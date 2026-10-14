@@ -43,7 +43,7 @@ Otherwise, create it from the official scans and five-scan alignment:
 ```bash
 VOD=/path/to/view_of_delft_PUBLIC
 PY=/path/to/cuda/python
-cd /path/to/Thesis-1
+cd /path/to/Thesis---1
 export PYTHONPATH="$PWD"
 
 for split in train val; do
