@@ -1,9 +1,9 @@
-"""Earlier Stage-I PFE radar/LiDAR encoders with a 64D interface adapter.
+"""Native sparse backbone used by the earlier Stage-I interpolation views.
 
-The point encoder and four-level sparse backbone are the earlier Stage-I
-architecture: 32 input channels and (16, 32, 64, 128) sparse levels. The
-128-to-64 adapter is trained during independent pretraining because the
-cross-modal teacher and radar-only student consume 64D bottlenecks.
+The point encoder starts at 16 channels and the four sparse levels have
+widths (16, 32, 64, 128). The final level grows its active support axially,
+as in that Stage-I model. An independently trained adapter maps its stride-8
+features to the existing 64D cross-modal interface.
 """
 
 from __future__ import annotations
@@ -13,13 +13,15 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from models.radar_lidar_stage1.pfe_spconv import PFEPointVoxelEncoder, PFESpconvBackbone
-from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
+from models.radar_lidar_stage1.sparse import (
+    PointVoxelEncoder, SparseBackbone, SparseSites, encode_keys,
+)
 
 from .encoder import BOTTLENECK_CHANNELS, GRID, masked_bottleneck_sites
 
 
 BACKBONE_CHANNELS = (16, 32, 64, 128)
+GROWTH_SCALES = (4,)
 
 
 def _selected_coarse_sites(coordinates: torch.Tensor, rate: float, salt: int) -> torch.Tensor:
@@ -29,7 +31,7 @@ def _selected_coarse_sites(coordinates: torch.Tensor, rate: float, salt: int) ->
     return masked_bottleneck_sites(fine_origin, rate, salt)
 
 
-class PreviousStage1PFE(nn.Module):
+class PreviousStage1Sparse(nn.Module):
     def __init__(self, checkpoint: str | Path | None = None, *,
                  modality: str, frozen: bool = False):
         super().__init__()
@@ -37,8 +39,8 @@ class PreviousStage1PFE(nn.Module):
             raise ValueError("Encoder modality must be radar or lidar")
         if frozen and checkpoint is None:
             raise ValueError("A frozen encoder requires pretrained weights")
-        self.point = PFEPointVoxelEncoder(GRID, modality)
-        self.backbone = PFESpconvBackbone(BACKBONE_CHANNELS)
+        self.point = PointVoxelEncoder(GRID, modality, BACKBONE_CHANNELS[0])
+        self.backbone = SparseBackbone(BACKBONE_CHANNELS, GROWTH_SCALES)
         self.output_adapter = nn.Sequential(
             nn.Linear(BACKBONE_CHANNELS[-1], BOTTLENECK_CHANNELS),
             nn.LayerNorm(BOTTLENECK_CHANNELS), nn.SiLU(),
@@ -49,11 +51,11 @@ class PreviousStage1PFE(nn.Module):
         if checkpoint is not None:
             checkpoint = Path(checkpoint)
             if not checkpoint.is_file():
-                raise FileNotFoundError(f"Previous Stage-I PFE weights missing: {checkpoint}")
+                raise FileNotFoundError(f"Previous Stage-I sparse weights missing: {checkpoint}")
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             if not isinstance(saved, dict) or not saved or not all(
                     isinstance(value, torch.Tensor) for value in saved.values()):
-                raise ValueError("Expected a direct PreviousStage1PFE state dictionary")
+                raise ValueError("Expected a direct PreviousStage1Sparse state dictionary")
             self.load_state_dict(saved, strict=True)
         self.source_checkpoint = str(checkpoint.resolve()) if checkpoint is not None else None
         if frozen:
@@ -91,6 +93,6 @@ class PreviousStage1PFE(nn.Module):
             GRID.scale_shape(8), 8)
 
 
-class FrozenPreviousStage1PFE(PreviousStage1PFE):
+class FrozenPreviousStage1Sparse(PreviousStage1Sparse):
     def __init__(self, checkpoint: str | Path, *, modality: str):
         super().__init__(checkpoint, modality=modality, frozen=True)

@@ -12,7 +12,7 @@ from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
 
 from . import INTERFACE_VERSION
 from .encoder import BOTTLENECK_CHANNELS, GRID
-from .previous_encoder import FrozenPreviousStage1PFE
+from .previous_encoder import FrozenPreviousStage1Sparse
 from .teacher import ResidualAdapter
 
 try:
@@ -133,7 +133,7 @@ class RadarOnlyStudent(nn.Module):
     def __init__(self, radar_checkpoint: str, config: StudentConfig | None = None):
         super().__init__()
         self.config = config or StudentConfig()
-        self.radar_encoder = FrozenPreviousStage1PFE(radar_checkpoint, modality="radar")
+        self.radar_encoder = FrozenPreviousStage1Sparse(radar_checkpoint, modality="radar")
         d = self.config.feature_dim
         self.shared = ResidualAdapter(d)
         self.feature_head = ResidualAdapter(d)

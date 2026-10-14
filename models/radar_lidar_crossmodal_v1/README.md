@@ -1,22 +1,28 @@
-# Previous Stage-I PFE encoders, cross-modal teacher, radar-only student
+# Native Stage-I sparse encoders, cross-modal teacher, radar-only student
 
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and
-their existing checkpoints. The active radar and LiDAR encoders now use the
-earlier Stage-I `PFEPointVoxelEncoder` and `PFESpconvBackbone`, copied into
-`models/radar_lidar_stage1/pfe_spconv.py`. Both have independent weights and
+their existing checkpoints. The active radar and LiDAR encoders use the native
+Stage-I `PointVoxelEncoder` and `SparseBackbone` from
+`models/radar_lidar_stage1/sparse.py`. Both have independent weights and
 are retrained for this pipeline. The former Downloads encoder in `vendor/`
 is retained for provenance but is no longer used by these training phases.
 
-The earlier backbone has sparse scale widths 16, 32, 64 and 128. A trainable
+The earlier backbone has sparse scale widths 16, 32, 64 and 128, with axial
+support growth at the fourth level. A trainable
 128→64 adapter at its stride-8 output keeps the teacher and student at 64D,
 with four 16D attention heads. The base voxel remains 0.2 × 0.2 × 0.25 m.
+The earlier interpolation report records a Stage-I surface-region checkpoint
+with those exact channels and growth setting. Its surface proposal head and
+ellipsoid, trilinear, and edge-aware interpolation produced the displayed
+five-panel views; this pipeline preserves its requested raw confidence output.
 The current cross-modal grid has 512 × 512 × 16 fine cells and 64 × 64 × 2
 stride-8 cells. The earlier Stage-I training run used a much wider grid;
 its checkpoints cannot be loaded directly into this adapted encoder.
 
-The radar point encoder uses mean XYZ and log density plus pooled RCS, radial
-and compensated Doppler velocity, and scan age. The LiDAR point encoder uses
-mean XYZ and log density plus reflectivity. These are the earlier Stage-I
+The radar point encoder embeds point offsets, global XYZ, RCS, radial and
+compensated Doppler velocity, and scan age, then aggregates mean, maximum,
+and point count per voxel. The LiDAR encoder uses the same geometry path plus
+reflectivity. These are the earlier Stage-I
 feature paths. Old exact-Downloads encoder, teacher, and student checkpoints
 are incompatible with this version; start new runs for all three phases.
 
@@ -24,10 +30,10 @@ are incompatible with this version; start new runs for all three phases.
 
 | Phase | Frozen | Trained | Output |
 | --- | --- | --- | --- |
-| 0 radar | none | earlier Stage-I radar PFE, 128→64 adapter, temporary 512-bin head | `radar/best_encoder.pth` |
-| 0 LiDAR | none | earlier Stage-I LiDAR PFE, 128→64 adapter, temporary 512-bin head | `lidar/best_encoder.pth` |
-| 1 teacher | both pretrained PFEs | separate residual adapters, bottleneck Q/K/V/O, scalar gate, alignment projections | radar-coordinate LiDAR-aware 64D features |
-| 2 student | radar PFE and complete teacher | shared residual transform, feature MLP, three-level generative sparse confidence decoder | radar-only 64D features and raw fine-voxel confidence |
+| 0 radar | none | native Stage-I radar encoder, 128→64 adapter, temporary 512-bin head | `radar/best_encoder.pth` |
+| 0 LiDAR | none | native Stage-I LiDAR encoder, 128→64 adapter, temporary 512-bin head | `lidar/best_encoder.pth` |
+| 1 teacher | both pretrained sparse encoders | separate residual adapters, bottleneck Q/K/V/O, scalar gate, alignment projections | radar-coordinate LiDAR-aware 64D features |
+| 2 student | radar sparse encoder and complete teacher | shared residual transform, feature MLP, three-level generative sparse confidence decoder | radar-only 64D features and raw fine-voxel confidence |
 
 Phase 0 trains both encoders independently from scratch. Its pretraining
 objective masks input features in complete stride-8 cells and predicts the
@@ -81,7 +87,7 @@ is coarse and limits object-level separation.
 ### Student
 
 The student's `forward(radar_points, radar_valid)` reads radar only. A frozen
-radar PFE feeds a trainable shared residual transform and two heads.
+radar sparse encoder feeds a trainable shared residual transform and two heads.
 One head distills the teacher's 64D radar-coordinate tensor with Smooth L1.
 The other expands each active stride-8 site through three MinkowskiEngine
 generative transposed convolutions to fine stride 1 and predicts one raw logit
@@ -112,7 +118,7 @@ within the complete radar-generated candidate domain. The separately named
 voxels. The known-space value is the default checkpoint metric because unknown
 space has no trustworthy negative label. Both, the selected threshold, and
 candidate coverage (represented clean points / all clean points inside the
-declared fixed PFE grid) are logged. Thresholds 0.1–0.9 are selected using
+declared fixed grid) are logged. Thresholds 0.1–0.9 are selected using
 validation only; the exported logits and probabilities remain unthresholded.
 The diagnostic `teacher_correspondence_supported_iou` also masks known sites
 to candidates with teacher evidence at least `teacher_evidence_threshold`
@@ -132,12 +138,12 @@ total/component losses, validation correspondence and confidence metrics,
 and overfitting trends. Full validation every five epochs determines checkpoint
 selection; fixed first-frame quick validation runs in intervening epochs.
 
-Python, CUDA, PyTorch, `spconv`, MinkowskiEngine, NumPy, SciPy, tqdm, and
+Python, CUDA, PyTorch, MinkowskiEngine, NumPy, SciPy, tqdm, and
 matplotlib are needed for all three GPU phases. TensorBoard is optional when
 the trainers use `--no-tensorboard`; `metrics.jsonl` and PNG plots are still
 written. Install `tensorboard` into the same Python environment and omit that
-flag to write event files. The sparse PFE backend requires CUDA even though mathematical unit tests are
-CPU-compatible. On the professor machine, the existing user-space OpenBLAS
+flag to write event files. Full training uses CUDA; small native sparse-encoder
+checks run on CPU. On the professor machine, the existing user-space OpenBLAS
 runtime must be on `LD_LIBRARY_PATH` for MinkowskiEngine. The GPU decoder
 smoke test should pass before Phase 2 training. The full generative candidate
 set may consume substantial GPU memory; no points are secretly removed.
@@ -158,7 +164,7 @@ so each phase can be inspected before starting the next.
 BASE=/mnt/3D10B36523559581/Gianluca
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 PY="$BASE/Sensor-Fusion/.venv_model_v2/bin/python"
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_previous_pfe_raw64
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_stage1_native_sparse_raw64
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8

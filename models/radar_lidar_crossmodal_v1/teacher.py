@@ -13,7 +13,7 @@ from models.radar_lidar_stage1.correspondence import Neighborhood, local_neighbo
 from models.radar_lidar_stage1.sparse import SparseSites
 
 from .encoder import BOTTLENECK_CHANNELS, GRID
-from .previous_encoder import FrozenPreviousStage1PFE
+from .previous_encoder import FrozenPreviousStage1Sparse
 
 
 @dataclass(frozen=True)
@@ -126,8 +126,8 @@ class CrossModalTeacher(nn.Module):
                  config: TeacherConfig | None = None):
         super().__init__()
         self.config = config or TeacherConfig()
-        self.radar_encoder = FrozenPreviousStage1PFE(radar_checkpoint, modality="radar")
-        self.lidar_encoder = FrozenPreviousStage1PFE(lidar_checkpoint, modality="lidar")
+        self.radar_encoder = FrozenPreviousStage1Sparse(radar_checkpoint, modality="radar")
+        self.lidar_encoder = FrozenPreviousStage1Sparse(lidar_checkpoint, modality="lidar")
         self.core = BottleneckTeacherCore(self.config)
 
     def train(self, mode: bool = True):

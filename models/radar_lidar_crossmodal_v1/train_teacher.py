@@ -134,7 +134,7 @@ def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
 
 
 def _save(path, model, optimizer, scheduler, epoch, step, args, validation):
-    state = {"version": "crossmodal_teacher_v2_doppler_radar_raw64", "config": asdict(model.config),
+    state = {"version": "crossmodal_teacher_v4_stage1_native_sparse_raw64", "config": asdict(model.config),
              "model": model.state_dict(), "optimizer": optimizer.state_dict(),
              "scheduler": scheduler.state_dict(), "epoch": epoch, "step": step,
              "radar_checkpoint": str(args.radar_encoder.resolve()),
@@ -150,8 +150,8 @@ def _save(path, model, optimizer, scheduler, epoch, step, args, validation):
 
 def load_teacher(path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") != "crossmodal_teacher_v2_doppler_radar_raw64":
-        raise ValueError("Expected versioned exact-PFE teacher checkpoint")
+    if saved.get("version") != "crossmodal_teacher_v4_stage1_native_sparse_raw64":
+        raise ValueError("Expected versioned native Stage-I sparse teacher checkpoint")
     for key in ("radar", "lidar"):
         source = saved[f"{key}_checkpoint"]
         if not Path(source).is_file() or _hash(source) != saved[f"{key}_sha256"]:

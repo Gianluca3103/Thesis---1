@@ -1,4 +1,4 @@
-"""CPU contract checks for the active previous Stage-I encoder interface."""
+"""CPU contract checks for the active native Stage-I sparse encoder."""
 
 import tempfile
 import unittest
@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
-from models.radar_lidar_stage1.pfe_spconv import PFEPointVoxelEncoder
+from models.radar_lidar_stage1.sparse import PointVoxelEncoder
 from models.radar_lidar_crossmodal_v1.encoder import GRID, masked_bottleneck_sites
 from models.radar_lidar_crossmodal_v1 import previous_encoder
 from models.radar_lidar_crossmodal_v1.pretrain_encoder import GeometryPretrainer
@@ -18,10 +18,11 @@ from models.radar_lidar_crossmodal_v1 import teacher as teacher_module
 
 
 class FakePointEncoder(nn.Module):
-    def __init__(self, grid, modality):
+    def __init__(self, grid, modality, out_channels):
         super().__init__()
         self.modality = modality
-        self.weight = nn.Parameter(torch.ones(32))
+        assert out_channels == 16
+        self.weight = nn.Parameter(torch.ones(out_channels))
 
     def forward(self, points, valid, **kwargs):
         batch, point = valid.nonzero(as_tuple=True)
@@ -35,10 +36,11 @@ class FakePointEncoder(nn.Module):
 
 
 class FakeBackbone(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, growth_scales):
         super().__init__()
         assert channels == (16, 32, 64, 128)
-        self.project = nn.Linear(32, 128)
+        assert growth_scales == (4,)
+        self.project = nn.Linear(16, 128)
         self.last_fine = None
 
     def forward(self, fine, **kwargs):
@@ -46,7 +48,7 @@ class FakeBackbone(nn.Module):
         coarse = fine.coords.clone()
         coarse[:, 1:] //= 8
         coords, inverse = torch.unique(coarse, dim=0, sorted=True, return_inverse=True)
-        pooled = fine.features.new_zeros((len(coords), 32))
+        pooled = fine.features.new_zeros((len(coords), 16))
         pooled.index_add_(0, inverse, fine.features)
         counts = torch.bincount(inverse, minlength=len(coords)).clamp_min(1)
         features = self.project(pooled / counts[:, None])
@@ -55,8 +57,8 @@ class FakeBackbone(nn.Module):
 
 class PreviousStage1EncoderTests(unittest.TestCase):
     def setUp(self):
-        point = patch.object(previous_encoder, "PFEPointVoxelEncoder", FakePointEncoder)
-        backbone = patch.object(previous_encoder, "PFESpconvBackbone", FakeBackbone)
+        point = patch.object(previous_encoder, "PointVoxelEncoder", FakePointEncoder)
+        backbone = patch.object(previous_encoder, "SparseBackbone", FakeBackbone)
         point.start()
         backbone.start()
         self.addCleanup(point.stop)
@@ -87,7 +89,7 @@ class PreviousStage1EncoderTests(unittest.TestCase):
     def test_trained_encoder_exports_strict_frozen_radar_and_lidar_weights(self):
         for modality in ("radar", "lidar"):
             with self.subTest(modality=modality):
-                model = previous_encoder.PreviousStage1PFE(modality=modality)
+                model = previous_encoder.PreviousStage1Sparse(modality=modality)
                 points, valid = self.sample(modality)
                 output = model(points, valid)
                 self.assertEqual(output.features.shape, (3, 64))
@@ -96,7 +98,7 @@ class PreviousStage1EncoderTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as folder:
                     saved = Path(folder) / "encoder.pth"
                     torch.save(model.state_dict(), saved)
-                    frozen = previous_encoder.FrozenPreviousStage1PFE(saved, modality=modality)
+                    frozen = previous_encoder.FrozenPreviousStage1Sparse(saved, modality=modality)
                     loaded = frozen(points, valid)
                     torch.testing.assert_close(loaded.features, output.features)
                     self.assertFalse(any(parameter.requires_grad for parameter in frozen.parameters()))
@@ -113,9 +115,9 @@ class PreviousStage1EncoderTests(unittest.TestCase):
             self.assertIsNotNone(model.local_distribution.weight.grad)
 
     def test_active_radar_point_encoder_receives_doppler_and_scan_age(self):
-        encoder = PFEPointVoxelEncoder(GRID, "radar").eval()
+        encoder = PointVoxelEncoder(GRID, "radar", 16).eval()
         captured = []
-        handle = encoder.attribute_mlp.register_forward_pre_hook(
+        handle = encoder.point[0].register_forward_pre_hook(
             lambda module, inputs: captured.append(inputs[0].detach().clone()))
         self.addCleanup(handle.remove)
         radar = torch.zeros(1, 2, 7)
@@ -126,8 +128,9 @@ class PreviousStage1EncoderTests(unittest.TestCase):
         radar[0, 0, 4:7] = radar.new_tensor([6.0, 4.0, -3.0])
         encoder(radar, valid)
         changed = captured[-1]
-        self.assertFalse(torch.equal(baseline[:, [1, 2, 5, 6, 3, 7]],
-                                     changed[:, [1, 2, 5, 6, 3, 7]]))
+        # Four normalized radar attributes are RCS, radial Doppler,
+        # compensated radial Doppler, and scan age.
+        self.assertFalse(torch.equal(baseline[:, 7:10], changed[:, 7:10]))
 
     def test_teacher_and_student_construct_the_previous_encoder(self):
         class FakeFrozenEncoder(nn.Module):
@@ -136,14 +139,36 @@ class PreviousStage1EncoderTests(unittest.TestCase):
                 self.source_checkpoint = checkpoint
                 self.modality = modality
 
-        with patch.object(teacher_module, "FrozenPreviousStage1PFE", FakeFrozenEncoder), \
-             patch.object(student_module, "FrozenPreviousStage1PFE", FakeFrozenEncoder), \
+        with patch.object(teacher_module, "FrozenPreviousStage1Sparse", FakeFrozenEncoder), \
+             patch.object(student_module, "FrozenPreviousStage1Sparse", FakeFrozenEncoder), \
              patch.object(student_module, "RawSparseConfidenceDecoder", lambda config: nn.Identity()):
             teacher = teacher_module.CrossModalTeacher("radar.pth", "lidar.pth")
             student = student_module.RadarOnlyStudent("radar.pth")
         self.assertEqual(teacher.radar_encoder.modality, "radar")
         self.assertEqual(teacher.lidar_encoder.modality, "lidar")
         self.assertEqual(student.radar_encoder.source_checkpoint, "radar.pth")
+
+
+class NativeSparseArchitectureTests(unittest.TestCase):
+    def test_real_backbone_has_growth_and_backpropagates(self):
+        for modality, columns in (("radar", 7), ("lidar", 4)):
+            with self.subTest(modality=modality):
+                model = previous_encoder.PreviousStage1Sparse(modality=modality)
+                self.assertIsInstance(model.point, PointVoxelEncoder)
+                self.assertEqual(model.backbone.channels, (16, 32, 64, 128))
+                self.assertIn("4", model.backbone.grow)
+                points = torch.zeros(1, 2, columns)
+                points[0, :, :3] = torch.tensor([[0.0, 0.0, 0.0],
+                                                [2.0, 1.0, 0.25]])
+                if modality == "radar":
+                    points[0, :, 4:6] = torch.tensor([[1.0, 0.5], [2.0, 1.0]])
+                output = model(points, torch.ones(1, 2, dtype=torch.bool))
+                self.assertEqual(output.stride, 8)
+                self.assertEqual(output.features.shape[1], 64)
+                output.features.square().mean().backward()
+                self.assertTrue(torch.isfinite(model.point.point[0].weight.grad).all())
+                self.assertTrue(torch.isfinite(model.backbone.stem.kernel.grad).all())
+                self.assertTrue(torch.isfinite(model.output_adapter[0].weight.grad).all())
 
 
 if __name__ == "__main__":
