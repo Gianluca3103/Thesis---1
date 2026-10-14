@@ -18,8 +18,11 @@ weights, older Stage I/II experiments, and generated reports are excluded.
 | `scripts/` | Verified stack generation, Doppler radial variant generation, GPU decoder smoke check |
 | `configs/` | Teacher, student, and online augmentation settings |
 
-The 64-channel bottleneck uses the original PFE architecture. The student's
-fine-grid output is **raw confidence logits and probabilities**, with no
+The 64-channel bottleneck uses the original PFE sparse backbone. LiDAR retains
+mean XYZ and log point count as its four voxel inputs. Radar adds mean radial
+and mean compensated radial Doppler velocity, changing only its first input
+MLP layer from four to six channels. RCS and scan age are not encoder inputs.
+The student's fine-grid output is **raw confidence logits and probabilities**, with no
 interpolation or spherical influence expansion. It is not a reconstructed
 LiDAR point cloud or a trained Stage II diffusion model.
 
@@ -78,6 +81,8 @@ coordinates, so its loss-selected sites can differ from its input-masked
 sites. Preserve this warning when reviewing Phase 0 metrics. Full sequential
 training was paused pending the original encoder training files; this
 extraction does not claim trained results or resolve that learning issue.
+Previous four-input radar, teacher, and student checkpoints cannot be resumed
+with this six-input radar path. The LiDAR encoder layout is unchanged.
 
 ## Provenance
 

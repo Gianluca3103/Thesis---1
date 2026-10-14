@@ -3,7 +3,7 @@
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and
 their existing checkpoints. The exact `Downloads/encoder.py` is copied unchanged
 into `vendor/`. Its matching `Downloads/config.py` changes only the requested
-voxel size; the encoder architecture and 64-channel bottleneck are unchanged. The original
+voxel size; the 64-channel bottleneck and original sparse backbone are unchanged. The original
 `PFE_Engine.forward` converts its output to a dense volume. The wrapper in
 `encoder.py` invokes the original voxelizer, input MLP, and sparse backbone
 and retains the stride-8 sparse result. It does not alter the vendored source.
@@ -18,13 +18,21 @@ SHA256 values `e9090b89276322873b2027a329bd706a7661ea65e6f093ac1419c3ad1a016b89`
 and `5a83fe1b302653796bdee062daeb72ff14bbd2d8795c4e1f72f8c0ea33b07023` for
 the voxel-size-adjusted config.
 
+LiDAR still uses the supplied four-input voxel feature: mean XYZ and log point
+count. Radar now pools mean radial and mean compensated radial velocity in each
+fine voxel and appends them to those four values. Only the radar input MLP's
+first layer changes to `Linear(6,16)`; `vendor/encoder.py` remains unmodified.
+RCS and scan age remain in the radar dataset but are not encoder inputs.
+Old four-input radar encoder, teacher, and student checkpoints are incompatible.
+LiDAR encoder checkpoints retain the original four-input layout.
+
 ## Phases and parameters
 
 | Phase | Frozen | Trained | Output |
 | --- | --- | --- | --- |
-| 0 radar | none | independent original radar PFE and a temporary 512-bin head | `radar/best_encoder.pth` |
+| 0 radar | none | independent PFE with Doppler input and a temporary 512-bin head | `radar/best_encoder.pth` |
 | 0 LiDAR | none | independent original LiDAR PFE and a temporary 512-bin head | `lidar/best_encoder.pth` |
-| 1 teacher | both original PFEs | separate residual adapters, bottleneck Q/K/V/O, scalar gate, alignment projections | radar-coordinate LiDAR-aware 64D features |
+| 1 teacher | both pretrained PFEs | separate residual adapters, bottleneck Q/K/V/O, scalar gate, alignment projections | radar-coordinate LiDAR-aware 64D features |
 | 2 student | radar PFE and complete teacher | shared residual transform, feature MLP, three-level generative sparse confidence decoder | radar-only 64D features and raw fine-voxel confidence |
 
 No pretrained encoder weights were available for the exact Downloads encoder.
@@ -38,15 +46,13 @@ current pretrainer also applies its mask helper to already downsampled output
 coordinates, dividing those coordinates by eight a second time. Consequently,
 the sites selected for loss do not consistently match the feature-masked sites.
 This requires a separate correction before Phase 0 learning curves can validate
-the intended objective; the voxel-size-only change here does not alter it. The
+the intended objective; the radar input change here does not alter it. The
 512-bin head is discarded. `best_encoder.pth`
-contains the original `PFE_Engine` state dictionary directly and is loaded
-strictly by Phase 1. The original encoder source and architecture remain unchanged.
-
-The PFE voxelizer uses XYZ mean and log point density. Although the input is the
-aligned 20-frame radar stack, this exact encoder does **not** use Doppler, RCS,
-or per-point age as network features. Current-frame radar returns are used for
-reliable object-label assignment; the full stack supplies encoder geometry.
+contains the PFE state dictionary directly and is loaded strictly by Phase 1.
+The LiDAR PFE remains exact, while radar uses the six-input first layer above.
+Current-frame radar returns are used for
+reliable object-label assignment; the full stack supplies encoder geometry and
+Doppler velocity features.
 
 ### Teacher
 
@@ -87,7 +93,7 @@ is coarse and limits object-level separation.
 ### Student
 
 The student's `forward(radar_points, radar_valid)` reads radar only. A frozen
-original radar PFE feeds a trainable shared residual transform and two heads.
+radar PFE feeds a trainable shared residual transform and two heads.
 One head distills the teacher's 64D radar-coordinate tensor with Smooth L1.
 The other expands each active stride-8 site through three MinkowskiEngine
 generative transposed convolutions to fine stride 1 and predicts one raw logit
@@ -162,7 +168,7 @@ mkdir -p "$OUT"
 # Backend coordinate and backward check; no dataset or encoder weights needed.
 "$PY" -m scripts.smoke_crossmodal_raw_decoder
 
-# Phase 0: two independent original-PFE pretrains.
+# Phase 0: two independent PFE pretrains.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality radar --output-root "$OUT/radar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
@@ -172,7 +178,7 @@ mkdir -p "$OUT"
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
   --epochs 25 --batch-size 2 --num-workers 2 --device cuda --no-tensorboard
 
-# Phase 1: frozen original encoders, trainable local teacher.
+# Phase 1: frozen pretrained encoders, trainable local teacher.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_teacher \
   --vod-root "$VOD" --radar-encoder "$OUT/radar/best_encoder.pth" \
   --lidar-encoder "$OUT/lidar/best_encoder.pth" --output-root "$OUT/teacher" \

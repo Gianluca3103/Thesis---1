@@ -1,4 +1,4 @@
-"""Train independent copies of the exact original PFE encoder before Phase 1."""
+"""Train independent PFE encoders before Phase 1, with radar Doppler input."""
 
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ from .train_teacher import _move
 
 
 class GeometryPretrainer(nn.Module):
-    def __init__(self):
+    def __init__(self, modality: str):
         super().__init__()
-        self.encoder = OriginalPFE()
+        self.encoder = OriginalPFE(modality=modality)
         # Training-only head; neither teacher nor student loads or exports it.
         self.local_distribution = nn.Linear(BOTTLENECK_CHANNELS, 512)
 
@@ -119,7 +119,7 @@ def main():
     if (args.output_root / "metrics.jsonl").exists() and not args.resume:
         parser.error("Existing pretraining metrics require --resume or a new output directory")
     writer = open_writer(args.output_root, args.tensorboard)
-    model = GeometryPretrainer().to(args.device)
+    model = GeometryPretrainer(args.modality).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -153,7 +153,7 @@ def main():
         warning = overfitting_warning(args.output_root / "metrics.jsonl")
         if warning:
             print(f"Overfitting warning: {warning}", flush=True)
-        checkpoint = {"version": "original_pfe_geometry_pretrain_v1",
+        checkpoint = {"version": "original_pfe_geometry_pretrain_v2_doppler_radar",
                       "modality": args.modality, "mask_rate": args.mask_rate,
                       "augmentation": augmentation.to_dict(),
                       "model": model.state_dict(), "optimizer": optimizer.state_dict(),

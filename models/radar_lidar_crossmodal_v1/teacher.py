@@ -125,8 +125,8 @@ class CrossModalTeacher(nn.Module):
                  config: TeacherConfig | None = None):
         super().__init__()
         self.config = config or TeacherConfig()
-        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint)
-        self.lidar_encoder = FrozenOriginalPFE(lidar_checkpoint)
+        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint, modality="radar")
+        self.lidar_encoder = FrozenOriginalPFE(lidar_checkpoint, modality="lidar")
         self.core = BottleneckTeacherCore(self.config)
 
     def train(self, mode: bool = True):

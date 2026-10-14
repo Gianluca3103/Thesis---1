@@ -127,7 +127,7 @@ class RadarOnlyStudent(nn.Module):
     def __init__(self, radar_checkpoint: str, config: StudentConfig | None = None):
         super().__init__()
         self.config = config or StudentConfig()
-        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint)
+        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint, modality="radar")
         d = self.config.feature_dim
         self.shared = ResidualAdapter(d)
         self.feature_head = ResidualAdapter(d)
