@@ -164,7 +164,7 @@ so each phase can be inspected before starting the next.
 BASE=/mnt/3D10B36523559581/Gianluca
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 PY="$BASE/Sensor-Fusion/.venv_model_v2/bin/python"
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_stage1_native_sparse_raw64
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_native_sparse_verified_20261015_25ep
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8

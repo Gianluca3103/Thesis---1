@@ -7,7 +7,7 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BASE=${BASE:-/mnt/3D10B36523559581/Gianluca}
 VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC}
 PY=${PY:-$BASE/Sensor-Fusion/.venv_model_v2/bin/python}
-OUT=${OUT:-/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_native_sparse_20261015_25ep}
+OUT=${OUT:-/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_native_sparse_verified_20261015_25ep}
 RADAR_VARIANT=radar_20frames_verified_doppler_radial
 AUGMENTATION=$REPO/configs/stage1_online_geometric_augmentation.json
 TEACHER_CONFIG=$REPO/configs/crossmodal_teacher_raw64.json
@@ -40,6 +40,16 @@ export OMP_NUM_THREADS=8
 export MPLBACKEND=Agg
 cd "$REPO"
 
+"$PY" - <<'PY'
+from pathlib import Path
+from models.radar_lidar_crossmodal_v1 import INTERFACE_VERSION
+from models.radar_lidar_crossmodal_v1 import previous_encoder
+from models.radar_lidar_crossmodal_v1.student import StudentConfig
+assert INTERFACE_VERSION == "radar_lidar_crossmodal_v4_stage1_native_sparse_raw64"
+assert StudentConfig().lambda_teacher_evidence == 0.5
+assert hasattr(previous_encoder, "PreviousStage1Sparse")
+print("Verified native sparse source:", Path(previous_encoder.__file__).resolve(), flush=True)
+PY
 "$PY" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0), flush=True)'
 printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "$OUT"
 
