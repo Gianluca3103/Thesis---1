@@ -1,0 +1,14 @@
+{
+  "feature_dim": 64,
+  "heads": 4,
+  "max_candidates": 24,
+  "radius_m": 6.0,
+  "sigma_m": 2.0,
+  "temperature": 0.1,
+  "adapters_enabled": true,
+  "fusion_beta": 1.0,
+  "object_weight": 1.0,
+  "geometry_weight": 0.5,
+  "contrastive_weight": 0.1,
+  "fusion_weight": 0.5
+}
