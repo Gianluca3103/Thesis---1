@@ -33,10 +33,11 @@ LiDAR point cloud or a trained Stage II diffusion model.
 See [the pipeline guide](models/radar_lidar_crossmodal_v1/README.md) for
 losses, metrics, checkpoint formats, and individual training commands.
 
-For a sequential full run, `scripts/prepare_and_train_crossmodal.sh` checks
+For a full run, `scripts/prepare_and_train_crossmodal.sh` checks
 the complete train/val verified 20-scan Doppler radar cache, fills missing
-derived frames when possible, and then runs the encoder, teacher, and student
-phases. It writes checkpoints and logs under `OUT`. Online geometric
+derived frames when possible, then trains the radar and LiDAR encoders in
+parallel before the teacher and student phases. It writes separate encoder
+checkpoints and logs under `OUT`. Online geometric
 augmentation changes the voxel geometry each epoch, so this pipeline has no
 static geometry cache to prebuild.
 

@@ -102,7 +102,7 @@ def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
         dataset.set_epoch(epoch)
     summary = Summary(model.config)
     progress = tqdm(loader, desc=("Teacher train" if training else "Teacher val") + f" {epoch:03d}",
-                    unit="batch", dynamic_ncols=True)
+                    unit="batch", dynamic_ncols=True, leave=training)
     for batch_index, raw in enumerate(progress, 1):
         batch = _move(raw, device)
         with torch.set_grad_enabled(training):
@@ -115,19 +115,9 @@ def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 total.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.core.parameters(), 5.)
+                torch.nn.utils.clip_grad_norm_(model.core.parameters(), 5.)
                 optimizer.step()
         summary.add(terms, metrics, len(batch["frame_id"]))
-        if training and batch_index % 50 == 0:
-            print(json.dumps({"epoch": epoch, "step": batch_index,
-                              "loss": float(total.detach()), "grad_norm": float(grad_norm),
-                              "learning_rate": optimizer.param_groups[0]["lr"],
-                              "loss_components": {key: float(term.mean.detach())
-                                                  for key, term in terms.items()},
-                              "object_queries": metrics["object_queries"],
-                              "geometry_queries": metrics["geometry_eligible"],
-                              "radar_sites": len(output.radar_frozen.coords),
-                              "lidar_sites": len(output.lidar_frozen.coords)}), flush=True)
     return summary.finish()
 
 

@@ -110,7 +110,8 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0):
         dataset.set_epoch(epoch)
     aggregate = Summary(student.config)
     for batch_index, raw in enumerate(tqdm(loader, desc=("Student train" if training else "Student val")
-                                            + f" {epoch:03d}", unit="batch", dynamic_ncols=True), 1):
+                                            + f" {epoch:03d}", unit="batch", dynamic_ncols=True,
+                                            leave=training), 1):
         batch = _move(raw, device)
         with torch.no_grad():
             teacher_output = teacher(batch["radar"], batch["radar_valid"],
@@ -125,21 +126,11 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0):
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
+                torch.nn.utils.clip_grad_norm_(
                     (parameter for parameter in student.parameters() if parameter.requires_grad), 5.)
                 optimizer.step()
         aggregate.add(pieces, output, targets, len(batch["frame_id"]),
                       teacher_evidence=evidence, evaluate=not training)
-        if training and batch_index % 50 == 0:
-            print(json.dumps({"epoch": epoch, "step": batch_index,
-                              "loss": float(loss.detach()), "grad_norm": float(grad_norm),
-                              "learning_rate": optimizer.param_groups[0]["lr"],
-                              "loss_components": {key: float(pieces[key].detach())
-                                                  for key in ("distillation", "spatial", "bce", "dice")},
-                              "feature_elements": pieces["feature_elements"],
-                              "known_sites": pieces["known_sites"],
-                              "candidate_sites": len(output.confidence_logits.coords)}),
-                  flush=True)
     return aggregate.finish(select_threshold=not training)
 
 

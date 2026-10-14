@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import time
 
 import torch
 from torch import nn
@@ -38,13 +40,30 @@ class GeometryPretrainer(nn.Module):
         return loss, eligible, len(sites.coords)
 
 
-def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epoch=0):
+def _write_progress(path, **values):
+    if path is None:
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(values), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epoch=0,
+           progress_file=None, quiet_progress=False, progress_offset=0,
+           progress_total=None):
     training = optimizer is not None
+    phase = "train" if training else "val"
     model.train(training)
     loss_sum = 0.
     eligible_sum = active_sum = 0
-    for step, raw in enumerate(tqdm(loader, desc=f"{modality} {'train' if training else 'val'} {epoch:03d}",
-                                    unit="batch", dynamic_ncols=True), 1):
+    total = len(loader)
+    display_total = progress_total if progress_total is not None else total
+    _write_progress(progress_file, epoch=epoch, phase=phase,
+                    step=progress_offset, total=display_total)
+    last_progress = time.monotonic()
+    for step, raw in enumerate(tqdm(loader, desc=f"{modality} {phase} {epoch:03d}",
+                                    unit="batch", dynamic_ncols=True,
+                                    disable=quiet_progress, leave=training), 1):
         batch = _move(raw, device)
         name = "radar" if modality == "radar" else "clean_lidar"
         with torch.set_grad_enabled(training):
@@ -53,16 +72,16 @@ def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epo
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
                 optimizer.step()
         loss_sum += float(loss.detach()) * eligible
         eligible_sum += eligible
         active_sum += active
-        if training and step % 50 == 0:
-            print(json.dumps({"epoch": epoch, "step": step,
-                              "loss": float(loss.detach()), "gradient_norm": float(grad_norm),
-                              "eligible_sites": eligible, "active_sites": active}),
-                  flush=True)
+        now = time.monotonic()
+        if progress_file is not None and (now - last_progress >= 0.5 or step == total):
+            _write_progress(progress_file, epoch=epoch, phase=phase,
+                            step=progress_offset + step, total=display_total)
+            last_progress = now
     return {"loss_total": loss_sum / eligible_sum if eligible_sum else None,
             "eligible_sites": eligible_sum, "active_sites": active_sum}
 
@@ -88,8 +107,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--progress-file", type=Path)
+    parser.add_argument("--quiet-progress", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.progress_file is not None:
+        args.progress_file.parent.mkdir(parents=True, exist_ok=True)
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("Full Stage-I sparse encoder training needs CUDA")
     if not 0 < args.mask_rate < 1:
@@ -131,12 +154,20 @@ def main():
         start, best = saved["epoch"] + 1, saved["best_val_loss"]
     for epoch in range(start, args.epochs + 1):
         train.set_epoch(epoch)
-        training = _epoch(model, loaders["train"], args.modality, args.device,
-                          args.mask_rate, epoch, optimizer, epoch)
-        scheduler.step()
         full = epoch % args.full_val_every == 0 or epoch == args.epochs
-        validation = _epoch(model, loaders["full" if full else "quick"], args.modality,
-                            args.device, args.mask_rate, 0, epoch=epoch)
+        validation_loader = loaders["full" if full else "quick"]
+        progress_total = len(loaders["train"]) + len(validation_loader)
+        training = _epoch(model, loaders["train"], args.modality, args.device,
+                          args.mask_rate, epoch, optimizer, epoch,
+                          args.progress_file, args.quiet_progress,
+                          progress_total=progress_total)
+        scheduler.step()
+        validation = _epoch(model, validation_loader, args.modality,
+                            args.device, args.mask_rate, 0, epoch=epoch,
+                            progress_file=args.progress_file,
+                            quiet_progress=args.quiet_progress,
+                            progress_offset=len(loaders["train"]),
+                            progress_total=progress_total)
         gap = (validation["loss_total"] - training["loss_total"]
                if validation["loss_total"] is not None and training["loss_total"] is not None else None)
         record = {"epoch": epoch, "train": training, "val": validation,
@@ -168,6 +199,11 @@ def main():
         print(f"Previous Stage-I native sparse {args.modality} {epoch:03d}/{args.epochs:03d} "
               f"train {training['loss_total']} val {validation['loss_total']} "
               f"scope {'full' if full else 'quick'}", flush=True)
+        _write_progress(args.progress_file, epoch=epoch, phase="complete",
+                        step=1, total=1, train_loss=training["loss_total"],
+                        val_loss=validation["loss_total"],
+                        validation_scope="full" if full else "quick",
+                        warning=warning)
     if writer is not None:
         writer.close()
 

@@ -44,6 +44,9 @@ is a feature-masking objective rather than a fully hidden geometry task. The
 loss mask now selects the same stride-8 parent cells as the input mask. The
 512-bin head is discarded. `best_encoder.pth` contains the point encoder,
 sparse backbone, and 128→64 adapter and is loaded strictly by Phase 1.
+The all-in-one runner trains the two encoders concurrently on the same GPU,
+with a separate epoch bar and log for each. If either fails, it stops both;
+rerunning resumes each encoder from its own `last.ckpt`.
 Current-frame radar returns are used for
 reliable object-label assignment; the full stack supplies encoder geometry and
 Doppler velocity features.

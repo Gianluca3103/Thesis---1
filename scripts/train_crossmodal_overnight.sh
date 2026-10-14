@@ -142,13 +142,12 @@ fi
 printf 'All four one-frame smoke tests passed. Starting full training.\n'
 
 printf '\n=== Full training: independent encoders ===\n'
-run_phase 'radar encoder' "$FULL/radar" \
-  models.radar_lidar_crossmodal_v1.pretrain_encoder \
-  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size "$ENCODER_BATCH_SIZE" --modality radar
+"$PY" -u -m scripts.train_crossmodal_encoder_pair \
+  --vod-root "$VOD" --radar-variant "$RADAR_VARIANT" \
+  --online-augmentation-config "$AUGMENTATION" --output-root "$FULL" \
+  --epochs 25 --batch-size "$ENCODER_BATCH_SIZE" \
+  --full-val-every 5 --num-workers 2 --device cuda
 test -s "$FULL/radar/best_encoder.pth"
-run_phase 'LiDAR encoder' "$FULL/lidar" \
-  models.radar_lidar_crossmodal_v1.pretrain_encoder \
-  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size "$ENCODER_BATCH_SIZE" --modality lidar
 test -s "$FULL/lidar/best_encoder.pth"
 
 printf '\n=== Full training: cross-attention teacher ===\n'
