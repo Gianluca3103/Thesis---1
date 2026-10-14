@@ -33,6 +33,11 @@ if (( FREE_BYTES < 15 * 1024 * 1024 * 1024 )); then
   printf 'Need at least 15 GiB free on the output volume: %s\n' "$OUT" >&2
   exit 1
 fi
+mkdir -p "$OUT/tmp" "$OUT/matplotlib"
+export TMPDIR="$OUT/tmp"
+export TMP="$TMPDIR"
+export TEMP="$TMPDIR"
+export MPLCONFIGDIR="$OUT/matplotlib"
 
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -40,16 +45,15 @@ export OMP_NUM_THREADS=8
 export MPLBACKEND=Agg
 cd "$REPO"
 
-"$PY" - <<'PY'
+"$PY" -c '
 from pathlib import Path
-from models.radar_lidar_crossmodal_v1 import INTERFACE_VERSION
-from models.radar_lidar_crossmodal_v1 import previous_encoder
+from models.radar_lidar_crossmodal_v1 import INTERFACE_VERSION, previous_encoder
 from models.radar_lidar_crossmodal_v1.student import StudentConfig
 assert INTERFACE_VERSION == "radar_lidar_crossmodal_v4_stage1_native_sparse_raw64"
 assert StudentConfig().lambda_teacher_evidence == 0.5
 assert hasattr(previous_encoder, "PreviousStage1Sparse")
 print("Verified native sparse source:", Path(previous_encoder.__file__).resolve(), flush=True)
-PY
+'
 "$PY" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0), flush=True)'
 printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "$OUT"
 
