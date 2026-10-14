@@ -11,7 +11,8 @@ from torch.nn import functional as F
 from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
 
 from . import INTERFACE_VERSION
-from .encoder import BOTTLENECK_CHANNELS, GRID, FrozenOriginalPFE
+from .encoder import BOTTLENECK_CHANNELS, GRID
+from .previous_encoder import FrozenPreviousStage1PFE
 from .teacher import ResidualAdapter
 
 try:
@@ -36,7 +37,7 @@ class StudentConfig:
 
     def __post_init__(self):
         if self.feature_dim != BOTTLENECK_CHANNELS or min(self.decoder_channels) < 1:
-            raise ValueError("Student must use the exact 64-channel original PFE bottleneck")
+            raise ValueError("Student must use the 64-channel adapted Stage-I bottleneck")
         if min(self.positive_weight, self.smooth_l1_beta) <= 0 or min(
                 self.dice_weight, self.distillation_weight, self.spatial_weight,
                 self.lambda_teacher_evidence) < 0:
@@ -78,7 +79,7 @@ class RawSparseConfidenceDecoder(nn.Module):
 
     def forward(self, bottleneck: SparseSites):
         if bottleneck.stride != 8 or bottleneck.shape_zyx != GRID.scale_shape(8):
-            raise ValueError("Expected original PFE stride-8 bottleneck")
+            raise ValueError("Expected adapted Stage-I stride-8 bottleneck")
         if not len(bottleneck.coords):
             return SparseSites._from_validated(
                 bottleneck.coords.new_empty((0, 4)),
@@ -132,7 +133,7 @@ class RadarOnlyStudent(nn.Module):
     def __init__(self, radar_checkpoint: str, config: StudentConfig | None = None):
         super().__init__()
         self.config = config or StudentConfig()
-        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint, modality="radar")
+        self.radar_encoder = FrozenPreviousStage1PFE(radar_checkpoint, modality="radar")
         d = self.config.feature_dim
         self.shared = ResidualAdapter(d)
         self.feature_head = ResidualAdapter(d)

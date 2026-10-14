@@ -13,7 +13,7 @@ from .encoder import GRID
 def observed_child_distribution(sites, points: torch.Tensor, valid: torch.Tensor):
     """512 child bins per occupied stride-8 site; no physical free-space claim."""
     if sites.stride != 8 or sites.shape_zyx != GRID.scale_shape(8):
-        raise ValueError("Expected original stride-8 PFE sites")
+        raise ValueError("Expected stride-8 PFE sites")
     counts = points.new_zeros((len(sites.coords), 512))
     if not len(sites.coords):
         return counts

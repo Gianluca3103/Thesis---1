@@ -1,55 +1,43 @@
-# Exact-PFE cross-modal teacher and radar-only student
+# Previous Stage-I PFE encoders, cross-modal teacher, radar-only student
 
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and
-their existing checkpoints. The exact `Downloads/encoder.py` is copied unchanged
-into `vendor/`. Its matching `Downloads/config.py` changes only the requested
-voxel size; the 64-channel bottleneck and original sparse backbone are unchanged. The original
-`PFE_Engine.forward` converts its output to a dense volume. The wrapper in
-`encoder.py` invokes the original voxelizer, input MLP, and sparse backbone
-and retains the stride-8 sparse result. It does not alter the vendored source.
+their existing checkpoints. The active radar and LiDAR encoders now use the
+earlier Stage-I `PFEPointVoxelEncoder` and `PFESpconvBackbone`, copied into
+`models/radar_lidar_stage1/pfe_spconv.py`. Both have independent weights and
+are retrained for this pipeline. The former Downloads encoder in `vendor/`
+is retained for provenance but is no longer used by these training phases.
 
-The encoder uses 64 bottleneck channels and now uses a 0.2 × 0.2 × 0.25 m base
-voxel, so the physical stride-8 cell is 1.6 × 1.6 × 2 m. The unchanged
-point-cloud range yields a fine grid of 512 × 512 × 16 cells in XYZ order and
-a stride-8 grid of 64 × 64 × 2 cells. Existing checkpoints and cached geometry
-from the earlier 0.1 × 0.1 × 0.5 m grid must not be resumed for this grid.
-Four attention heads therefore have 16 channels each. The vendor sources have
-SHA256 values `e9090b89276322873b2027a329bd706a7661ea65e6f093ac1419c3ad1a016b89`
-and `5a83fe1b302653796bdee062daeb72ff14bbd2d8795c4e1f72f8c0ea33b07023` for
-the voxel-size-adjusted config.
+The earlier backbone has sparse scale widths 16, 32, 64 and 128. A trainable
+128→64 adapter at its stride-8 output keeps the teacher and student at 64D,
+with four 16D attention heads. The base voxel remains 0.2 × 0.2 × 0.25 m.
+The current cross-modal grid has 512 × 512 × 16 fine cells and 64 × 64 × 2
+stride-8 cells. The earlier Stage-I training run used a much wider grid;
+its checkpoints cannot be loaded directly into this adapted encoder.
 
-LiDAR still uses the supplied four-input voxel feature: mean XYZ and log point
-count. Radar now pools mean radial and mean compensated radial velocity in each
-fine voxel and appends them to those four values. Only the radar input MLP's
-first layer changes to `Linear(6,16)`; `vendor/encoder.py` remains unmodified.
-RCS and scan age remain in the radar dataset but are not encoder inputs.
-Old four-input radar encoder, teacher, and student checkpoints are incompatible.
-LiDAR encoder checkpoints retain the original four-input layout.
+The radar point encoder uses mean XYZ and log density plus pooled RCS, radial
+and compensated Doppler velocity, and scan age. The LiDAR point encoder uses
+mean XYZ and log density plus reflectivity. These are the earlier Stage-I
+feature paths. Old exact-Downloads encoder, teacher, and student checkpoints
+are incompatible with this version; start new runs for all three phases.
 
 ## Phases and parameters
 
 | Phase | Frozen | Trained | Output |
 | --- | --- | --- | --- |
-| 0 radar | none | independent PFE with Doppler input and a temporary 512-bin head | `radar/best_encoder.pth` |
-| 0 LiDAR | none | independent original LiDAR PFE and a temporary 512-bin head | `lidar/best_encoder.pth` |
+| 0 radar | none | earlier Stage-I radar PFE, 128→64 adapter, temporary 512-bin head | `radar/best_encoder.pth` |
+| 0 LiDAR | none | earlier Stage-I LiDAR PFE, 128→64 adapter, temporary 512-bin head | `lidar/best_encoder.pth` |
 | 1 teacher | both pretrained PFEs | separate residual adapters, bottleneck Q/K/V/O, scalar gate, alignment projections | radar-coordinate LiDAR-aware 64D features |
 | 2 student | radar PFE and complete teacher | shared residual transform, feature MLP, three-level generative sparse confidence decoder | radar-only 64D features and raw fine-voxel confidence |
 
-No pretrained encoder weights were available for the exact Downloads encoder.
-Phase 0 therefore trains two independent copies. Its **chosen new pretraining
-objective** masks input features in complete stride-8 cells and predicts the
+Phase 0 trains both encoders independently from scratch. Its pretraining
+objective masks input features in complete stride-8 cells and predicts the
 distribution of observed points over their 512 fine child cells. It does not
 assert that unmeasured cells are empty and does not itself learn radar–LiDAR
 correspondence. Sparse input coordinates remain present during masking, so this
 is a feature-masking objective rather than a fully hidden geometry task. The
-current pretrainer also applies its mask helper to already downsampled output
-coordinates, dividing those coordinates by eight a second time. Consequently,
-the sites selected for loss do not consistently match the feature-masked sites.
-This requires a separate correction before Phase 0 learning curves can validate
-the intended objective; the radar input change here does not alter it. The
-512-bin head is discarded. `best_encoder.pth`
-contains the PFE state dictionary directly and is loaded strictly by Phase 1.
-The LiDAR PFE remains exact, while radar uses the six-input first layer above.
+loss mask now selects the same stride-8 parent cells as the input mask. The
+512-bin head is discarded. `best_encoder.pth` contains the point encoder,
+sparse backbone, and 128→64 adapter and is loaded strictly by Phase 1.
 Current-frame radar returns are used for
 reliable object-label assignment; the full stack supplies encoder geometry and
 Doppler velocity features.
@@ -148,8 +136,7 @@ Python, CUDA, PyTorch, `spconv`, MinkowskiEngine, NumPy, SciPy, tqdm, and
 matplotlib are needed for all three GPU phases. TensorBoard is optional when
 the trainers use `--no-tensorboard`; `metrics.jsonl` and PNG plots are still
 written. Install `tensorboard` into the same Python environment and omit that
-flag to write event files. The original
-PFE constructor requires CUDA even though the mathematical unit tests are
+flag to write event files. The sparse PFE backend requires CUDA even though mathematical unit tests are
 CPU-compatible. On the professor machine, the existing user-space OpenBLAS
 runtime must be on `LD_LIBRARY_PATH` for MinkowskiEngine. The GPU decoder
 smoke test should pass before Phase 2 training. The full generative candidate
@@ -171,7 +158,7 @@ so each phase can be inspected before starting the next.
 BASE=/mnt/3D10B36523559581/Gianluca
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 PY="$BASE/Sensor-Fusion/.venv_model_v2/bin/python"
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_raw64_voxel_020_020_025
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_previous_pfe_raw64
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
@@ -180,7 +167,7 @@ mkdir -p "$OUT"
 # Backend coordinate and backward check; no dataset or encoder weights needed.
 "$PY" -m scripts.smoke_crossmodal_raw_decoder
 
-# Phase 0: two independent PFE pretrains.
+# Phase 0: retrain the previous Stage-I radar and LiDAR encoder architecture.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality radar --output-root "$OUT/radar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
@@ -241,13 +228,7 @@ only when that optional dependency is installed and logging is enabled. The outp
 for future Stage II conditioning. Existing Stage II diffusion checkpoints are
 **not** compatible with this new 64D/stride-8 interface without a new adapter.
 
-The Windows workspace has no trained exact-PFE checkpoint or sparse CUDA
-backend. Before this voxel-size change, on the professor's RTX 4090, one-frame GPU smoke tests passed for
-both independent encoder pretrains, teacher training, student training,
-checkpoint reload/evaluation, and raw radar-only export. The sparse decoder
-expanded one stride-8 site to 512 fine sites and backpropagated finite
-gradients. These runs verify integration only. Full training and held-out
-quality assessment remain necessary. The one-frame smoke student represented
-11.7% of clean returns inside the previous fixed PFE grid; that candidate-coverage
-ceiling cannot improve through confidence training alone for that frame. Rerun
-the GPU smoke test and all training phases with the new voxel size.
+The Windows workspace has no trained checkpoint for this adapted encoder and
+no sparse CUDA backend. Run a one-frame GPU smoke test of each phase on the
+professor machine before starting full training. Previous one-frame results
+from the Downloads-PFE version do not establish the quality of this encoder.

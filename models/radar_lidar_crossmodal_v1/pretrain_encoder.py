@@ -1,9 +1,8 @@
-"""Train independent PFE encoders before Phase 1, with radar Doppler input."""
+"""Train independent previous Stage-I PFE encoders before Phase 1."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +13,8 @@ from tqdm import tqdm
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
 
-from .encoder import BOTTLENECK_CHANNELS, OriginalPFE, VENDOR, masked_bottleneck_sites
+from .encoder import BOTTLENECK_CHANNELS
+from .previous_encoder import PreviousStage1PFE, _selected_coarse_sites
 from .history import log_record, open_writer, overfitting_warning
 from .plots import update_plots
 from .pipeline_data import collate_stage1, paired_dataset
@@ -25,7 +25,7 @@ from .train_teacher import _move
 class GeometryPretrainer(nn.Module):
     def __init__(self, modality: str):
         super().__init__()
-        self.encoder = OriginalPFE(modality=modality)
+        self.encoder = PreviousStage1PFE(modality=modality)
         # Training-only head; neither teacher nor student loads or exports it.
         self.local_distribution = nn.Linear(BOTTLENECK_CHANNELS, 512)
 
@@ -33,7 +33,7 @@ class GeometryPretrainer(nn.Module):
         sites = self.encoder(points, valid, input_mask_rate=mask_rate, mask_salt=mask_salt)
         target = observed_child_distribution(sites, points, valid)
         logits = self.local_distribution(sites.features)
-        held_out = masked_bottleneck_sites(sites.coords, mask_rate, mask_salt)
+        held_out = _selected_coarse_sites(sites.coords, mask_rate, mask_salt)
         loss, eligible = observed_distribution_loss(logits, target, held_out)
         return loss, eligible, len(sites.coords)
 
@@ -68,10 +68,6 @@ def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epo
             "eligible_sites": eligible_sum, "active_sites": active_sum}
 
 
-def _sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vod-root", type=Path, required=True)
@@ -96,7 +92,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.device != "cuda" or not torch.cuda.is_available():
-        parser.error("The unmodified original encoder needs CUDA")
+        parser.error("The previous Stage-I spconv encoder needs CUDA")
     if not 0 < args.mask_rate < 1:
         parser.error("Mask rate must lie strictly between zero and one")
     augmentation = GeometricAugmentationConfig.from_dict(
@@ -126,7 +122,9 @@ def main():
     start, best = 1, float("inf")
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if saved.get("modality") != args.modality or saved.get("mask_rate") != args.mask_rate:
+        if (saved.get("version") != "previous_stage1_pfe_geometry_pretrain_v1"
+                or saved.get("modality") != args.modality
+                or saved.get("mask_rate") != args.mask_rate):
             raise ValueError("Encoder pretraining resume configuration differs")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -153,23 +151,22 @@ def main():
         warning = overfitting_warning(args.output_root / "metrics.jsonl")
         if warning:
             print(f"Overfitting warning: {warning}", flush=True)
-        checkpoint = {"version": "original_pfe_geometry_pretrain_v2_doppler_radar",
+        checkpoint = {"version": "previous_stage1_pfe_geometry_pretrain_v1",
                       "modality": args.modality, "mask_rate": args.mask_rate,
                       "augmentation": augmentation.to_dict(),
                       "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                       "scheduler": scheduler.state_dict(), "epoch": epoch,
                       "best_val_loss": best, "validation": validation,
-                      "vendor_encoder_sha256": _sha(VENDOR / "encoder.py"),
-                      "vendor_config_sha256": _sha(VENDOR / "config.py")}
+                      "encoder_architecture": "stage1_pfe_spconv_16_32_64_128_to_64"}
         if full and validation["loss_total"] is not None and validation["loss_total"] < best:
             best = validation["loss_total"]
             checkpoint["best_val_loss"] = best
             torch.save(checkpoint, args.output_root / "best_pretrain.ckpt")
-            # Direct strict PFE_Engine state dict; the teacher loads this exact
-            # copy and discards the training-only local distribution head.
-            torch.save(model.encoder.encoder.state_dict(), args.output_root / "best_encoder.pth")
+            # Export point encoder, sparse backbone, and 128→64 adapter.
+            # The temporary distribution head is not part of inference.
+            torch.save(model.encoder.state_dict(), args.output_root / "best_encoder.pth")
         torch.save(checkpoint, args.output_root / "last.ckpt")
-        print(f"Original PFE {args.modality} {epoch:03d}/{args.epochs:03d} "
+        print(f"Previous Stage-I PFE {args.modality} {epoch:03d}/{args.epochs:03d} "
               f"train {training['loss_total']} val {validation['loss_total']} "
               f"scope {'full' if full else 'quick'}", flush=True)
     if writer is not None:

@@ -1,27 +1,26 @@
 # Thesis-1: radar–LiDAR cross-modal learning
 
-Standalone extraction of the current encoder → cross-modal teacher → radar-only
-student pipeline from `Gianluca3103/sensor-fusion-fault-localization` at
-`417aaa9989a8c747184f2fc35f79c734c94b32ee` (14 October 2026).
-The code and the exact supplied PFE encoder are retained; datasets, trained
-weights, older Stage I/II experiments, and generated reports are excluded.
+Standalone encoder → cross-modal teacher → radar-only student pipeline,
+based on the earlier Stage-I PFE architecture. Datasets, trained weights,
+older experiments, and generated reports are excluded.
 
 ## What is here
 
 | Path | Purpose |
 | --- | --- |
 | `models/radar_lidar_crossmodal_v1/` | Independent PFE pretraining, frozen-encoder teacher, radar-only student, evaluation, raw export |
-| `models/radar_lidar_crossmodal_v1/vendor/` | Supplied original `encoder.py` and its config; only voxel size in the config was changed to 0.2 × 0.2 × 0.25 m |
+| `models/radar_lidar_stage1/pfe_spconv.py` | Earlier Stage-I radar and LiDAR point encoders and four-scale sparse backbone |
+| `models/radar_lidar_crossmodal_v1/vendor/` | Retained Downloads encoder source, inactive in this pipeline |
 | `Fault_Localization_Model/vod_dataset/` | VoD decoding, calibration, verified 20-scan radar accumulation, Doppler radial compensation |
 | `models/radar_lidar_stage1/` | Shared voxel, sparse, correspondence, paired-data, and augmentation utilities |
 | `models/radar_lidar_stage2/` | Minimal candidate-domain contract and measured/free-space target construction for the student's confidence loss |
 | `scripts/` | Verified stack generation, Doppler radial variant generation, GPU decoder smoke check |
 | `configs/` | Teacher, student, and online augmentation settings |
 
-The 64-channel bottleneck uses the original PFE sparse backbone. LiDAR retains
-mean XYZ and log point count as its four voxel inputs. Radar adds mean radial
-and mean compensated radial Doppler velocity, changing only its first input
-MLP layer from four to six channels. RCS and scan age are not encoder inputs.
+The earlier sparse backbone has 16, 32, 64 and 128 feature channels. A trained
+128→64 adapter preserves the existing 64-channel cross-attention and student
+interface. Radar uses RCS, radial and compensated Doppler velocity, and scan
+age; LiDAR uses reflectivity. Both encoders are retrained independently.
 The student's fine-grid output is **raw confidence logits and probabilities**, with no
 interpolation or spherical influence expansion. It is not a reconstructed
 LiDAR point cloud or a trained Stage II diffusion model.
@@ -34,8 +33,8 @@ losses, metrics, checkpoint formats, and individual training commands.
 Use a CUDA-capable PyTorch environment with NumPy, SciPy, tqdm, matplotlib,
 `spconv`, and MinkowskiEngine. TensorBoard is optional with
 `--no-tensorboard`. The existing professor-machine Python environment has
-previously passed one-frame integration checks on the **old voxel grid**;
-the 0.2 × 0.2 × 0.25 m grid requires fresh GPU smoke tests and training.
+previously passed one-frame integration checks with the Downloads PFE;
+the previous Stage-I encoder architecture requires fresh GPU smoke tests.
 No dataset or weights are stored in this repository.
 
 The VoD root supplied as `--vod-root` must contain official `lidar`, `radar`,
@@ -73,16 +72,11 @@ inside the VoD root and refuse to silently replace existing outputs. Set
 
 ## Training status
 
-The original supplied `encoder.py` and `config.py` contained **no original
-training script or standard training hyperparameters**. The included Phase 0
-pretrainer is an experimental objective chosen in the previous repository.
-It currently applies its mask helper to already downsampled output
-coordinates, so its loss-selected sites can differ from its input-masked
-sites. Preserve this warning when reviewing Phase 0 metrics. Full sequential
-training was paused pending the original encoder training files; this
-extraction does not claim trained results or resolve that learning issue.
-Previous four-input radar, teacher, and student checkpoints cannot be resumed
-with this six-input radar path. The LiDAR encoder layout is unchanged.
+Phase 0 uses a masked child-distribution objective to train two independent
+earlier Stage-I encoders and their 128→64 adapters. The loss mask now matches
+the masked input's stride-8 cells. The teacher and student use only the saved
+encoder weights. No trained weights are included; old Downloads-PFE teacher
+and student checkpoints cannot be resumed with this encoder architecture.
 
 ## Provenance
 

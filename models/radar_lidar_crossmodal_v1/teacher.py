@@ -1,4 +1,4 @@
-"""Frozen exact-PFE encoders with an independently trainable bottleneck teacher."""
+"""Frozen previous Stage-I encoders with an independently trainable teacher."""
 
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ from torch.nn import functional as F
 from models.radar_lidar_stage1.correspondence import Neighborhood, local_neighbors
 from models.radar_lidar_stage1.sparse import SparseSites
 
-from .encoder import BOTTLENECK_CHANNELS, GRID, FrozenOriginalPFE
+from .encoder import BOTTLENECK_CHANNELS, GRID
+from .previous_encoder import FrozenPreviousStage1PFE
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class TeacherConfig:
 
     def __post_init__(self):
         if self.feature_dim != BOTTLENECK_CHANNELS or self.heads != 4 or self.feature_dim % self.heads:
-            raise ValueError("The exact Downloads encoder has 64 channels and uses four 16D heads")
+            raise ValueError("The encoder interface has 64 channels and uses four 16D heads")
         if min(self.max_candidates, self.radius_m, self.sigma_m, self.temperature,
                self.fusion_beta) <= 0:
             raise ValueError("Teacher geometry and loss scales must be positive")
@@ -89,7 +90,7 @@ class BottleneckTeacherCore(nn.Module):
     def forward(self, radar: SparseSites, lidar: SparseSites,
                 neighbors: Neighborhood) -> TeacherOutput:
         if radar.stride != 8 or lidar.stride != 8 or radar.shape_zyx != GRID.scale_shape(8):
-            raise ValueError("Expected original PFE stride-8 sparse bottlenecks")
+            raise ValueError("Expected previous Stage-I stride-8 sparse bottlenecks")
         n, k = neighbors.indices.shape
         d, h = self.config.feature_dim, self.config.heads
         if n != len(radar.coords) or k != self.config.max_candidates:
@@ -125,8 +126,8 @@ class CrossModalTeacher(nn.Module):
                  config: TeacherConfig | None = None):
         super().__init__()
         self.config = config or TeacherConfig()
-        self.radar_encoder = FrozenOriginalPFE(radar_checkpoint, modality="radar")
-        self.lidar_encoder = FrozenOriginalPFE(lidar_checkpoint, modality="lidar")
+        self.radar_encoder = FrozenPreviousStage1PFE(radar_checkpoint, modality="radar")
+        self.lidar_encoder = FrozenPreviousStage1PFE(lidar_checkpoint, modality="lidar")
         self.core = BottleneckTeacherCore(self.config)
 
     def train(self, mode: bool = True):
