@@ -101,6 +101,11 @@ COMMON=(--vod-root "$VOD" --radar-variant "$RADAR_VARIANT"
 SMOKE_ARGS=(--epochs 1 --batch-size 1 --train-limit 1 --val-limit 1
             --quick-val-frames 1 --full-val-every 1 --num-workers 0)
 FULL_ARGS=(--epochs 25 --full-val-every 5 --num-workers 2)
+ENCODER_BATCH_SIZE=${ENCODER_BATCH_SIZE:-4}
+if (( ENCODER_BATCH_SIZE < 1 )); then
+  printf 'ENCODER_BATCH_SIZE must be at least 1.\n' >&2
+  exit 1
+fi
 SMOKE=$OUT/smoke
 FULL=$OUT/full
 
@@ -139,11 +144,11 @@ printf 'All four one-frame smoke tests passed. Starting full training.\n'
 printf '\n=== Full training: independent encoders ===\n'
 run_phase 'radar encoder' "$FULL/radar" \
   models.radar_lidar_crossmodal_v1.pretrain_encoder \
-  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size 2 --modality radar
+  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size "$ENCODER_BATCH_SIZE" --modality radar
 test -s "$FULL/radar/best_encoder.pth"
 run_phase 'LiDAR encoder' "$FULL/lidar" \
   models.radar_lidar_crossmodal_v1.pretrain_encoder \
-  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size 2 --modality lidar
+  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size "$ENCODER_BATCH_SIZE" --modality lidar
 test -s "$FULL/lidar/best_encoder.pth"
 
 printf '\n=== Full training: cross-attention teacher ===\n'

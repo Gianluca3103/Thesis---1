@@ -61,8 +61,7 @@ def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epo
         if training and step % 50 == 0:
             print(json.dumps({"epoch": epoch, "step": step,
                               "loss": float(loss.detach()), "gradient_norm": float(grad_norm),
-                              "eligible_sites": eligible, "active_sites": active,
-                              "gpu_peak_gib": torch.cuda.max_memory_allocated() / 2**30}),
+                              "eligible_sites": eligible, "active_sites": active}),
                   flush=True)
     return {"loss_total": loss_sum / eligible_sum if eligible_sum else None,
             "eligible_sites": eligible_sum, "active_sites": active_sum}
@@ -79,7 +78,7 @@ def main():
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--mask-rate", type=float, default=0.3)
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--train-limit", type=int)

@@ -127,9 +127,7 @@ def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
                               "object_queries": metrics["object_queries"],
                               "geometry_queries": metrics["geometry_eligible"],
                               "radar_sites": len(output.radar_frozen.coords),
-                              "lidar_sites": len(output.lidar_frozen.coords),
-                              "gpu_peak_gib": (torch.cuda.max_memory_allocated() / 2**30
-                                               if torch.cuda.is_available() else None)}), flush=True)
+                              "lidar_sites": len(output.lidar_frozen.coords)}), flush=True)
     return summary.finish()
 
 

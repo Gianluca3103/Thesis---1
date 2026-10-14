@@ -138,8 +138,7 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0):
                                                   for key in ("distillation", "spatial", "bce", "dice")},
                               "feature_elements": pieces["feature_elements"],
                               "known_sites": pieces["known_sites"],
-                              "candidate_sites": len(output.confidence_logits.coords),
-                              "gpu_peak_gib": torch.cuda.max_memory_allocated() / 2**30}),
+                              "candidate_sites": len(output.confidence_logits.coords)}),
                   flush=True)
     return aggregate.finish(select_threshold=not training)
 
