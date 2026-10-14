@@ -11,13 +11,18 @@ RADAR_VARIANT=radar_20frames_verified_doppler_radial
 
 test -s "$PY"
 test -d "$VOD/lidar"
-mkdir -p "$OUT/tmp" "$OUT/matplotlib"
+SHORT_TMP=${CROSSMODAL_TMPDIR:-/dev/shm/cm-$UID}
+if (( ${#SHORT_TMP} > 60 )); then
+  printf 'Temporary path is too long for PyTorch worker sockets: %s\n' "$SHORT_TMP" >&2
+  exit 1
+fi
+mkdir -p "$SHORT_TMP" "$OUT/matplotlib"
 FREE_BYTES=$(df -B1 --output=avail "$OUT" | tail -n 1 | tr -d ' ')
 if (( FREE_BYTES < 15 * 1024 * 1024 * 1024 )); then
   printf 'Need at least 15 GiB free on the output volume: %s\n' "$OUT" >&2
   exit 1
 fi
-export TMPDIR="$OUT/tmp" TMP="$OUT/tmp" TEMP="$OUT/tmp" MPLCONFIGDIR="$OUT/matplotlib"
+export TMPDIR="$SHORT_TMP" TMP="$SHORT_TMP" TEMP="$SHORT_TMP" MPLCONFIGDIR="$OUT/matplotlib"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8 MPLBACKEND=Agg

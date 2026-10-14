@@ -41,8 +41,13 @@ if (( FREE_BYTES < MIN_FREE_GIB * 1024 * 1024 * 1024 )); then
   printf 'Need at least %s GiB free on the output volume: %s\n' "$MIN_FREE_GIB" "$OUT" >&2
   exit 1
 fi
-mkdir -p "$OUT/tmp" "$OUT/matplotlib"
-export TMPDIR="$OUT/tmp"
+SHORT_TMP=${CROSSMODAL_TMPDIR:-/dev/shm/cm-$UID}
+if (( ${#SHORT_TMP} > 60 )); then
+  printf 'Temporary path is too long for PyTorch worker sockets: %s\n' "$SHORT_TMP" >&2
+  exit 1
+fi
+mkdir -p "$SHORT_TMP" "$OUT/matplotlib"
+export TMPDIR="$SHORT_TMP"
 export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 export MPLCONFIGDIR="$OUT/matplotlib"
@@ -63,6 +68,12 @@ assert hasattr(previous_encoder, "PreviousStage1Sparse")
 print("Verified native sparse source:", Path(previous_encoder.__file__).resolve(), flush=True)
 '
 "$PY" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0), flush=True)'
+"$PY" -c '
+import tempfile, torch
+from torch.utils.data import DataLoader, TensorDataset
+assert next(iter(DataLoader(TensorDataset(torch.arange(4)), batch_size=2, num_workers=2)))[0].numel() == 2
+print("Two DataLoader workers ready; temporary directory:", tempfile.gettempdir(), flush=True)
+'
 printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "$OUT"
 
 run_phase() {
