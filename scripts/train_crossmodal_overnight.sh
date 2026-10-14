@@ -3,6 +3,12 @@ set -Eeuo pipefail
 
 # Run all three training phases with a one-frame integration check first.
 # OUT may be overridden when more space is available on another volume.
+SMOKE_ONLY=0
+case ${1:-} in
+  '') ;;
+  --smoke-only) SMOKE_ONLY=1 ;;
+  *) printf 'Usage: bash %s [--smoke-only]\n' "$0" >&2; exit 2 ;;
+esac
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BASE=${BASE:-/mnt/3D10B36523559581/Gianluca}
 VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC}
@@ -29,8 +35,10 @@ test -s "$TEACHER_CONFIG"
 test -s "$STUDENT_CONFIG"
 mkdir -p "$OUT"
 FREE_BYTES=$(df -B1 --output=avail "$OUT" | tail -n 1 | tr -d ' ')
-if (( FREE_BYTES < 15 * 1024 * 1024 * 1024 )); then
-  printf 'Need at least 15 GiB free on the output volume: %s\n' "$OUT" >&2
+MIN_FREE_GIB=15
+if (( SMOKE_ONLY )); then MIN_FREE_GIB=2; fi
+if (( FREE_BYTES < MIN_FREE_GIB * 1024 * 1024 * 1024 )); then
+  printf 'Need at least %s GiB free on the output volume: %s\n' "$MIN_FREE_GIB" "$OUT" >&2
   exit 1
 fi
 mkdir -p "$OUT/tmp" "$OUT/matplotlib"
@@ -111,6 +119,10 @@ run_phase 'smoke radar-only student' "$SMOKE/student" \
   models.radar_lidar_crossmodal_v1.train_student \
   "${COMMON[@]}" "${SMOKE_ARGS[@]}" --config "$STUDENT_CONFIG" \
   --teacher-checkpoint "$SMOKE_TEACHER"
+if (( SMOKE_ONLY )); then
+  printf 'All four one-frame smoke tests passed. Full training was not started.\n'
+  exit 0
+fi
 printf 'All four one-frame smoke tests passed. Starting full training.\n'
 
 printf '\n=== Full training: independent encoders ===\n'
