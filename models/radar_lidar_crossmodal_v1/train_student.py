@@ -17,7 +17,8 @@ from .pipeline_data import collate_stage1, paired_dataset
 from .history import log_record, open_writer, overfitting_warning
 from .plots import update_plots
 from .student import RadarOnlyStudent, StudentConfig
-from .student_loss import radar_supported_iou, student_objective, student_targets
+from .student_loss import (radar_supported_iou, student_objective, student_targets,
+                           teacher_correspondence_evidence)
 from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move, _prior_full_records, load_teacher
 
 
@@ -26,20 +27,25 @@ class Summary:
         self.config = config
         self.feature_elements = self.known_sites = 0
         self.distill_sum = self.bce_sum = 0.
+        self.bce_weight_sum = 0.
         self.dice_inter = self.dice_prob = self.dice_true = 0.
         self.counts = {name: 0 for name in ("occupied_sites", "free_sites", "unknown_sites")}
-        self.sweep = {threshold: {"known": [0, 0], "conventional": [0, 0]}
+        self.sweep = {threshold: {"known": [0, 0], "conventional": [0, 0],
+                                  "teacher": [0, 0]}
                       for threshold in config.thresholds}
         self.clean_represented = self.clean_in_grid = 0
         self.frames = 0
         self.candidate_sites = 0
 
-    def add(self, pieces, output, targets, batch_count, *, evaluate=False):
+    def add(self, pieces, output, targets, batch_count, *, teacher_evidence=None,
+            evaluate=False):
         features, known = pieces["feature_elements"], pieces["known_sites"]
         self.feature_elements += features
         self.known_sites += known
         self.distill_sum += float(pieces["distillation"].detach()) * features
-        self.bce_sum += float(pieces["bce"].detach()) * known
+        bce_weight = float(pieces["bce_weight_sum"])
+        self.bce_sum += float(pieces["bce"].detach()) * bce_weight
+        self.bce_weight_sum += bce_weight
         self.dice_inter += float(pieces["dice_intersection"])
         self.dice_prob += float(pieces["dice_probability_sum"])
         self.dice_true += float(pieces["dice_target_sum"])
@@ -48,18 +54,23 @@ class Summary:
         self.frames += batch_count
         self.candidate_sites += len(output.confidence_logits.coords)
         if evaluate:
+            if teacher_evidence is None:
+                raise ValueError("Validation requires frozen teacher correspondence evidence")
             self.clean_represented += targets.clean_points_in_candidates
             self.clean_in_grid += targets.clean_points_in_grid
             for threshold in self.config.thresholds:
-                row = radar_supported_iou(output, targets, threshold)
+                row = radar_supported_iou(
+                    output, targets, threshold, teacher_evidence,
+                    self.config.teacher_evidence_threshold)
                 for name, target_key in (("known", "known_space_masked"),
-                                         ("conventional", "conventional_clean_scan")):
+                                         ("conventional", "conventional_clean_scan"),
+                                         ("teacher", "teacher_correspondence_supported")):
                     self.sweep[threshold][name][0] += row[target_key]["intersection"]
                     self.sweep[threshold][name][1] += row[target_key]["union"]
 
     def finish(self, *, select_threshold=False):
         distill = self.distill_sum / self.feature_elements if self.feature_elements else None
-        bce = self.bce_sum / self.known_sites if self.known_sites else None
+        bce = self.bce_sum / self.bce_weight_sum if self.bce_weight_sum else None
         dice = (1 - (2 * self.dice_inter + 1e-6) /
                 (self.dice_prob + self.dice_true + 1e-6)) if self.dice_true else 0.
         spatial = (bce or 0.) + self.config.dice_weight * dice
@@ -82,6 +93,8 @@ class Summary:
             report.update({"selected_threshold": best,
                            "radar_supported_iou_known": rows[str(best)]["known"]["iou"],
                            "radar_supported_iou_conventional": rows[str(best)]["conventional"]["iou"],
+                           "teacher_correspondence_supported_iou": rows[str(best)]["teacher"]["iou"],
+                           "teacher_evidence_threshold": self.config.teacher_evidence_threshold,
                            "threshold_sweep": rows,
                            "candidate_coverage": self.clean_represented / max(self.clean_in_grid, 1),
                            "clean_points_in_candidates": self.clean_represented,
@@ -105,14 +118,18 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0):
         with torch.set_grad_enabled(training):
             output = student(batch["radar"], batch["radar_valid"])
             targets = student_targets(output, batch["clean_lidar"], batch["clean_lidar_valid"])
-            loss, pieces = student_objective(output, teacher_output.fused, targets, student.config)
+            evidence = teacher_correspondence_evidence(
+                teacher_output, output.confidence_logits)
+            loss, pieces = student_objective(output, teacher_output.fused, targets,
+                                             student.config, evidence)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     (parameter for parameter in student.parameters() if parameter.requires_grad), 5.)
                 optimizer.step()
-        aggregate.add(pieces, output, targets, len(batch["frame_id"]), evaluate=not training)
+        aggregate.add(pieces, output, targets, len(batch["frame_id"]),
+                      teacher_evidence=evidence, evaluate=not training)
         if training and batch_index % 50 == 0:
             print(json.dumps({"epoch": epoch, "step": batch_index,
                               "loss": float(loss.detach()), "grad_norm": float(grad_norm),

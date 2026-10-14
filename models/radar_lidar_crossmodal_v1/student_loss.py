@@ -32,7 +32,66 @@ def student_targets(output: StudentOutput, clean_points: torch.Tensor,
     return make_targets(domain, clean_points, clean_valid)
 
 
-def student_objective(output: StudentOutput, teacher_sites, targets, config: StudentConfig):
+@torch.no_grad()
+def teacher_correspondence_evidence(teacher_output, candidate_sites) -> torch.Tensor:
+    """Project mean four-head attention to existing fine candidate parents.
+
+    Attention supplies a coarse supervision weight, never a fine occupancy
+    label or a candidate coordinate. Repeated neighbors of one radar query
+    contribute together; evidence from different queries combines by max.
+    """
+    radar = teacher_output.radar_frozen
+    lidar = teacher_output.lidar_frozen
+    neighbors = teacher_output.neighbors.indices
+    attention = teacher_output.attention
+    coarse_shape = GRID.scale_shape(8)
+    if (radar.stride != 8 or lidar.stride != 8 or candidate_sites.stride != 1
+            or radar.shape_zyx != coarse_shape or lidar.shape_zyx != coarse_shape
+            or candidate_sites.shape_zyx != GRID.shape_zyx):
+        raise ValueError("Teacher and candidate coordinates must use the shared stride-8 grid")
+    if (neighbors.ndim != 2 or neighbors.shape[0] != len(radar.coords)
+            or attention.shape != (len(radar.coords), 4, neighbors.shape[1])):
+        raise ValueError("Teacher attention and neighborhood shapes differ")
+    if (radar.coords.device != lidar.coords.device
+            or radar.coords.device != candidate_sites.coords.device
+            or attention.device != radar.coords.device
+            or neighbors.device != radar.coords.device):
+        raise ValueError("Teacher and student coordinates must share a device")
+    evidence = attention.new_zeros(len(candidate_sites.coords))
+    valid_query, valid_slot = (neighbors >= 0).nonzero(as_tuple=True)
+    if not len(valid_query) or not len(evidence):
+        return evidence
+    lidar_index = neighbors[valid_query, valid_slot]
+    if bool((lidar_index >= len(lidar.coords)).any()):
+        raise ValueError("Teacher neighborhood refers to a missing LiDAR site")
+    if not torch.equal(radar.coords[valid_query, 0], lidar.coords[lidar_index, 0]):
+        raise ValueError("Teacher neighborhood crosses sample boundaries")
+
+    lidar_keys = encode_keys(lidar.coords[lidar_index], coarse_shape)
+    query_parent = torch.stack((valid_query, lidar_keys), dim=1)
+    unique_pairs, pair_inverse = torch.unique(query_parent, dim=0,
+                                              sorted=True, return_inverse=True)
+    mean_attention = attention.mean(dim=1)[valid_query, valid_slot]
+    summed = mean_attention.new_zeros(len(unique_pairs))
+    summed.index_add_(0, pair_inverse, mean_attention)
+    parent_keys, parent_inverse = torch.unique(unique_pairs[:, 1], sorted=True,
+                                               return_inverse=True)
+    parent_scores = summed.new_zeros(len(parent_keys))
+    parent_scores.scatter_reduce_(0, parent_inverse, summed, reduce="amax",
+                                  include_self=True)
+
+    parents = candidate_sites.coords.clone()
+    parents[:, 1:] //= 8
+    candidate_keys = encode_keys(parents, coarse_shape)
+    position = torch.searchsorted(parent_keys, candidate_keys)
+    matched = ((position < len(parent_keys))
+               & (parent_keys[position.clamp(max=len(parent_keys) - 1)] == candidate_keys))
+    evidence[matched] = parent_scores[position[matched]]
+    return evidence
+
+
+def student_objective(output: StudentOutput, teacher_sites, targets, config: StudentConfig,
+                      teacher_evidence: torch.Tensor | None = None):
     target_features = aligned_teacher_features(output, teacher_sites)
     if len(target_features):
         distill = F.smooth_l1_loss(output.conditioning.features, target_features,
@@ -44,12 +103,25 @@ def student_objective(output: StudentOutput, teacher_sites, targets, config: Stu
     if occupied.shape != logits.shape or free.shape != logits.shape or (occupied & free).any():
         raise ValueError("Confidence labels must be disjoint and match candidate sites")
     known = occupied | free
+    if teacher_evidence is not None and teacher_evidence.shape != logits.shape:
+        raise ValueError("Teacher evidence must match existing candidate sites")
     dice_intersection = logits.new_zeros(())
     dice_probability_sum = logits.new_zeros(())
     dice_target_sum = logits.new_zeros(())
     if known.any():
-        bce = F.binary_cross_entropy_with_logits(logits[known], occupied[known].float(),
-                                                  pos_weight=logits.new_tensor(config.positive_weight))
+        labels = occupied[known].float()
+        if config.lambda_teacher_evidence and teacher_evidence is not None:
+            per_site = F.binary_cross_entropy_with_logits(
+                logits[known], labels, pos_weight=logits.new_tensor(config.positive_weight),
+                reduction="none")
+            weights = 1 + config.lambda_teacher_evidence * teacher_evidence[known].detach() * labels
+            bce_weight_sum = weights.sum()
+            bce = (weights * per_site).sum() / bce_weight_sum
+        else:
+            # Preserve the original objective exactly when evidence is disabled.
+            bce = F.binary_cross_entropy_with_logits(
+                logits[known], labels, pos_weight=logits.new_tensor(config.positive_weight))
+            bce_weight_sum = logits.new_tensor(len(labels))
         probabilities = torch.sigmoid(logits[known])
         positives = occupied[known].float()
         dice_intersection = (probabilities * positives).sum()
@@ -60,10 +132,12 @@ def student_objective(output: StudentOutput, teacher_sites, targets, config: Stu
     else:
         bce = logits.sum() * 0
         dice = logits.sum() * 0
+        bce_weight_sum = logits.new_zeros(())
     spatial = bce + config.dice_weight * dice
     total = config.distillation_weight * distill + config.spatial_weight * spatial
     return total, {"distillation": distill, "spatial": spatial, "bce": bce,
                    "dice": dice, "feature_elements": target_features.numel(),
+                   "bce_weight_sum": bce_weight_sum.detach(),
                    "known_sites": int(known.sum()), "occupied_sites": int(occupied.sum()),
                    "free_sites": int(free.sum()), "unknown_sites": int((~known).sum()),
                    "dice_intersection": dice_intersection.detach(),
@@ -71,13 +145,17 @@ def student_objective(output: StudentOutput, teacher_sites, targets, config: Stu
                    "dice_target_sum": dice_target_sum.detach()}
 
 
-def radar_supported_iou(output: StudentOutput, targets, threshold: float):
+def radar_supported_iou(output: StudentOutput, targets, threshold: float,
+                        teacher_evidence: torch.Tensor | None = None,
+                        evidence_threshold: float = 0.2):
     """Conventional candidate-domain IoU and known-space masked variant."""
     predicted = torch.sigmoid(output.confidence_logits.features[:, 0]) >= threshold
     occupied, free = targets.occupied, targets.known_free
     known = occupied | free
     if predicted.shape != occupied.shape:
         raise ValueError("Prediction and candidate labels differ")
+    if teacher_evidence is not None and teacher_evidence.shape != predicted.shape:
+        raise ValueError("Teacher evidence must match existing candidate sites")
 
     def measure(mask):
         intersection = int((predicted & occupied & mask).sum())
@@ -85,7 +163,7 @@ def radar_supported_iou(output: StudentOutput, targets, threshold: float):
         return {"intersection": intersection, "union": union,
                 "iou": intersection / union if union else None}
 
-    return {
+    report = {
         "conventional_clean_scan": measure(torch.ones_like(known)),
         "known_space_masked": measure(known),
         "candidate_sites": len(predicted),
@@ -99,3 +177,7 @@ def radar_supported_iou(output: StudentOutput, targets, threshold: float):
         "clean_points_in_candidates": targets.clean_points_in_candidates,
         "clean_points_in_grid": targets.clean_points_in_grid,
     }
+    if teacher_evidence is not None:
+        report["teacher_correspondence_supported"] = measure(
+            known & (teacher_evidence >= evidence_threshold))
+    return report

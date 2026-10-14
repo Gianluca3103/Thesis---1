@@ -106,6 +106,13 @@ each active coarse cell is generated; high confidence is learned separately.
 Clean LiDAR labels are positive where a point was measured, negative only on
 conservatively verified pre-return free space, and ignored elsewhere. The
 spatial objective is known-site weighted BCE with logits plus 0.5 soft Dice.
+During student training, frozen teacher attention is averaged across four heads
+and summed for LiDAR bottleneck neighbors sharing each fine candidate's stride-8
+parent; the maximum evidence over radar queries increases only positive BCE
+weights by `1 + lambda_teacher_evidence × evidence` (default λ = 0.5).
+Known-free labels keep weight one, and LiDAR remains the occupancy target.
+Setting λ to zero recovers the original positive-class-weighted BCE. Teacher
+evidence does not create candidates or enter radar-only student inference.
 Total student loss is `distillation_weight × SmoothL1 + spatial_weight ×
 (BCE + dice_weight × Dice)`. This does not force reconstruction of every clean
 LiDAR hit outside the radar-generated candidate domain. The student output is
@@ -119,6 +126,11 @@ space has no trustworthy negative label. Both, the selected threshold, and
 candidate coverage (represented clean points / all clean points inside the
 declared fixed PFE grid) are logged. Thresholds 0.1–0.9 are selected using
 validation only; the exported logits and probabilities remain unthresholded.
+The diagnostic `teacher_correspondence_supported_iou` also masks known sites
+to candidates with teacher evidence at least `teacher_evidence_threshold`
+(default 0.2). Its intersection and union are summed across validation frames.
+It does not affect threshold or checkpoint selection; an empty region reports
+`null` IoU.
 
 ## Data and dependencies
 

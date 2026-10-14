@@ -28,6 +28,8 @@ class StudentConfig:
     dice_weight: float = 0.5
     distillation_weight: float = 1.0
     spatial_weight: float = 1.0
+    lambda_teacher_evidence: float = 0.5
+    teacher_evidence_threshold: float = 0.2
     smooth_l1_beta: float = 1.0
     confidence_threshold: float = 0.5
     thresholds: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
@@ -36,8 +38,11 @@ class StudentConfig:
         if self.feature_dim != BOTTLENECK_CHANNELS or min(self.decoder_channels) < 1:
             raise ValueError("Student must use the exact 64-channel original PFE bottleneck")
         if min(self.positive_weight, self.smooth_l1_beta) <= 0 or min(
-                self.dice_weight, self.distillation_weight, self.spatial_weight) < 0:
+                self.dice_weight, self.distillation_weight, self.spatial_weight,
+                self.lambda_teacher_evidence) < 0:
             raise ValueError("Student loss weights are invalid")
+        if not 0 <= self.teacher_evidence_threshold <= 1:
+            raise ValueError("Teacher evidence threshold must be in [0,1]")
         if not 0 < self.confidence_threshold < 1:
             raise ValueError("Confidence threshold must be in (0,1)")
         if (not self.thresholds or any(not 0 < value < 1 for value in self.thresholds)
