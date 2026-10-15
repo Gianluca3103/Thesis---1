@@ -154,7 +154,7 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0,
 
 def _save(path, student, optimizer, scheduler, teacher_path, teacher_hash, epoch, step,
           args, validation):
-    torch.save({"version": "crossmodal_student_v4_stage1_native_sparse_raw64", "config": asdict(student.config),
+    torch.save({"version": "crossmodal_student_v5_multiscale_refined_raw64", "config": asdict(student.config),
                 "model": student.state_dict(), "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(), "epoch": epoch, "step": step,
                 "teacher_checkpoint": str(teacher_path.resolve()), "teacher_sha256": teacher_hash,
@@ -169,8 +169,8 @@ def _save(path, student, optimizer, scheduler, teacher_path, teacher_hash, epoch
 
 def load_student(path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") != "crossmodal_student_v4_stage1_native_sparse_raw64":
-        raise ValueError("Expected versioned raw-confidence student checkpoint")
+    if saved.get("version") != "crossmodal_student_v5_multiscale_refined_raw64":
+        raise ValueError("Expected a trained multiscale-refined raw-confidence student checkpoint")
     model = RadarOnlyStudent(saved["radar_checkpoint"], StudentConfig(**saved["config"]))
     model.load_state_dict(saved["model"], strict=True)
     return model.to(device).eval(), saved
@@ -269,7 +269,8 @@ def main():
     start, step = 1, 0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if (saved["config"] != asdict(config) or saved["teacher_sha256"] != teacher_hash
+        if (saved.get("version") != "crossmodal_student_v5_multiscale_refined_raw64"
+                or saved["config"] != asdict(config) or saved["teacher_sha256"] != teacher_hash
                 or saved["augmentation"] != args.augmentation.to_dict()
                 or saved.get("lidar_fov") != RADAR_FOV_SPEC):
             raise ValueError("Student resume configuration or frozen teacher changed")

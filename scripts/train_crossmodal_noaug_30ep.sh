@@ -79,6 +79,7 @@ cd "$REPO"
 
 "$PY" -c 'import json,sys; assert json.load(open(sys.argv[1]))["enabled"] is False' "$NOAUG"
 "$PY" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0), flush=True)'
+"$PY" -m scripts.smoke_crossmodal_raw_decoder
 printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "$OUT"
 
 run_phase() {

@@ -75,8 +75,25 @@ class PreviousStage1Sparse(nn.Module):
                 return self._encode(points, valid, 0.0, mask_salt)
         return self._encode(points, valid, input_mask_rate, mask_salt)
 
+    def forward_pyramid(self, points: torch.Tensor, valid: torch.Tensor
+                        ) -> tuple[SparseSites, tuple[SparseSites, ...]]:
+        """Expose the existing fine levels for radar-only learned decoding.
+
+        The encoder weights and its ordinary bottleneck forward stay unchanged.
+        """
+        if not self.frozen:
+            raise ValueError("The decoder pyramid requires a frozen encoder")
+        with torch.no_grad():
+            return self._encode_and_levels(points, valid, 0.0, 0)
+
     def _encode(self, points: torch.Tensor, valid: torch.Tensor,
                 input_mask_rate: float, mask_salt: int) -> SparseSites:
+        bottleneck, _ = self._encode_and_levels(points, valid, input_mask_rate, mask_salt)
+        return bottleneck
+
+    def _encode_and_levels(self, points: torch.Tensor, valid: torch.Tensor,
+                           input_mask_rate: float, mask_salt: int
+                           ) -> tuple[SparseSites, tuple[SparseSites, ...]]:
         fine, _ = self.point(points, valid, defer_diagnostics=True)
         if input_mask_rate:
             masked = masked_bottleneck_sites(fine.coords, input_mask_rate, mask_salt)
@@ -84,13 +101,15 @@ class PreviousStage1Sparse(nn.Module):
         levels, _ = self.backbone(fine, defer_diagnostics=True)
         coarse = levels[-1]
         if not len(coarse.coords):
-            return SparseSites._from_validated(
+            empty = SparseSites._from_validated(
                 coarse.coords, coarse.features.new_empty((0, BOTTLENECK_CHANNELS)),
                 GRID.scale_shape(8), 8)
+            return empty, tuple(levels[:-1])
         order = torch.argsort(encode_keys(coarse.coords, GRID.scale_shape(8)), stable=True)
-        return SparseSites._from_validated(
+        bottleneck = SparseSites._from_validated(
             coarse.coords[order], self.output_adapter(coarse.features[order]),
             GRID.scale_shape(8), 8)
+        return bottleneck, tuple(levels[:-1])
 
 
 class FrozenPreviousStage1Sparse(PreviousStage1Sparse):

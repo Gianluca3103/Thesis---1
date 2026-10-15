@@ -52,7 +52,9 @@ class StudentConfig:
 
 
 class GenerativeBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    """Learn fine sites, then exchange features across adjacent generated sites."""
+
+    def __init__(self, in_channels, out_channels, skip_channels):
         super().__init__()
         if ME is None:
             raise RuntimeError("MinkowskiEngine is required for unpruned generative sparse decoding")
@@ -60,26 +62,62 @@ class GenerativeBlock(nn.Module):
             in_channels, out_channels, kernel_size=2, stride=2, dimension=3)
         self.norm = nn.LayerNorm(out_channels)
 
-    def forward(self, tensor):
+        # These radar features were already computed by the frozen encoder at
+        # the matching resolution. Exact coordinate joins keep inference radar-only.
+        self.skip_projection = nn.Linear(skip_channels, out_channels, bias=False)
+        self.spatial = ME.MinkowskiConvolution(
+            out_channels, out_channels, kernel_size=3, stride=1, dimension=3)
+        self.spatial_norm = nn.LayerNorm(out_channels)
+
+    def _joined_skip(self, tensor, skip: SparseSites) -> torch.Tensor:
+        stride = int(tensor.tensor_stride[0])
+        if skip.stride != stride or skip.shape_zyx != GRID.scale_shape(stride):
+            raise ValueError("Radar skip features must match the decoder level")
+        if not len(skip.coords):
+            return tensor.F.new_zeros(tensor.F.shape)
+        compact = tensor.C.to(device=tensor.F.device, dtype=torch.long).clone()
+        compact[:, 1:] //= stride
+        keys = encode_keys(compact, skip.shape_zyx)
+        source_keys = skip.keys
+        positions = torch.searchsorted(source_keys, keys)
+        present = ((positions < len(source_keys)) &
+                   (source_keys[positions.clamp(max=len(source_keys) - 1)] == keys))
+        projected = self.skip_projection(skip.features)
+        return projected[positions.clamp(max=len(source_keys) - 1)] * present[:, None]
+
+    def forward(self, tensor, skip: SparseSites | None = None):
         tensor = self.up(tensor)
-        return ME.SparseTensor(F.silu(self.norm(tensor.F)),
-                               coordinate_map_key=tensor.coordinate_map_key,
-                               coordinate_manager=tensor.coordinate_manager)
+        features = self.norm(tensor.F)
+        if skip is not None:
+            features = features + self._joined_skip(tensor, skip)
+        x = ME.SparseTensor(F.silu(features),
+                            coordinate_map_key=tensor.coordinate_map_key,
+                            coordinate_manager=tensor.coordinate_manager)
+        mixed = self.spatial(x)
+        if mixed.coordinate_map_key != x.coordinate_map_key:
+            raise RuntimeError("Spatial refinement unexpectedly changed candidate coordinates")
+        return ME.SparseTensor(F.silu(x.F + self.spatial_norm(mixed.F)),
+                               coordinate_map_key=x.coordinate_map_key,
+                               coordinate_manager=x.coordinate_manager)
 
 
 class RawSparseConfidenceDecoder(nn.Module):
-    """Expand every bottleneck site by 2×2×2 at each of three levels."""
+    """Decode to the original grid with learned local mixing at every scale."""
 
     def __init__(self, config: StudentConfig):
         super().__init__()
         widths = (config.feature_dim, *config.decoder_channels)
-        self.blocks = nn.ModuleList(GenerativeBlock(widths[i], widths[i + 1])
-                                    for i in range(3))
+        self.blocks = nn.ModuleList(
+            GenerativeBlock(widths[i], widths[i + 1], (64, 32, 16)[i])
+            for i in range(3))
         self.logits = nn.Linear(widths[-1], 1)
 
-    def forward(self, bottleneck: SparseSites):
+    def forward(self, bottleneck: SparseSites,
+                radar_pyramid: tuple[SparseSites, ...] | None = None):
         if bottleneck.stride != 8 or bottleneck.shape_zyx != GRID.scale_shape(8):
             raise ValueError("Expected adapted Stage-I stride-8 bottleneck")
+        if radar_pyramid is not None and tuple(level.stride for level in radar_pyramid) != (1, 2, 4):
+            raise ValueError("Expected radar encoder levels at strides 1, 2, and 4")
         if not len(bottleneck.coords):
             return SparseSites._from_validated(
                 bottleneck.coords.new_empty((0, 4)),
@@ -91,8 +129,9 @@ class RawSparseConfidenceDecoder(nn.Module):
         x = ME.SparseTensor(bottleneck.features.contiguous(),
                             coordinates=fine_coordinates.contiguous(),
                             tensor_stride=bottleneck.stride)
-        for block in self.blocks:
-            x = block(x)
+        for index, block in enumerate(self.blocks):
+            skip = radar_pyramid[2 - index] if radar_pyramid is not None else None
+            x = block(x, skip)
         coordinates = x.C.to(device=bottleneck.features.device, dtype=torch.long)
         if tuple(int(value) for value in x.tensor_stride) != (1, 1, 1):
             raise RuntimeError("Generative decoder did not reach fine-grid stride 1")
@@ -148,8 +187,13 @@ class RadarOnlyStudent(nn.Module):
     def forward(self, radar_points, radar_valid) -> StudentOutput:
         # No LiDAR, teacher, LiDAR coordinates or target labels enter this path.
         with torch.no_grad():
-            radar = self.radar_encoder(radar_points, radar_valid)
+            if hasattr(self.radar_encoder, "forward_pyramid"):
+                radar, pyramid = self.radar_encoder.forward_pyramid(radar_points, radar_valid)
+            else:
+                radar = self.radar_encoder(radar_points, radar_valid)
+                pyramid = None
         shared = radar.replace_features(self.shared(radar.features))
         feature = shared.replace_features(self.feature_norm(self.feature_head(shared.features)))
-        confidence = self.confidence_decoder(shared)
+        confidence = (self.confidence_decoder(shared, pyramid) if pyramid is not None
+                      else self.confidence_decoder(shared))
         return StudentOutput(feature, confidence)
