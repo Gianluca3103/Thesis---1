@@ -123,9 +123,11 @@ def main():
         if args.online_augmentation_config else None)
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=augmentation, seed=args.augmentation_seed,
-                           limit=args.train_limit, data_cache_root=args.data_cache_root)
+                           limit=args.train_limit, data_cache_root=args.data_cache_root,
+                           include_clean=args.modality == "lidar" or augmentation.enabled)
     val = paired_dataset(args.vod_root, "val", args.radar_variant,
-                         limit=args.val_limit, data_cache_root=args.data_cache_root)
+                         limit=args.val_limit, data_cache_root=args.data_cache_root,
+                         include_clean=args.modality == "lidar")
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, collate_fn=collate_stage1, pin_memory=True),
