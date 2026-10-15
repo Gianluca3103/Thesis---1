@@ -8,6 +8,7 @@ from typing import Protocol
 from Fault_Localization_Model.vod_dataset.vod_io import load_vod_lidar_to_camera
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
+from models.radar_lidar_stage1.radar_fov import RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M
 
 from .encoder import GRID
 from .supervision import voxel_object_ids
@@ -42,7 +43,9 @@ def paired_dataset(vod_root: str | Path, split: str, radar_variant: str, *,
     dataset = VoDStage1Dataset(vod_root, split, radar_variant=radar_variant,
                                include_clean=include_clean,
                                augmentation_config=augmentation,
-                               augmentation_grid=GRID, augmentation_seed=seed)
+                               augmentation_grid=GRID, augmentation_seed=seed,
+                               lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
+                               lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
     if data_cache_root is not None and not id_only:
         from .fixed_frame_cache import FixedFrameCache
         dataset = FixedFrameCache(Path(data_cache_root) / split, dataset,

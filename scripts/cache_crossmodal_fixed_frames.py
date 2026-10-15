@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.fixed_frame_cache import FixedFrameCache
 from models.radar_lidar_stage1.data import VoDStage1Dataset
+from models.radar_lidar_stage1.radar_fov import RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M
 
 
 def main() -> None:
@@ -23,7 +24,10 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--minimum-free-gib", type=float, default=10.)
     args = parser.parse_args()
-    dataset = VoDStage1Dataset(args.vod_root, args.split, radar_variant=args.radar_variant)
+    dataset = VoDStage1Dataset(
+        args.vod_root, args.split, radar_variant=args.radar_variant,
+        lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
+        lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
     cache = FixedFrameCache(args.cache_root / args.split, dataset, create=True)
     frames = dataset.frames[:args.limit] if args.limit is not None else dataset.frames
     missing = [i for i, frame in enumerate(frames)

@@ -9,7 +9,10 @@ from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.fixed_frame_cache import FixedFrameCache
 from models.radar_lidar_crossmodal_v1.teacher import BottleneckTeacherCore, TeacherConfig
 from models.radar_lidar_crossmodal_v1.teacher_static_cache import TeacherStaticCache
-from models.radar_lidar_crossmodal_v1.train_teacher import _epoch as teacher_epoch
+from models.radar_lidar_crossmodal_v1.train_teacher import (
+    _epoch as teacher_epoch, validate_lidar_pretraining_fov,
+)
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 from models.radar_lidar_stage1.correspondence import Neighborhood
 from models.radar_lidar_stage1.sparse import SparseSites
 
@@ -37,11 +40,26 @@ def test_fixed_frames_preserve_inputs_and_support_radar_only(tmp_path):
     only_radar = FixedFrameCache(tmp_path / "cache", dataset, include_clean=False)
     assert "clean_lidar" not in only_radar[0]
     only_radar.check_complete()
+    cropped = SimpleNamespace(frames=dataset.frames,
+                              augmentation_config=dataset.augmentation_config,
+                              lidar_radar_fov_deg=70., lidar_radar_max_range_m=80.)
+    with pytest.raises(ValueError, match="manifest"):
+        FixedFrameCache(tmp_path / "cache", cropped)
     with pytest.raises(ValueError, match="augmentation"):
         FixedFrameCache(tmp_path / "other",
                         SimpleNamespace(frames=dataset.frames,
                                         augmentation_config=SimpleNamespace(enabled=True)),
                         create=True)
+
+
+def test_teacher_rejects_old_lidar_encoder_supervision(tmp_path):
+    encoder = tmp_path / "best_encoder.pth"
+    metadata = tmp_path / "best_pretrain.ckpt"
+    torch.save({"modality": "lidar"}, metadata)
+    with pytest.raises(ValueError, match="field of view"):
+        validate_lidar_pretraining_fov(encoder)
+    torch.save({"modality": "lidar", "lidar_fov": RADAR_FOV_SPEC}, metadata)
+    validate_lidar_pretraining_fov(encoder)
 
 
 def test_teacher_static_cache_rebases_neighbors_and_object_ids(tmp_path):

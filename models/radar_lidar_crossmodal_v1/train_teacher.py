@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 
 from .encoder import GRID
 from .pipeline_data import annotate_batch, collate_stage1, paired_dataset
@@ -137,6 +138,7 @@ def _save(path, model, optimizer, scheduler, epoch, step, args, validation):
              "radar_sha256": _hash(args.radar_encoder),
              "lidar_sha256": _hash(args.lidar_encoder),
              "radar_variant": args.radar_variant,
+             "lidar_fov": RADAR_FOV_SPEC,
              "augmentation": args.augmentation.to_dict(),
              "augmentation_seed": args.augmentation_seed,
              "validation": validation}
@@ -155,6 +157,17 @@ def load_teacher(path, device="cuda"):
                               TeacherConfig(**saved["config"]))
     model.load_state_dict(saved["model"], strict=True)
     return model.to(device).eval(), saved
+
+
+def validate_lidar_pretraining_fov(encoder_path: Path) -> None:
+    """Prevent training the cropped teacher with old 360° LiDAR weights."""
+    record = encoder_path.with_name("best_pretrain.ckpt")
+    if not record.is_file():
+        raise FileNotFoundError(
+            f"LiDAR encoder training metadata is missing: {record}")
+    saved = torch.load(record, map_location="cpu", weights_only=False)
+    if saved.get("modality") != "lidar" or saved.get("lidar_fov") != RADAR_FOV_SPEC:
+        raise ValueError("LiDAR encoder was not pretrained with the configured radar field of view")
 
 
 def main():
@@ -185,6 +198,7 @@ def main():
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("The unmodified Downloads encoder requires CUDA")
     config = TeacherConfig(**json.loads(args.config.read_text(encoding="utf-8")))
+    validate_lidar_pretraining_fov(args.lidar_encoder)
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
@@ -237,7 +251,8 @@ def main():
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if (saved["config"] != asdict(config) or saved["radar_sha256"] != _hash(args.radar_encoder)
                 or saved["lidar_sha256"] != _hash(args.lidar_encoder)
-                or saved["augmentation"] != args.augmentation.to_dict()):
+                or saved["augmentation"] != args.augmentation.to_dict()
+                or saved.get("lidar_fov") != RADAR_FOV_SPEC):
             raise ValueError("Teacher resume configuration or frozen encoder sources changed")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])

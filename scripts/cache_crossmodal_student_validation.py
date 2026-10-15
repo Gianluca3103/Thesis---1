@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 
 import torch
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -42,6 +43,8 @@ def main() -> None:
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("Cache construction needs the same CUDA sparse runtime as training")
     teacher, source = load_teacher(args.teacher_checkpoint, args.device)
+    if source.get("lidar_fov") != RADAR_FOV_SPEC:
+        raise ValueError("Teacher checkpoint was trained with a different clean-LiDAR field of view")
     if source["radar_variant"] != args.radar_variant:
         raise ValueError("Teacher and cache radar variants differ")
     if args.student_checkpoint:

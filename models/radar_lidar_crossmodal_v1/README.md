@@ -15,6 +15,17 @@ The earlier interpolation report records a Stage-I surface-region checkpoint
 with those exact channels and growth setting. Its surface proposal head and
 ellipsoid, trilinear, and edge-aware interpolation produced the displayed
 five-panel views; this pipeline preserves its requested raw confidence output.
+The raw student's stride-8 features expand through three non-overlapping
+stride-2 generative layers. Thresholded scores can therefore appear in
+rectangular patches; the older five-panel trilinear and edge-aware views were
+interpolated from a different Stage-I proposal head.
+
+Cross-modal training now crops clean LiDAR into a fixed forward radar sector
+(±70° azimuth, 80 m), using each frame's radar-to-LiDAR calibration. Radar
+input remains unchanged and student inference still takes radar alone. The
+crop precedes encoder and teacher training, student labels, and cache writes;
+the viewer uses the same sector. Existing LiDAR, teacher, and student weights
+and LiDAR-dependent caches from the 360° setup must be rebuilt in a new run.
 The current cross-modal grid has 512 × 512 × 16 fine cells and 64 × 64 × 2
 stride-8 cells. The earlier Stage-I training run used a much wider grid;
 its checkpoints cannot be loaded directly into this adapted encoder.

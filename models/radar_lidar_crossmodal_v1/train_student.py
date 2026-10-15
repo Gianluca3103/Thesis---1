@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 
 from .pipeline_data import collate_stage1, paired_dataset
 from .history import log_record, open_writer, overfitting_warning
@@ -159,6 +160,7 @@ def _save(path, student, optimizer, scheduler, teacher_path, teacher_hash, epoch
                 "teacher_checkpoint": str(teacher_path.resolve()), "teacher_sha256": teacher_hash,
                 "radar_checkpoint": student.radar_encoder.source_checkpoint,
                 "radar_variant": args.radar_variant,
+                "lidar_fov": RADAR_FOV_SPEC,
                 "augmentation": args.augmentation.to_dict(),
                 "augmentation_seed": args.augmentation_seed,
                 "selected_threshold": validation.get("val", {}).get("selected_threshold"),
@@ -216,6 +218,8 @@ def main():
     if args.training_cache_root and args.augmentation.enabled:
         parser.error("Training cache requires geometric augmentation to be disabled")
     teacher, source = load_teacher(args.teacher_checkpoint, args.device)
+    if source.get("lidar_fov") != RADAR_FOV_SPEC:
+        raise ValueError("Teacher checkpoint was trained with a different clean-LiDAR field of view")
     if source["radar_variant"] != args.radar_variant:
         raise ValueError("Teacher/student radar variants differ")
     teacher_hash = _hash(args.teacher_checkpoint)
@@ -266,7 +270,8 @@ def main():
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if (saved["config"] != asdict(config) or saved["teacher_sha256"] != teacher_hash
-                or saved["augmentation"] != args.augmentation.to_dict()):
+                or saved["augmentation"] != args.augmentation.to_dict()
+                or saved.get("lidar_fov") != RADAR_FOV_SPEC):
             raise ValueError("Student resume configuration or frozen teacher changed")
         student.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])

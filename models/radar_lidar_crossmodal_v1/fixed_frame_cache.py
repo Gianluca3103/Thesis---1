@@ -16,6 +16,7 @@ VERSION = 1
 def _source_hash() -> str:
     repo = Path(__file__).resolve().parents[2]
     files = (repo / "models/radar_lidar_stage1/data.py",
+             repo / "models/radar_lidar_stage1/radar_fov.py",
              repo / "Fault_Localization_Model/vod_dataset/vod_io.py",
              Path(__file__))
     digest = hashlib.sha256()
@@ -38,6 +39,8 @@ class FixedFrameCache:
             "vod_root": str(Path(dataset.frames[0].lidar_path).resolve().parents[3]),
             "split": dataset.frames[0].split,
             "radar_variant": dataset.frames[0].radar_variant,
+            "lidar_radar_fov_deg": getattr(dataset, "lidar_radar_fov_deg", None),
+            "lidar_radar_max_range_m": getattr(dataset, "lidar_radar_max_range_m", None),
             "frame_ids": [frame.frame_id for frame in dataset.frames],
             "source_hash": _source_hash(),
             "augmentation_enabled": False,

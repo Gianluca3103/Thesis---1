@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 
 from .encoder import BOTTLENECK_CHANNELS
 from .previous_encoder import PreviousStage1Sparse, _selected_coarse_sites
@@ -151,7 +152,8 @@ def main():
         if (saved.get("version") != "previous_stage1_native_sparse_geometry_pretrain_v1"
                 or saved.get("modality") != args.modality
                 or saved.get("mask_rate") != args.mask_rate
-                or saved.get("augmentation") != augmentation.to_dict()):
+                or saved.get("augmentation") != augmentation.to_dict()
+                or (args.modality == "lidar" and saved.get("lidar_fov") != RADAR_FOV_SPEC)):
             raise ValueError("Encoder pretraining resume configuration differs")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -189,6 +191,7 @@ def main():
         checkpoint = {"version": "previous_stage1_native_sparse_geometry_pretrain_v1",
                       "modality": args.modality, "mask_rate": args.mask_rate,
                       "augmentation": augmentation.to_dict(),
+                      "lidar_fov": RADAR_FOV_SPEC if args.modality == "lidar" else None,
                       "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                       "scheduler": scheduler.state_dict(), "epoch": epoch,
                       "best_val_loss": best, "validation": validation,

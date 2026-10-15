@@ -1,7 +1,7 @@
-"""View raw radar-only confidence beside radar and range-matched clean LiDAR.
+"""View raw radar-only confidence beside radar and forward-sector clean LiDAR.
 
-Every radar point and confidence candidate is shown. Clean LiDAR is limited
-only to the farthest aligned radar return; no cloud has a point-count limit.
+Every radar point and confidence candidate is shown. Clean LiDAR uses the
+same fixed calibration-aware radar sector as cross-modal training.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
+from models.radar_lidar_stage1.radar_fov import (
+    RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M,
+)
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 
 
@@ -36,23 +39,12 @@ def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None
         stream.write(records.tobytes())
 
 
-def _match_lidar_range_to_radar(radar: np.ndarray, lidar: np.ndarray) -> tuple[np.ndarray, float]:
-    """Display LiDAR through the frame's farthest radar return, in aligned XYZ."""
-    if radar.ndim != 2 or radar.shape[1] != 3 or lidar.ndim != 2 or lidar.shape[1] != 3:
-        raise ValueError("Radar and LiDAR clouds must have XYZ columns")
-    if not np.isfinite(radar).all() or not np.isfinite(lidar).all():
-        raise ValueError("Radar and LiDAR coordinates must be finite")
-    radius = float(np.linalg.norm(radar.astype(np.float64), axis=1).max()) if len(radar) else 0.0
-    lidar_radius = np.linalg.norm(lidar.astype(np.float64), axis=1)
-    return lidar[lidar_radius <= radius], radius
-
-
 def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
-                *, lidar_full_count: int, radar_max_range_m: float) -> None:
+                *, checkpoint_uses_fov: bool) -> None:
     clouds = [
         {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
-        {"name": "Clean LiDAR within radar range", "xyz": np.round(lidar, 3).tolist()},
+        {"name": "Clean LiDAR in forward radar sector", "xyz": np.round(lidar, 3).tolist()},
         {"name": "Raw student confidence", "xyz": np.round(centers, 3).tolist(),
          "score": np.round(confidence, 4).tolist()},
     ]
@@ -60,8 +52,9 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
     minimum = all_xyz.min(axis=0).tolist()
     maximum = all_xyz.max(axis=0).tolist()
     packed = json.dumps({"frame": frame_id, "epoch": epoch, "clouds": clouds,
-                         "lidar_full_count": lidar_full_count,
-                         "radar_max_range_m": radar_max_range_m,
+                         "radar_half_fov_deg": RADAR_HALF_FOV_DEG,
+                         "radar_max_range_m": RADAR_MAX_RANGE_M,
+                         "checkpoint_uses_fov": checkpoint_uses_fov,
                          "minimum": minimum, "maximum": maximum},
                         separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
@@ -91,7 +84,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent), panes=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${data.frame} · student epoch ${data.epoch}`;
-document.getElementById('range-note').textContent=`Clean LiDAR: ${data.clouds[1].xyz.length.toLocaleString()} of ${data.lidar_full_count.toLocaleString()} points within the farthest radar return (${data.radar_max_range_m.toFixed(1)} m). This radial filter does not estimate radar field of view or visibility.`;
+document.getElementById('range-note').textContent=`Clean LiDAR reference: ${data.clouds[1].xyz.length.toLocaleString()} points in the calibrated forward sector (±${data.radar_half_fov_deg.toFixed(0)}° azimuth, up to ${data.radar_max_range_m.toFixed(0)} m). This is a fixed crop, not measured free space or per-frame radar visibility.${data.checkpoint_uses_fov?'':' This checkpoint predates the training crop; the green reference is cropped for display only.'}`;
 const canvases=[], headings=[];
 for(const cloud of data.clouds){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');
   h.textContent=`${cloud.name}: ${cloud.xyz.length.toLocaleString()} points`;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -144,7 +137,9 @@ def main() -> None:
     student, saved = load_student(args.checkpoint, args.device)
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
-                               frame_ids=args.frame_id, include_clean=True)
+                               frame_ids=args.frame_id, include_clean=True,
+                               lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
+                               lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
     args.output_root.mkdir(parents=True, exist_ok=True)
     found = {frame.frame_id for frame in dataset.frames}
     if missing := set(args.frame_id) - found:
@@ -161,19 +156,18 @@ def main() -> None:
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
         confidence = sites.features.sigmoid().detach().cpu().numpy().reshape(-1)
         radar = row["radar"][:, :3].numpy()
-        lidar_full = row["clean_lidar"][:, :3].numpy()
-        lidar, radar_max_range_m = _match_lidar_range_to_radar(radar, lidar_full)
+        lidar = row["clean_lidar"][:, :3].numpy()
         stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}"
         _write_ply(stem.with_name(stem.name + "_radar.ply"), radar)
         _write_ply(stem.with_name(stem.name + "_clean_lidar.ply"), lidar)
         _write_ply(stem.with_name(stem.name + "_confidence.ply"), centers, confidence)
         html = stem.with_suffix(".html")
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
-                    centers, confidence, lidar_full_count=len(lidar_full),
-                    radar_max_range_m=radar_max_range_m)
+                    centers, confidence,
+                    checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC)
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
-              f"{len(radar)} radar points, {len(lidar)}/{len(lidar_full)} clean LiDAR "
-              f"within {radar_max_range_m:.1f} m | {html}",
+              f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
+              f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m | {html}",
               flush=True)
 
 

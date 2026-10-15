@@ -16,7 +16,9 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import (
 )
 from models.radar_lidar_crossmodal_v1.teacher import CrossModalTeacher, TeacherConfig
 from models.radar_lidar_crossmodal_v1.teacher_static_cache import TeacherStaticCache
-from models.radar_lidar_crossmodal_v1.train_teacher import _hash, _move
+from models.radar_lidar_crossmodal_v1.train_teacher import (
+    _hash, _move, validate_lidar_pretraining_fov,
+)
 
 
 def main() -> None:
@@ -37,6 +39,7 @@ def main() -> None:
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("Teacher static cache requires the CUDA sparse runtime")
     config = TeacherConfig(**json.loads(args.config.read_text(encoding="utf-8")))
+    validate_lidar_pretraining_fov(args.lidar_encoder)
     model = CrossModalTeacher(str(args.radar_encoder), str(args.lidar_encoder),
                               config).to(args.device).eval()
     cache = TeacherStaticCache(args.cache_root, split=args.split,

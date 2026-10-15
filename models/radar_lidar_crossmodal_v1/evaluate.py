@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from torch.utils.data import DataLoader
+from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 
 from .pipeline_data import collate_stage1, paired_dataset
 from .train_teacher import _epoch as evaluate_teacher_epoch, load_teacher
@@ -31,6 +32,8 @@ def main():
         student, saved = load_student(args.checkpoint, args.device)
         teacher, _ = load_teacher(saved["teacher_checkpoint"], args.device)
         variant = saved["radar_variant"]
+    if saved.get("lidar_fov") != RADAR_FOV_SPEC:
+        raise ValueError("Checkpoint used a different LiDAR field of view; use its original evaluator")
     dataset = paired_dataset(args.vod_root, args.split, variant, limit=args.limit)
     loader = DataLoader(dataset, batch_size=1, num_workers=args.num_workers,
                         collate_fn=collate_stage1)

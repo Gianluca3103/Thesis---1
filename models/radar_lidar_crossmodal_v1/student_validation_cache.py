@@ -32,6 +32,8 @@ def source_fingerprint() -> str:
     files = (root / "student_validation_cache.py", root / "student_loss.py",
              root / "student.py", root / "teacher.py", root / "encoder.py",
              root / "previous_encoder.py", root / "pipeline_data.py",
+             repo / "models/radar_lidar_stage1/data.py",
+             repo / "models/radar_lidar_stage1/radar_fov.py",
              repo / "models/radar_lidar_stage2/voxel_target.py",
              repo / "models/radar_lidar_stage2/candidate_domain.py",
              repo / "models/radar_lidar_stage1/correspondence.py",

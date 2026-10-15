@@ -21,6 +21,8 @@ VERSION = 1
 def _source_hash() -> str:
     repo = Path(__file__).resolve().parents[2]
     files = (Path(__file__), repo / "models/radar_lidar_stage1/correspondence.py",
+             repo / "models/radar_lidar_stage1/data.py",
+             repo / "models/radar_lidar_stage1/radar_fov.py",
              repo / "models/radar_lidar_stage1/sparse.py",
              repo / "models/radar_lidar_crossmodal_v1/teacher.py",
              repo / "models/radar_lidar_crossmodal_v1/supervision.py",
