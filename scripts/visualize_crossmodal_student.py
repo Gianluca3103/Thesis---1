@@ -1,7 +1,7 @@
-"""View raw radar-only student confidence beside aligned radar and clean LiDAR.
+"""View raw radar-only confidence beside radar and range-matched clean LiDAR.
 
-All points and candidate voxels are included. The HTML viewer applies no
-interpolation, spatial crop, or point-count limit.
+Every radar point and confidence candidate is shown. Clean LiDAR is limited
+only to the farthest aligned radar return; no cloud has a point-count limit.
 """
 
 from __future__ import annotations
@@ -36,11 +36,23 @@ def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None
         stream.write(records.tobytes())
 
 
+def _match_lidar_range_to_radar(radar: np.ndarray, lidar: np.ndarray) -> tuple[np.ndarray, float]:
+    """Display LiDAR through the frame's farthest radar return, in aligned XYZ."""
+    if radar.ndim != 2 or radar.shape[1] != 3 or lidar.ndim != 2 or lidar.shape[1] != 3:
+        raise ValueError("Radar and LiDAR clouds must have XYZ columns")
+    if not np.isfinite(radar).all() or not np.isfinite(lidar).all():
+        raise ValueError("Radar and LiDAR coordinates must be finite")
+    radius = float(np.linalg.norm(radar.astype(np.float64), axis=1).max()) if len(radar) else 0.0
+    lidar_radius = np.linalg.norm(lidar.astype(np.float64), axis=1)
+    return lidar[lidar_radius <= radius], radius
+
+
 def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
-                lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray) -> None:
+                lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
+                *, lidar_full_count: int, radar_max_range_m: float) -> None:
     clouds = [
         {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
-        {"name": "Clean LiDAR", "xyz": np.round(lidar, 3).tolist()},
+        {"name": "Clean LiDAR within radar range", "xyz": np.round(lidar, 3).tolist()},
         {"name": "Raw student confidence", "xyz": np.round(centers, 3).tolist(),
          "score": np.round(confidence, 4).tolist()},
     ]
@@ -48,6 +60,8 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
     minimum = all_xyz.min(axis=0).tolist()
     maximum = all_xyz.max(axis=0).tolist()
     packed = json.dumps({"frame": frame_id, "epoch": epoch, "clouds": clouds,
+                         "lidar_full_count": lidar_full_count,
+                         "radar_max_range_m": radar_max_range_m,
                          "minimum": minimum, "maximum": maximum},
                         separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
@@ -65,7 +79,8 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 @media(max-width:900px){.panels{display:block}section{margin-bottom:8px}canvas{height:55vh;min-height:300px}}
 </style>
 <h1 id="title"></h1>
-<p>Raw radar-only confidence at fine voxel centers. No interpolation, spatial crop, or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.</p>
+<p>Raw radar-only confidence at fine voxel centers. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.</p>
+<p id="range-note"></p>
 <div class="controls"><label>Minimum confidence <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="value">0.00</output></label>
 <button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div>
@@ -76,6 +91,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent), panes=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${data.frame} · student epoch ${data.epoch}`;
+document.getElementById('range-note').textContent=`Clean LiDAR: ${data.clouds[1].xyz.length.toLocaleString()} of ${data.lidar_full_count.toLocaleString()} points within the farthest radar return (${data.radar_max_range_m.toFixed(1)} m). This radial filter does not estimate radar field of view or visibility.`;
 const canvases=[], headings=[];
 for(const cloud of data.clouds){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');
   h.textContent=`${cloud.name}: ${cloud.xyz.length.toLocaleString()} points`;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -145,16 +161,19 @@ def main() -> None:
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
         confidence = sites.features.sigmoid().detach().cpu().numpy().reshape(-1)
         radar = row["radar"][:, :3].numpy()
-        lidar = row["clean_lidar"][:, :3].numpy()
+        lidar_full = row["clean_lidar"][:, :3].numpy()
+        lidar, radar_max_range_m = _match_lidar_range_to_radar(radar, lidar_full)
         stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}"
         _write_ply(stem.with_name(stem.name + "_radar.ply"), radar)
         _write_ply(stem.with_name(stem.name + "_clean_lidar.ply"), lidar)
         _write_ply(stem.with_name(stem.name + "_confidence.ply"), centers, confidence)
         html = stem.with_suffix(".html")
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
-                    centers, confidence)
+                    centers, confidence, lidar_full_count=len(lidar_full),
+                    radar_max_range_m=radar_max_range_m)
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
-              f"{len(radar)} radar points, {len(lidar)} clean LiDAR points | {html}",
+              f"{len(radar)} radar points, {len(lidar)}/{len(lidar_full)} clean LiDAR "
+              f"within {radar_max_range_m:.1f} m | {html}",
               flush=True)
 
 
