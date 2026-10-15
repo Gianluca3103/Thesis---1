@@ -180,11 +180,11 @@ mkdir -p "$OUT"
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality radar --output-root "$OUT/radar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 4 --num-workers 2 --device cuda --no-tensorboard
+  --epochs 25 --batch-size 16 --num-workers 2 --device cuda --no-tensorboard
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality lidar --output-root "$OUT/lidar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 4 --num-workers 2 --device cuda --no-tensorboard
+  --epochs 25 --batch-size 16 --num-workers 2 --device cuda --no-tensorboard
 
 # Phase 1: frozen pretrained encoders, trainable local teacher.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_teacher \

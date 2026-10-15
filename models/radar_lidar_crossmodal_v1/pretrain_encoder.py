@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--mask-rate", type=float, default=0.3)
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--train-limit", type=int)
