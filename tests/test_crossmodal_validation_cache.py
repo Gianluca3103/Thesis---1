@@ -13,6 +13,7 @@ from models.radar_lidar_crossmodal_v1.student_loss import (
 from models.radar_lidar_crossmodal_v1.student_validation_cache import (
     CachedTargets, StudentValidationCache,
 )
+from models.radar_lidar_crossmodal_v1.train_student import _epoch
 from models.radar_lidar_crossmodal_v1.teacher import tiled_local_neighbors
 from models.radar_lidar_stage1.correspondence import local_neighbors
 from models.radar_lidar_stage1.sparse import SparseSites
@@ -94,3 +95,49 @@ def test_validation_cache_joins_frames_without_crossing_sample_boundaries(tmp_pa
         cache.load_batch(["00001", "00002"], wrong, "cpu")
     with pytest.raises(ValueError, match="manifest"):
         StudentValidationCache(tmp_path, "wrong-teacher", "radar-test")
+
+
+def test_training_cache_skips_teacher_and_keeps_student_gradients(tmp_path):
+    cache = StudentValidationCache(tmp_path, "teacher-hash", "radar-test",
+                                   split="train", create=True)
+    with pytest.raises(ValueError, match="manifest"):
+        StudentValidationCache(tmp_path, "teacher-hash", "radar-test", split="val")
+
+    class Student(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit = torch.nn.Parameter(torch.tensor(0.2))
+            self.config = StudentConfig()
+
+        def forward(self, radar, radar_valid):
+            conditioning = _sites([[0, 0, 1, 1]],
+                                  self.logit.expand(1, 64), 8)
+            confidence = _sites([[0, 0, 1, 1]],
+                                self.logit.reshape(1, 1), 1)
+            return StudentOutput(conditioning, confidence)
+
+    class Teacher(torch.nn.Module):
+        def forward(self, *args):
+            raise AssertionError("Cached training must not run the teacher")
+
+    class Dataset:
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+    student = Student()
+    output = student(None, None)
+    teacher_output = SimpleNamespace(fused=output.conditioning.replace_features(
+        torch.zeros((1, 64))))
+    targets = CachedTargets(torch.tensor([True]), torch.tensor([False]), 1, 1)
+    cache.write("00001", output, teacher_output, targets, torch.tensor([0.75]))
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    before = student.logit.item()
+    dataset = Dataset()
+    batch = {"frame_id": ["00001"], "radar": torch.empty(1),
+             "radar_valid": torch.ones(1, dtype=torch.bool)}
+    report = _epoch(student, Teacher(), dataset, [batch], "cpu", optimizer,
+                    epoch=3, training_cache=cache)
+    assert dataset.epoch == 3
+    assert report["frames"] == 1
+    assert report["occupied_sites"] == 1
+    assert student.logit.item() != before

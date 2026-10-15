@@ -110,7 +110,7 @@ class Summary:
 
 
 def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0,
-           validation_cache=None):
+           validation_cache=None, training_cache=None):
     training = optimizer is not None
     student.train(training)
     teacher.eval()
@@ -121,10 +121,11 @@ def _epoch(student, teacher, dataset, loader, device, optimizer=None, epoch=0,
                                             + f" {epoch:03d}", unit="batch", dynamic_ncols=True,
                                             leave=training), 1):
         batch = _move(raw, device)
-        if not training and validation_cache is not None:
-            with torch.no_grad():
+        cache = training_cache if training else validation_cache
+        if cache is not None:
+            with torch.set_grad_enabled(training):
                 output = student(batch["radar"], batch["radar_valid"])
-                teacher_sites, targets, evidence = validation_cache.load_batch(
+                teacher_sites, targets, evidence = cache.load_batch(
                     batch["frame_id"], output, device)
                 loss, pieces = student_objective(output, teacher_sites, targets,
                                                  student.config, evidence)
@@ -186,6 +187,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--validation-batch-size", type=int, default=1)
     parser.add_argument("--validation-cache-root", type=Path)
+    parser.add_argument("--training-cache-root", type=Path)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--quick-val-frames", type=int, default=32)
@@ -210,18 +212,29 @@ def main():
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
+    if args.training_cache_root and args.augmentation.enabled:
+        parser.error("Training cache requires geometric augmentation to be disabled")
     teacher, source = load_teacher(args.teacher_checkpoint, args.device)
     if source["radar_variant"] != args.radar_variant:
         raise ValueError("Teacher/student radar variants differ")
     teacher_hash = _hash(args.teacher_checkpoint)
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=args.augmentation, seed=args.augmentation_seed,
-                           limit=args.train_limit)
+                           limit=args.train_limit,
+                           include_clean=args.training_cache_root is None)
     val = paired_dataset(args.vod_root, "val", args.radar_variant, limit=args.val_limit,
                          include_clean=args.validation_cache_root is None)
     validation_cache = (StudentValidationCache(args.validation_cache_root, teacher_hash,
-                                               args.radar_variant)
+                                               args.radar_variant, split="val")
                         if args.validation_cache_root else None)
+    training_cache = (StudentValidationCache(args.training_cache_root, teacher_hash,
+                                             args.radar_variant, split="train")
+                      if args.training_cache_root else None)
+    if training_cache is not None:
+        missing = [frame.frame_id for frame in train.frames
+                   if not training_cache.path(frame.frame_id).is_file()]
+        if missing:
+            raise FileNotFoundError(f"Training cache misses {len(missing)} frames, first: {missing[0]}")
     if validation_cache is not None:
         missing = [frame.frame_id for frame in val.frames
                    if not validation_cache.path(frame.frame_id).is_file()]
@@ -266,7 +279,8 @@ def main():
                 >= args.minimum_candidate_coverage):
             best_iou = max(best_iou, iou)
     for epoch in range(start, args.epochs + 1):
-        training = _epoch(student, teacher, train, loaders["train"], args.device, optimizer, epoch)
+        training = _epoch(student, teacher, train, loaders["train"], args.device,
+                          optimizer, epoch, training_cache=training_cache)
         step += len(loaders["train"])
         scheduler.step()
         full = epoch % args.full_val_every == 0 or epoch == args.epochs

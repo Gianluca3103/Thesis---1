@@ -1,4 +1,4 @@
-"""Reusable, coordinate-checked supervision for fixed validation frames."""
+"""Reusable, coordinate-checked supervision for fixed train or validation frames."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from models.radar_lidar_stage1.sparse import SparseSites
 from .encoder import GRID
 
 
-VERSION = 1
+VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -44,10 +44,14 @@ def source_fingerprint() -> str:
 
 class StudentValidationCache:
     def __init__(self, root: Path, teacher_sha256: str, radar_variant: str,
-                 *, create: bool = False):
+                 *, split: str = "val", create: bool = False):
+        if split not in ("train", "val"):
+            raise ValueError("Student cache split must be train or val")
         self.root = Path(root)
         expected = {"version": VERSION, "teacher_sha256": teacher_sha256,
-                    "radar_variant": radar_variant, "source_fingerprint": source_fingerprint(),
+                    "radar_variant": radar_variant, "split": split,
+                    "augmentation_enabled": False,
+                    "source_fingerprint": source_fingerprint(),
                     "grid_minimum_xyz": list(GRID.minimum_xyz),
                     "grid_size_xyz": list(GRID.size_xyz),
                     "grid_shape_zyx": list(GRID.shape_zyx)}
@@ -59,7 +63,7 @@ class StudentValidationCache:
                 temporary.write_text(json.dumps(expected, indent=2), encoding="utf-8")
                 temporary.replace(manifest)
         if not manifest.is_file() or json.loads(manifest.read_text(encoding="utf-8")) != expected:
-            raise ValueError("Validation cache manifest differs from the teacher, grid, or source code")
+            raise ValueError("Student cache manifest differs from split, teacher, grid, or source code")
 
     def path(self, frame_id: str) -> Path:
         if not frame_id.isdigit():

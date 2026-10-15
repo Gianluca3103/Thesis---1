@@ -221,6 +221,17 @@ uses a tiled GPU teacher-neighbor query during cache construction and training;
 set `CROSSMODAL_GPU_NEIGHBORS=0` to use the original CPU KD-tree if the GPU
 query is slower on a particular machine.
 
+For the next student trial, `bash scripts/train_crossmodal_student_noaug_cached.sh`
+disables geometric augmentation, builds separate fixed train and validation
+supervision caches, checks both with a two-frame foreground smoke run, and then
+trains a fresh 25-epoch student in `full/student_noaug_cached`. Each entry stores
+frozen teacher features, correspondence evidence, and clean-LiDAR supervision
+on the radar-only candidate coordinates. The train and validation caches are
+checked against the teacher hash, source version, split, and generated
+coordinates. The cache builder estimates disk use after eight new frames and
+stops if the remaining space is insufficient. This trial still uses the
+already-trained encoder and teacher checkpoints; it retrains only the student.
+
 Evaluate and export after training:
 
 ```bash

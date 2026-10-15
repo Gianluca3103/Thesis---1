@@ -1,4 +1,4 @@
-"""Build fixed validation supervision before radar-only student training."""
+"""Build fixed train or validation supervision before radar-only student training."""
 
 from __future__ import annotations
 
@@ -26,8 +26,10 @@ def main() -> None:
     parser.add_argument("--teacher-checkpoint", type=Path, required=True)
     parser.add_argument("--student-checkpoint", type=Path)
     parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--val-limit", type=int)
+    parser.add_argument("--train-limit", type=int)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--minimum-free-gib", type=float, default=5.)
     parser.add_argument("--device", default="cuda")
@@ -44,9 +46,9 @@ def main() -> None:
     else:
         student = RadarOnlyStudent(source["radar_checkpoint"]).to(args.device).eval()
     cache = StudentValidationCache(args.cache_root, _hash(args.teacher_checkpoint),
-                                   args.radar_variant, create=True)
-    dataset = paired_dataset(args.vod_root, "val", args.radar_variant,
-                             limit=args.val_limit)
+                                   args.radar_variant, split=args.split, create=True)
+    limit = args.train_limit if args.split == "train" else args.val_limit
+    dataset = paired_dataset(args.vod_root, args.split, args.radar_variant, limit=limit)
     missing_indices = []
     reused = 0
     for index, frame in enumerate(dataset.frames):
@@ -61,7 +63,7 @@ def main() -> None:
                         collate_fn=collate_stage1, pin_memory=True)
     measured_bytes = []
     built = 0
-    for raw in tqdm(loader, desc="Student validation cache", unit="frame", dynamic_ncols=True):
+    for raw in tqdm(loader, desc=f"Student {args.split} cache", unit="frame", dynamic_ncols=True):
         frame_id = raw["frame_id"][0]
         batch = _move(raw, args.device)
         with torch.no_grad():
@@ -84,9 +86,9 @@ def main() -> None:
                   f"estimated remaining {average * remaining / 1024**3:.1f} GiB, "
                   f"free {free / 1024**3:.1f} GiB", flush=True)
             if required > free:
-                raise OSError("Insufficient space for the complete validation cache; "
+                raise OSError(f"Insufficient space for the complete {args.split} cache; "
                               "existing entries remain reusable")
-    print(f"Validation cache ready: {built} built, {reused} reused, "
+    print(f"{args.split.capitalize()} cache ready: {built} built, {reused} reused, "
           f"{len(dataset)} frames at {args.cache_root}", flush=True)
 
 
