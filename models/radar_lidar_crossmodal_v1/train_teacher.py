@@ -19,6 +19,7 @@ from .pipeline_data import annotate_batch, collate_stage1, paired_dataset
 from .history import log_record, open_writer, overfitting_warning
 from .plots import update_plots
 from .teacher import CrossModalTeacher, TeacherConfig
+from .teacher_static_cache import TeacherStaticCache
 from .teacher_loss import teacher_objective
 
 
@@ -95,7 +96,8 @@ class Summary:
                 "counts": self.counts, "frames": self.samples, **self.aux}
 
 
-def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
+def _epoch(model, dataset, loader, device, optimizer=None, epoch=0,
+           static_cache=None):
     training = optimizer is not None
     model.train(training)
     if training:
@@ -106,10 +108,15 @@ def _epoch(model, dataset, loader, device, optimizer=None, epoch=0):
     for batch_index, raw in enumerate(progress, 1):
         batch = _move(raw, device)
         with torch.set_grad_enabled(training):
-            output = model(batch["radar"], batch["radar_valid"],
-                           batch["clean_lidar"], batch["clean_lidar_valid"])
-            radar_ids, lidar_ids, classes = annotate_batch(dataset, batch,
-                                                      output.radar_frozen, output.lidar_frozen)
+            if static_cache is None:
+                output = model(batch["radar"], batch["radar_valid"],
+                               batch["clean_lidar"], batch["clean_lidar_valid"])
+                radar_ids, lidar_ids, classes = annotate_batch(
+                    dataset, batch, output.radar_frozen, output.lidar_frozen)
+            else:
+                radar, lidar, neighbors, radar_ids, lidar_ids, classes = static_cache.load_batch(
+                    batch["frame_id"], device)
+                output = model.core(radar, lidar, neighbors)
             total, terms, metrics = teacher_objective(output, radar_ids, lidar_ids,
                                                       model.config, class_by_id=classes)
             if training:
@@ -156,6 +163,8 @@ def main():
     parser.add_argument("--radar-encoder", type=Path, required=True)
     parser.add_argument("--lidar-encoder", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--data-cache-root", type=Path)
+    parser.add_argument("--static-cache-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/crossmodal_teacher_raw64.json"))
     parser.add_argument("--online-augmentation-config", type=Path)
@@ -179,10 +188,32 @@ def main():
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
+    if args.static_cache_root and args.augmentation.enabled:
+        parser.error("Teacher static cache requires geometric augmentation to be disabled")
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=args.augmentation, seed=args.augmentation_seed,
-                           limit=args.train_limit)
-    val = paired_dataset(args.vod_root, "val", args.radar_variant, limit=args.val_limit)
+                           limit=args.train_limit, data_cache_root=args.data_cache_root,
+                           id_only=args.static_cache_root is not None)
+    val = paired_dataset(args.vod_root, "val", args.radar_variant,
+                         limit=args.val_limit, data_cache_root=args.data_cache_root,
+                         id_only=args.static_cache_root is not None)
+    static_caches = None
+    if args.static_cache_root:
+        static_caches = {
+            split: TeacherStaticCache(args.static_cache_root, split=split,
+                                      radar_variant=args.radar_variant,
+                                      radar_sha256=_hash(args.radar_encoder),
+                                      lidar_sha256=_hash(args.lidar_encoder),
+                                      radius_m=config.radius_m,
+                                      max_candidates=config.max_candidates)
+            for split in ("train", "val")
+        }
+        for split, dataset in (("train", train), ("val", val)):
+            missing = [frame.frame_id for frame in dataset.frames
+                       if not static_caches[split].path(frame.frame_id).is_file()]
+            if missing:
+                raise FileNotFoundError(f"Teacher {split} cache misses {len(missing)} frames; "
+                                        f"first: {missing[0]}")
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, collate_fn=collate_stage1, pin_memory=True),
@@ -220,12 +251,13 @@ def main():
         if r1 is not None and mae is not None and mae <= best_fusion * 1.05:
             best_r1 = max(best_r1, r1)
     for epoch in range(start, args.epochs + 1):
-        training = _epoch(model, train, loaders["train"], args.device, optimizer, epoch)
+        training = _epoch(model, train, loaders["train"], args.device, optimizer,
+                          epoch, static_cache=static_caches["train"] if static_caches else None)
         step += len(loaders["train"])
         scheduler.step()
         full = epoch % args.full_val_every == 0 or epoch == args.epochs
         validation = _epoch(model, val, loaders["full" if full else "quick"], args.device,
-                            epoch=epoch)
+                            epoch=epoch, static_cache=static_caches["val"] if static_caches else None)
         _assert_frozen(model, frozen)
         gap = validation["loss_total"] - training["loss_total"]
         record = {"epoch": epoch, "train": training, "val": validation,

@@ -181,6 +181,7 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/crossmodal_student_raw64.json"))
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--online-augmentation-config", type=Path)
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=25)
@@ -221,9 +222,11 @@ def main():
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=args.augmentation, seed=args.augmentation_seed,
                            limit=args.train_limit,
-                           include_clean=args.training_cache_root is None)
+                           include_clean=args.training_cache_root is None,
+                           data_cache_root=args.data_cache_root)
     val = paired_dataset(args.vod_root, "val", args.radar_variant, limit=args.val_limit,
-                         include_clean=args.validation_cache_root is None)
+                         include_clean=args.validation_cache_root is None,
+                         data_cache_root=args.data_cache_root)
     validation_cache = (StudentValidationCache(args.validation_cache_root, teacher_hash,
                                                args.radar_variant, split="val")
                         if args.validation_cache_root else None)

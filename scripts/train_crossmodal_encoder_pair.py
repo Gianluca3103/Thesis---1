@@ -65,6 +65,7 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--radar-variant", required=True)
     parser.add_argument("--online-augmentation-config", type=Path, required=True)
+    parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -99,6 +100,8 @@ def main() -> None:
             "--num-workers", str(args.num_workers), "--device", args.device,
             "--no-tensorboard", "--progress-file", str(progress), "--quiet-progress",
         ]
+        if args.data_cache_root is not None:
+            command.extend(("--data-cache-root", str(args.data_cache_root)))
         if last.is_file() and last.stat().st_size:
             command.extend(("--resume", str(last)))
             print(f"{modality} encoder: resuming from {last}", flush=True)

@@ -92,6 +92,7 @@ def main():
     parser.add_argument("--modality", choices=("radar", "lidar"), required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--online-augmentation-config", type=Path,
                         default=Path("configs/stage1_online_geometric_augmentation.json"))
     parser.add_argument("--augmentation-seed", type=int, default=0)
@@ -122,8 +123,9 @@ def main():
         if args.online_augmentation_config else None)
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=augmentation, seed=args.augmentation_seed,
-                           limit=args.train_limit)
-    val = paired_dataset(args.vod_root, "val", args.radar_variant, limit=args.val_limit)
+                           limit=args.train_limit, data_cache_root=args.data_cache_root)
+    val = paired_dataset(args.vod_root, "val", args.radar_variant,
+                         limit=args.val_limit, data_cache_root=args.data_cache_root)
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, collate_fn=collate_stage1, pin_memory=True),
@@ -146,7 +148,8 @@ def main():
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if (saved.get("version") != "previous_stage1_native_sparse_geometry_pretrain_v1"
                 or saved.get("modality") != args.modality
-                or saved.get("mask_rate") != args.mask_rate):
+                or saved.get("mask_rate") != args.mask_rate
+                or saved.get("augmentation") != augmentation.to_dict()):
             raise ValueError("Encoder pretraining resume configuration differs")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])

@@ -35,14 +35,42 @@ def tj4dradset_dataset(*args, **kwargs):
 def paired_dataset(vod_root: str | Path, split: str, radar_variant: str, *,
                    augmentation: GeometricAugmentationConfig | None = None,
                    seed: int = 0, limit: int | None = None,
-                   include_clean: bool = True):
+                   include_clean: bool = True, data_cache_root: Path | None = None,
+                   id_only: bool = False):
+    if id_only and augmentation is not None and augmentation.enabled:
+        raise ValueError("ID-only dataset cannot apply geometric augmentation")
     dataset = VoDStage1Dataset(vod_root, split, radar_variant=radar_variant,
                                include_clean=include_clean,
                                augmentation_config=augmentation,
                                augmentation_grid=GRID, augmentation_seed=seed)
+    if data_cache_root is not None and not id_only:
+        from .fixed_frame_cache import FixedFrameCache
+        dataset = FixedFrameCache(Path(data_cache_root) / split, dataset,
+                                  include_clean=include_clean)
     if limit is not None:
         dataset.frames = dataset.frames[:limit]
+    if data_cache_root is not None and not id_only:
+        dataset.check_complete()
+    if id_only:
+        dataset = FrameIdDataset(dataset)
     return dataset
+
+
+class FrameIdDataset:
+    """Use precomputed teacher sites without reloading any point clouds."""
+
+    def __init__(self, dataset):
+        self.frames = dataset.frames
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, index):
+        frame = self.frames[index]
+        return {"frame_id": frame.frame_id, "split": frame.split}
+
+    def set_epoch(self, epoch):
+        pass
 
 
 def annotate_batch(dataset: VoDStage1Dataset, batch: dict, radar_sites, lidar_sites):

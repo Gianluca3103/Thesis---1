@@ -232,6 +232,21 @@ coordinates. The cache builder estimates disk use after eight new frames and
 stops if the remaining space is insufficient. This trial still uses the
 already-trained encoder and teacher checkpoints; it retrains only the student.
 
+For a complete from-scratch no-augmentation trial, run
+`bash scripts/train_crossmodal_noaug_30ep.sh` in the foreground. This uses a new
+output root and trains the radar encoder, LiDAR encoder, cross-attention teacher,
+and radar-only student for 30 epochs each. It first caches aligned radar and
+clean LiDAR for all train and validation frames. Once the encoders exist, it
+caches their frozen bottleneck features, fixed neighborhoods, and object labels
+for teacher training. Once the teacher exists, it caches its features,
+correspondence evidence, and clean-LiDAR candidate labels for student training.
+Each phase's two-frame cache and smoke test runs before its full training. The
+teacher and student caches cannot be constructed before their upstream weights
+exist; the script constructs them immediately after those weights finish.
+The new default output is `crossmodal_noaug_30ep_20261015` and never resumes
+checkpoints from augmentation-trained runs. Partial caches and matching new-run
+checkpoints are reusable if the foreground script is restarted.
+
 Evaluate and export after training:
 
 ```bash

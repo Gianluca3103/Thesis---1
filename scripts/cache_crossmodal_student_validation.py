@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--teacher-checkpoint", type=Path, required=True)
     parser.add_argument("--student-checkpoint", type=Path)
     parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--val-limit", type=int)
@@ -48,7 +49,8 @@ def main() -> None:
     cache = StudentValidationCache(args.cache_root, _hash(args.teacher_checkpoint),
                                    args.radar_variant, split=args.split, create=True)
     limit = args.train_limit if args.split == "train" else args.val_limit
-    dataset = paired_dataset(args.vod_root, args.split, args.radar_variant, limit=limit)
+    dataset = paired_dataset(args.vod_root, args.split, args.radar_variant, limit=limit,
+                             data_cache_root=args.data_cache_root)
     missing_indices = []
     reused = 0
     for index, frame in enumerate(dataset.frames):
