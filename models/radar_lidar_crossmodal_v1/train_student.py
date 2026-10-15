@@ -19,7 +19,7 @@ from .plots import update_plots
 from .student import RadarOnlyStudent, StudentConfig
 from .student_loss import (radar_supported_iou_sweep, student_objective, student_targets,
                            teacher_correspondence_evidence)
-from .student_validation_cache import StudentValidationCache
+from .student_compact_cache import open_student_cache
 from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move, _prior_full_records, load_teacher
 
 
@@ -227,11 +227,11 @@ def main():
     val = paired_dataset(args.vod_root, "val", args.radar_variant, limit=args.val_limit,
                          include_clean=args.validation_cache_root is None,
                          data_cache_root=args.data_cache_root)
-    validation_cache = (StudentValidationCache(args.validation_cache_root, teacher_hash,
-                                               args.radar_variant, split="val")
+    validation_cache = (open_student_cache(args.validation_cache_root, teacher_hash,
+                                           args.radar_variant, split="val")
                         if args.validation_cache_root else None)
-    training_cache = (StudentValidationCache(args.training_cache_root, teacher_hash,
-                                             args.radar_variant, split="train")
+    training_cache = (open_student_cache(args.training_cache_root, teacher_hash,
+                                         args.radar_variant, split="train")
                       if args.training_cache_root else None)
     if training_cache is not None:
         missing = [frame.frame_id for frame in train.frames

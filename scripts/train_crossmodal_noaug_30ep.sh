@@ -14,8 +14,25 @@ TEACHER_CONFIG=$REPO/configs/crossmodal_teacher_raw64.json
 STUDENT_CONFIG=$REPO/configs/crossmodal_student_raw64.json
 RAW=$OUT/fixed_frames
 TEACHER_CACHE=$OUT/teacher_static
+STUDENT_CACHE_FORMAT=${STUDENT_CACHE_FORMAT:-legacy}
+STUDENT_COMPRESSION_CODEC=${STUDENT_COMPRESSION_CODEC:-zlib}
+STUDENT_COMPRESSION_LEVEL=${STUDENT_COMPRESSION_LEVEL:-6}
 STUDENT_CACHE=$OUT/student_supervision
+STUDENT_CACHE_ARGS=()
+if [[ "$STUDENT_CACHE_FORMAT" == compact ]]; then
+  STUDENT_CACHE=$OUT/student_supervision_compact
+  STUDENT_CACHE_ARGS=(--cache-format compact
+                      --compression-codec "$STUDENT_COMPRESSION_CODEC"
+                      --compression-level "$STUDENT_COMPRESSION_LEVEL")
+elif [[ "$STUDENT_CACHE_FORMAT" != legacy ]]; then
+  printf 'STUDENT_CACHE_FORMAT must be legacy or compact.\n' >&2
+  exit 1
+fi
 SMOKE=$OUT/smoke
+SMOKE_STUDENT_CACHE=$SMOKE/student_supervision
+if [[ "$STUDENT_CACHE_FORMAT" == compact ]]; then
+  SMOKE_STUDENT_CACHE=$SMOKE/student_supervision_compact
+fi
 FULL=$OUT/full
 ENCODER_BATCH_SIZE=${ENCODER_BATCH_SIZE:-16}
 VALIDATION_BATCH_SIZE=${VALIDATION_BATCH_SIZE:-2}
@@ -128,7 +145,8 @@ for split in train val; do
   "$PY" -u -m scripts.cache_crossmodal_student_validation \
     --vod-root "$VOD" --data-cache-root "$RAW" \
     --teacher-checkpoint "$SMOKE/teacher/best_object_r1.ckpt" \
-    --cache-root "$SMOKE/student_supervision/$split" \
+    --cache-root "$SMOKE_STUDENT_CACHE/$split" \
+    "${STUDENT_CACHE_ARGS[@]}" \
     --radar-variant "$RADAR_VARIANT" --split "$split" \
     "$LIMIT_ARG" 2 --num-workers 0 --device cuda
 done
@@ -136,8 +154,8 @@ run_phase 'smoke student' "$SMOKE/student" \
   models.radar_lidar_crossmodal_v1.train_student \
   "${COMMON[@]}" "${SMOKE_ARGS[@]}" --config "$STUDENT_CONFIG" \
   --teacher-checkpoint "$SMOKE/teacher/best_object_r1.ckpt" \
-  --training-cache-root "$SMOKE/student_supervision/train" \
-  --validation-cache-root "$SMOKE/student_supervision/val" \
+  --training-cache-root "$SMOKE_STUDENT_CACHE/train" \
+  --validation-cache-root "$SMOKE_STUDENT_CACHE/val" \
   --validation-batch-size "$VALIDATION_BATCH_SIZE"
 printf 'All cached no-augmentation smoke phases passed.\n'
 
@@ -180,6 +198,7 @@ for split in train val; do
     --vod-root "$VOD" --data-cache-root "$RAW" \
     --teacher-checkpoint "$FULL/teacher/best_object_r1.ckpt" \
     --cache-root "$STUDENT_CACHE/$split" \
+    "${STUDENT_CACHE_ARGS[@]}" \
     --radar-variant "$RADAR_VARIANT" --split "$split" \
     --num-workers 2 --device cuda
 done

@@ -16,6 +16,7 @@ from models.radar_lidar_crossmodal_v1.student_loss import (
     student_targets, teacher_correspondence_evidence,
 )
 from models.radar_lidar_crossmodal_v1.student_validation_cache import StudentValidationCache
+from models.radar_lidar_crossmodal_v1.student_compact_cache import CompactStudentCache
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 from models.radar_lidar_crossmodal_v1.train_teacher import _hash, _move, load_teacher
 
@@ -33,6 +34,9 @@ def main() -> None:
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--minimum-free-gib", type=float, default=5.)
+    parser.add_argument("--cache-format", choices=("legacy", "compact"), default="legacy")
+    parser.add_argument("--compression-codec", choices=("zlib", "zstd"), default="zlib")
+    parser.add_argument("--compression-level", type=int, default=6)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.device != "cuda" or not torch.cuda.is_available():
@@ -46,8 +50,13 @@ def main() -> None:
             raise ValueError("Student and teacher use different frozen radar encoders")
     else:
         student = RadarOnlyStudent(source["radar_checkpoint"]).to(args.device).eval()
-    cache = StudentValidationCache(args.cache_root, _hash(args.teacher_checkpoint),
-                                   args.radar_variant, split=args.split, create=True)
+    if args.cache_format == "compact":
+        cache = CompactStudentCache(args.cache_root, _hash(args.teacher_checkpoint),
+                                    args.radar_variant, split=args.split, create=True,
+                                    codec=args.compression_codec, level=args.compression_level)
+    else:
+        cache = StudentValidationCache(args.cache_root, _hash(args.teacher_checkpoint),
+                                       args.radar_variant, split=args.split, create=True)
     limit = args.train_limit if args.split == "train" else args.val_limit
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant, limit=limit,
                              data_cache_root=args.data_cache_root)
