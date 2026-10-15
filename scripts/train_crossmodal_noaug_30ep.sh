@@ -35,6 +35,7 @@ if [[ "$STUDENT_CACHE_FORMAT" == compact ]]; then
 fi
 FULL=$OUT/full
 ENCODER_BATCH_SIZE=${ENCODER_BATCH_SIZE:-16}
+TEACHER_BATCH_SIZE=${TEACHER_BATCH_SIZE:-8}
 VALIDATION_BATCH_SIZE=${VALIDATION_BATCH_SIZE:-2}
 MIN_FREE_GIB=${MIN_FREE_GIB:-55}
 if [[ -s "$RAW/train/manifest.json" || -s "$FULL/radar/last.ckpt" ]]; then
@@ -55,7 +56,7 @@ test -d "$VOD/$RADAR_VARIANT"
 test -s "$NOAUG"
 test -s "$TEACHER_CONFIG"
 test -s "$STUDENT_CONFIG"
-if (( ENCODER_BATCH_SIZE < 1 || VALIDATION_BATCH_SIZE < 1 )); then
+if (( ENCODER_BATCH_SIZE < 1 || TEACHER_BATCH_SIZE < 1 || VALIDATION_BATCH_SIZE < 1 )); then
   printf 'Batch sizes must be positive.\n' >&2
   exit 1
 fi
@@ -186,7 +187,7 @@ done
 printf '\n=== Train cross-attention teacher for 30 epochs ===\n'
 run_phase 'cross-attention teacher' "$FULL/teacher" \
   models.radar_lidar_crossmodal_v1.train_teacher \
-  "${COMMON[@]}" --epochs 30 --batch-size 2 --quick-val-frames 64 \
+  "${COMMON[@]}" --epochs 30 --batch-size "$TEACHER_BATCH_SIZE" --quick-val-frames 64 \
   --full-val-every 5 --num-workers 2 --config "$TEACHER_CONFIG" \
   --static-cache-root "$TEACHER_CACHE" \
   --radar-encoder "$FULL/radar/best_encoder.pth" \

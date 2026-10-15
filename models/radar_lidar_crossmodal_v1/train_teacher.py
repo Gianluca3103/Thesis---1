@@ -183,7 +183,7 @@ def main():
     parser.add_argument("--online-augmentation-config", type=Path)
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--quick-val-frames", type=int, default=64)

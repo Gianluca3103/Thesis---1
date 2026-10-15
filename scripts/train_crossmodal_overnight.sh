@@ -18,6 +18,11 @@ RADAR_VARIANT=radar_20frames_verified_doppler_radial
 AUGMENTATION=$REPO/configs/stage1_online_geometric_augmentation.json
 TEACHER_CONFIG=$REPO/configs/crossmodal_teacher_raw64.json
 STUDENT_CONFIG=$REPO/configs/crossmodal_student_raw64.json
+TEACHER_BATCH_SIZE=${TEACHER_BATCH_SIZE:-8}
+if (( TEACHER_BATCH_SIZE < 1 )); then
+  printf 'TEACHER_BATCH_SIZE must be positive.\n' >&2
+  exit 1
+fi
 
 on_error() {
   local status=$?
@@ -153,7 +158,7 @@ test -s "$FULL/lidar/best_encoder.pth"
 printf '\n=== Full training: cross-attention teacher ===\n'
 run_phase 'cross-attention teacher' "$FULL/teacher" \
   models.radar_lidar_crossmodal_v1.train_teacher \
-  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size 2 --config "$TEACHER_CONFIG" \
+  "${COMMON[@]}" "${FULL_ARGS[@]}" --batch-size "$TEACHER_BATCH_SIZE" --config "$TEACHER_CONFIG" \
   --radar-encoder "$FULL/radar/best_encoder.pth" \
   --lidar-encoder "$FULL/lidar/best_encoder.pth"
 test -s "$FULL/teacher/best_object_r1.ckpt" || {
