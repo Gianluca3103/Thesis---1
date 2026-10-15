@@ -34,8 +34,10 @@ def tj4dradset_dataset(*args, **kwargs):
 
 def paired_dataset(vod_root: str | Path, split: str, radar_variant: str, *,
                    augmentation: GeometricAugmentationConfig | None = None,
-                   seed: int = 0, limit: int | None = None):
+                   seed: int = 0, limit: int | None = None,
+                   include_clean: bool = True):
     dataset = VoDStage1Dataset(vod_root, split, radar_variant=radar_variant,
+                               include_clean=include_clean,
                                augmentation_config=augmentation,
                                augmentation_grid=GRID, augmentation_seed=seed)
     if limit is not None:

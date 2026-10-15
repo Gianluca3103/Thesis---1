@@ -37,9 +37,10 @@ For a full run, `scripts/prepare_and_train_crossmodal.sh` checks
 the complete train/val verified 20-scan Doppler radar cache, fills missing
 derived frames when possible, then trains the radar and LiDAR encoders in
 parallel before the teacher and student phases. It writes separate encoder
-checkpoints and logs under `OUT`. Online geometric
-augmentation changes the voxel geometry each epoch, so this pipeline has no
-static geometry cache to prebuild.
+checkpoints and logs under `OUT`. Online geometric augmentation changes the
+training geometry each epoch. Once the teacher is trained, fixed validation
+geometry and teacher correspondence can be prebuilt with
+`scripts/train_crossmodal_student_cached.sh`; training supervision remains online.
 
 ## Prerequisites
 

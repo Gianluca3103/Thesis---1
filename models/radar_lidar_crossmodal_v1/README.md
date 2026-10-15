@@ -209,6 +209,18 @@ smoke, and the smoke teacher checkpoint for a student smoke. Do not interpret
 one-frame scores as model quality. Resume a full run using its matching
 `--resume "$OUT/<phase>/last.ckpt"` and original arguments.
 
+For a completed teacher, `bash scripts/train_crossmodal_student_cached.sh`
+builds a two-frame validation cache, checks cached training/validation in the
+foreground, completes the fixed validation cache, then resumes or starts only
+the radar-only student. It uses validation batches of two and computes all
+threshold IoUs on the GPU before transferring aggregate counts. Cached entries
+include exact candidate coordinates and a teacher/source fingerprint; mismatched
+coordinates or stale teacher weights stop validation. Training remains online
+because geometric augmentation changes its coordinates each epoch. The script
+uses a tiled GPU teacher-neighbor query during cache construction and training;
+set `CROSSMODAL_GPU_NEIGHBORS=0` to use the original CPU KD-tree if the GPU
+query is slower on a particular machine.
+
 Evaluate and export after training:
 
 ```bash

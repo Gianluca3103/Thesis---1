@@ -138,8 +138,10 @@ def student_objective(output: StudentOutput, teacher_sites, targets, config: Stu
     return total, {"distillation": distill, "spatial": spatial, "bce": bce,
                    "dice": dice, "feature_elements": target_features.numel(),
                    "bce_weight_sum": bce_weight_sum.detach(),
-                   "known_sites": int(known.sum()), "occupied_sites": int(occupied.sum()),
-                   "free_sites": int(free.sum()), "unknown_sites": int((~known).sum()),
+                   "known_sites": known.sum().detach(),
+                   "occupied_sites": occupied.sum().detach(),
+                   "free_sites": free.sum().detach(),
+                   "unknown_sites": (~known).sum().detach(),
                    "dice_intersection": dice_intersection.detach(),
                    "dice_probability_sum": dice_probability_sum.detach(),
                    "dice_target_sum": dice_target_sum.detach()}
@@ -181,3 +183,29 @@ def radar_supported_iou(output: StudentOutput, targets, threshold: float,
         report["teacher_correspondence_supported"] = measure(
             known & (teacher_evidence >= evidence_threshold))
     return report
+
+
+@torch.no_grad()
+def radar_supported_iou_sweep(output: StudentOutput, targets,
+                              thresholds: tuple[float, ...], teacher_evidence: torch.Tensor,
+                              evidence_threshold: float) -> torch.Tensor:
+    """Return [threshold, known/conventional/teacher, intersection/union].
+
+    Keep all reductions on the device so validation can transfer the complete
+    epoch's counts once, instead of synchronizing for every threshold/frame.
+    """
+    logits = output.confidence_logits.features[:, 0]
+    occupied, free = targets.occupied, targets.known_free
+    if occupied.shape != logits.shape or free.shape != logits.shape or teacher_evidence.shape != logits.shape:
+        raise ValueError("Prediction, labels, and teacher evidence must share candidate coordinates")
+    known = occupied | free
+    predicted = torch.sigmoid(logits)[:, None] >= logits.new_tensor(thresholds)[None, :]
+    hit = predicted & occupied[:, None]
+    union = predicted | occupied[:, None]
+    teacher_known = known & (teacher_evidence >= evidence_threshold)
+    masks = (known, torch.ones_like(known), teacher_known)
+    return torch.stack([
+        torch.stack(((hit & mask[:, None]).sum(0),
+                     (union & mask[:, None]).sum(0)), dim=-1)
+        for mask in masks
+    ], dim=1)

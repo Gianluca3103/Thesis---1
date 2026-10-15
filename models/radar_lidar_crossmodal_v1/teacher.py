@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 
 import torch
 from torch import nn
@@ -140,6 +141,45 @@ class CrossModalTeacher(nn.Module):
         with torch.no_grad():
             radar = self.radar_encoder(radar_points, radar_valid)
             lidar = self.lidar_encoder(lidar_points, lidar_valid)
-            neighbors = local_neighbors(radar, lidar, GRID, self.config.radius_m,
-                                        self.config.max_candidates)
+            if radar.coords.is_cuda and os.environ.get("CROSSMODAL_GPU_NEIGHBORS") == "1":
+                neighbors = tiled_local_neighbors(radar, lidar, self.config.radius_m,
+                                                  self.config.max_candidates)
+            else:
+                neighbors = local_neighbors(radar, lidar, GRID, self.config.radius_m,
+                                            self.config.max_candidates)
         return self.core(radar, lidar, neighbors)
+
+
+@torch.no_grad()
+def tiled_local_neighbors(radar: SparseSites, lidar: SparseSites,
+                          radius_m: float, max_neighbors: int,
+                          *, max_pairs: int = 2_000_000) -> Neighborhood:
+    """Exact top-k radius search in bounded GPU tiles, preserving batch IDs.
+
+    This optional path removes the GPU→CPU→GPU KD-tree transfer. Its temporary
+    distance matrix is limited by max_pairs; the CPU KD-tree remains available.
+    """
+    if radar.stride != lidar.stride or radius_m <= 0 or max_neighbors < 1 or max_pairs < 1:
+        raise ValueError("Incompatible local neighborhood settings")
+    if radar.coords.device != lidar.coords.device:
+        raise ValueError("Radar and LiDAR sites must share a device")
+    n, m = len(radar.coords), len(lidar.coords)
+    indices = torch.full((n, max_neighbors), -1, dtype=torch.long,
+                         device=radar.coords.device)
+    distances = radar.features.new_full((n, max_neighbors), float("inf"))
+    if not n or not m:
+        return Neighborhood(indices, distances)
+    query = radar.centers_xyz(GRID)
+    reference = lidar.centers_xyz(GRID)
+    k = min(max_neighbors, m)
+    tile = max(1, max_pairs // m)
+    for start in range(0, n, tile):
+        end = min(n, start + tile)
+        matrix = torch.cdist(query[start:end], reference)
+        same_batch = radar.coords[start:end, :1] == lidar.coords[:, 0][None, :]
+        matrix.masked_fill_(~same_batch, float("inf"))
+        nearest_distance, nearest_index = matrix.topk(k, dim=1, largest=False, sorted=True)
+        valid = nearest_distance <= radius_m
+        indices[start:end, :k] = nearest_index.masked_fill(~valid, -1)
+        distances[start:end, :k] = nearest_distance.masked_fill(~valid, float("inf"))
+    return Neighborhood(indices, distances)
