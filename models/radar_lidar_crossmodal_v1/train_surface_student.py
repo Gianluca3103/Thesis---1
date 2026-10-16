@@ -1,4 +1,4 @@
-"""Train radar-only surface proposals with frozen encoders and teacher."""
+"""Train the surface decoder after freezing a trained radar-only student."""
 
 from __future__ import annotations
 
@@ -19,16 +19,15 @@ from .pipeline_data import collate_stage1, paired_dataset
 from .surface_student import RadarOnlySurfaceStudent, SurfaceStudentConfig
 from .surface_student_loss import (SurfaceMetricCounts, clean_surface_sites,
                                    surface_metric_counts, surface_student_objective)
-from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move, load_teacher
+from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move
 
 
-VERSION = "crossmodal_surface_student_v1"
+VERSION = "crossmodal_surface_student_v2_sequential"
 
 
-def _epoch(student, teacher, dataset, loader, device, *, optimizer=None, epoch=1):
+def _epoch(student, dataset, loader, device, *, optimizer=None, epoch=1):
     training = optimizer is not None
     student.train(training)
-    teacher.eval()
     if training:
         dataset.set_epoch(epoch)
     sums = {key: 0.0 for key in ("distillation", "geometry", "confidence")}
@@ -40,13 +39,11 @@ def _epoch(student, teacher, dataset, loader, device, *, optimizer=None, epoch=1
                     unit="batch", dynamic_ncols=True, leave=training):
         batch = _move(raw, device)
         with torch.no_grad():
-            teacher_output = teacher(batch["radar"], batch["radar_valid"],
-                                     batch["clean_lidar"], batch["clean_lidar_valid"])
             clean = clean_surface_sites(batch["clean_lidar"], batch["clean_lidar_valid"])
         with torch.set_grad_enabled(training):
             output = student(batch["radar"], batch["radar_valid"])
             loss, pieces = surface_student_objective(
-                output, teacher_output.fused, clean, student.config)
+                output, None, clean, student.config)
         if training:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -78,15 +75,15 @@ def _epoch(student, teacher, dataset, loader, device, *, optimizer=None, epoch=1
     return report
 
 
-def _save(path, student, optimizer, scheduler, teacher_path, teacher_hash,
+def _save(path, student, optimizer, scheduler, source_student_path, source_student_hash,
           epoch, args, validation):
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
         torch.save({"version": VERSION, "config": asdict(student.config),
                     "model": student.state_dict(), "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(), "epoch": epoch,
-                    "teacher_checkpoint": str(teacher_path.resolve()),
-                    "teacher_sha256": teacher_hash,
+                    "source_student_checkpoint": str(source_student_path.resolve()),
+                    "source_student_sha256": source_student_hash,
                     "radar_checkpoint": student.radar_encoder.source_checkpoint,
                     "radar_variant": args.radar_variant, "lidar_fov": RADAR_FOV_SPEC,
                     "augmentation": args.augmentation.to_dict(),
@@ -98,7 +95,7 @@ def _save(path, student, optimizer, scheduler, teacher_path, teacher_hash,
 
 def load_surface_student(path: str | Path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") != VERSION:
+    if saved.get("version") not in (VERSION, "crossmodal_surface_student_v1"):
         raise ValueError("Expected a trained raw surface-proposal student checkpoint")
     config = dict(saved["config"])
     config["context_radii_m"] = tuple(config["context_radii_m"])
@@ -111,7 +108,8 @@ def load_surface_student(path: str | Path, device="cuda"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
-    parser.add_argument("--teacher-checkpoint", type=Path, required=True)
+    parser.add_argument("--student-checkpoint", type=Path, required=True,
+                        help="Trained radar-only student checkpoint from the teacher-student phase")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_surface_student.json"))
@@ -140,15 +138,19 @@ def main():
     raw_config = json.loads(args.config.read_text(encoding="utf-8"))
     raw_config["context_radii_m"] = tuple(raw_config["context_radii_m"])
     config = SurfaceStudentConfig(**raw_config)
+    if not config.decoder_from_conditioned or config.distillation_weight != 0:
+        parser.error("Sequential decoding requires decoder_from_conditioned=true and distillation_weight=0")
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
-    teacher, source = load_teacher(args.teacher_checkpoint, args.device)
+    source = torch.load(args.student_checkpoint, map_location="cpu", weights_only=False)
+    if source.get("version") != "crossmodal_student_v5_multiscale_refined_raw64":
+        raise ValueError("Expected a completed radar-only student checkpoint")
     if source.get("lidar_fov") != RADAR_FOV_SPEC:
-        raise ValueError("Teacher checkpoint used a different LiDAR field of view")
+        raise ValueError("Student checkpoint used a different LiDAR field of view")
     if source["radar_variant"] != args.radar_variant:
-        raise ValueError("Teacher/student radar variants differ")
-    teacher_hash = _hash(args.teacher_checkpoint)
+        raise ValueError("Radar variants differ")
+    source_student_hash = _hash(args.student_checkpoint)
     train = paired_dataset(args.vod_root, "train", args.radar_variant,
                            augmentation=args.augmentation, seed=args.augmentation_seed,
                            limit=args.train_limit, data_cache_root=args.data_cache_root)
@@ -167,9 +169,11 @@ def main():
                            pin_memory=True),
     }
     student = RadarOnlySurfaceStudent(source["radar_checkpoint"], config).to(args.device)
+    student.load_trained_student(source)
     frozen_student = _encoder_snapshot(student)
-    frozen_teacher = {key: value.detach().cpu().clone()
-                      for key, value in teacher.state_dict().items()}
+    frozen_features = {key: value.detach().cpu().clone()
+                       for key, value in student.state_dict().items()
+                       if key.startswith(("shared.", "feature_head.", "feature_norm."))}
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
                                   lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -181,10 +185,10 @@ def main():
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if (saved.get("version") != VERSION or saved["config"] != asdict(config)
-                or saved["teacher_sha256"] != teacher_hash
+                or saved["source_student_sha256"] != source_student_hash
                 or saved["augmentation"] != args.augmentation.to_dict()
                 or saved.get("lidar_fov") != RADAR_FOV_SPEC):
-            raise ValueError("Surface-student resume configuration or teacher changed")
+            raise ValueError("Surface-decoder resume configuration or trained student changed")
         student.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         scheduler.load_state_dict(saved["scheduler"])
@@ -196,16 +200,16 @@ def main():
             if row.get("validation_scope") == "full":
                 best = max(best, row["val"].get("surface_f1_20cm") or float("-inf"))
     for epoch in range(start, args.epochs + 1):
-        training = _epoch(student, teacher, train, loaders["train"], args.device,
+        training = _epoch(student, train, loaders["train"], args.device,
                           optimizer=optimizer, epoch=epoch)
         scheduler.step()
         full = epoch % args.full_val_every == 0 or epoch == args.epochs
-        validation = _epoch(student, teacher, val, loaders["full" if full else "quick"],
+        validation = _epoch(student, val, loaders["full" if full else "quick"],
                             args.device, epoch=epoch)
         _assert_frozen(student, frozen_student)
-        if any(not torch.equal(value, teacher.state_dict()[key].detach().cpu())
-               for key, value in frozen_teacher.items()):
-            raise RuntimeError("Frozen teacher changed during student training")
+        if any(not torch.equal(value, student.state_dict()[key].detach().cpu())
+               for key, value in frozen_features.items()):
+            raise RuntimeError("Frozen trained student changed during surface training")
         record = {"epoch": epoch, "train": training, "val": validation,
                   "validation_scope": "full" if full else "quick",
                   "loss_gap": validation["loss_total"] - training["loss_total"]}
@@ -218,11 +222,11 @@ def main():
         (args.output_root / f"validation_epoch_{epoch:03d}.json").write_text(
             json.dumps(record, indent=2), encoding="utf-8")
         _save(args.output_root / "last.ckpt", student, optimizer, scheduler,
-              args.teacher_checkpoint, teacher_hash, epoch, args, record)
+              args.student_checkpoint, source_student_hash, epoch, args, record)
         if full and (score := validation.get("surface_f1_20cm")) is not None and score > best:
             best = score
             _save(args.output_root / "best_surface_f1.ckpt", student, optimizer,
-                  scheduler, args.teacher_checkpoint, teacher_hash, epoch, args, record)
+                  scheduler, args.student_checkpoint, source_student_hash, epoch, args, record)
         print(f"Surface student {epoch:03d}/{args.epochs:03d} train {training['loss_total']:.4f} "
               f"val {validation['loss_total']:.4f} raw F1@20cm "
               f"{validation.get('surface_f1_20cm')} selected "

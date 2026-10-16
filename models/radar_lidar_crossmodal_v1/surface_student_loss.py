@@ -24,11 +24,16 @@ def clean_surface_sites(clean_points: torch.Tensor,
     return SparseSites._from_validated(coords, features, GRID.shape_zyx, 1)
 
 
-def surface_student_objective(output: SurfaceStudentOutput, teacher_sites: SparseSites,
+def surface_student_objective(output: SurfaceStudentOutput, teacher_sites: SparseSites | None,
                               clean: SparseSites, config: SurfaceStudentConfig):
-    target_features = aligned_teacher_features(output, teacher_sites)
-    distill = (F.smooth_l1_loss(output.conditioning.features, target_features)
-               if len(target_features) else output.conditioning.features.sum() * 0)
+    if config.distillation_weight:
+        if teacher_sites is None:
+            raise ValueError("Feature distillation requires teacher features")
+        target_features = aligned_teacher_features(output, teacher_sites)
+        distill = (F.smooth_l1_loss(output.conditioning.features, target_features)
+                   if len(target_features) else output.conditioning.features.sum() * 0)
+    else:
+        distill = output.conditioning.features.sum() * 0
     p = output.surface
     if not len(p.anchor_xyz):
         zero = p.logits.sum() * 0

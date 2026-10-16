@@ -320,22 +320,25 @@ cache. Use `--static-cache-root "$NEW"` for teacher training; the trainer
 selects the matching reader automatically. For a future complete no-augmentation
 run, set `TEACHER_CACHE="$NEW"` before invoking
 `scripts/train_crossmodal_noaug_30ep.sh`. This cache supports teacher training;
-the separate surface-proposal student currently evaluates its frozen teacher
-online and does not read teacher static cache entries.
+the surface decoder instead loads the previously trained radar-only student
+and does not evaluate the teacher during decoder training.
 
 ## Radar-only surface proposal trial
 
 The earlier October 13 view used learned surface proposals before optional
-interpolation. `train_surface_student` provides this as a separate student
-trial: the existing radar encoder and cross-attention teacher stay frozen.
+interpolation. Train the cross-attention teacher, then the radar-only student,
+then `train_surface_student`. The surface decoder loads and freezes the
+trained student's radar encoder and 64-channel distilled bottleneck. Its
+query comes from that bottleneck at each fine radar anchor; fine radar
+pyramid features provide local detail.
 The first trial grouped fine radar sites at stride 8 and predicted two
 locations per anchor. That could produce only 982 raw proposals from 491
 anchors even with the display threshold at zero. The current configuration
 uses every active stride-1 radar voxel as an anchor and learns four continuous
-surface locations and confidence scores from its local multiscale radar
-features. It still does not enumerate neighboring candidate cells or fill a
-sphere. The student retains its 64-channel stride-8 radar conditioning output.
-Clean LiDAR supervises proposal geometry and score during training; inference
+surface locations and confidence scores from the trained student and local
+multiscale radar features. It still does not enumerate neighboring candidate
+cells or fill a sphere. Clean LiDAR supervises proposal geometry and score
+during decoder training; the teacher is absent from this phase and inference
 uses radar alone. Existing stride-8 surface checkpoints remain loadable using
 their saved config, but their output density cannot change without retraining
 the surface student. These additional learned proposals increase capacity;
@@ -345,22 +348,22 @@ The existing fixed student supervision cache contains labels on the former
 enumerated candidate grid, so it cannot supervise these moving proposals.
 The fixed aligned radar/LiDAR frame cache may still be supplied with
 `--data-cache-root`. Use a new output directory and train new student weights;
-the earlier encoder and teacher checkpoints can be reused if they have the
-same radar variant and forward LiDAR field of view.
+the trained radar-only student checkpoint is required and must use the same
+radar variant and forward LiDAR field of view.
 
 Run a one-frame smoke test in the foreground before the full run:
 
 ```bash
 PY=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/.venv_model_v2/bin/python
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
-TEACHER=/path/to/teacher/best_object_r1.ckpt
+STUDENT=/path/to/student/best_radar_iou.ckpt
 RUN=/path/to/new/surface_student_run
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="/mnt/3D10B36523559581/Gianluca/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
 
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
-  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --vod-root "$VOD" --student-checkpoint "$STUDENT" \
   --output-root "${RUN}_smoke" \
   --config configs/crossmodal_surface_student.json \
   --epochs 1 --batch-size 1 --validation-batch-size 1 \
@@ -368,7 +371,7 @@ export OMP_NUM_THREADS=8
   --full-val-every 1 --num-workers 0 --device cuda
 
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
-  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --vod-root "$VOD" --student-checkpoint "$STUDENT" \
   --output-root "$RUN" --config configs/crossmodal_surface_student.json \
   --epochs 30 --batch-size 4 --validation-batch-size 4 \
   --full-val-every 5 --num-workers 4 --device cuda

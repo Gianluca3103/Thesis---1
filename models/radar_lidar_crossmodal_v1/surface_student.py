@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -38,6 +39,7 @@ class SurfaceStudentConfig:
     confidence_weight: float = 0.2
     threshold: float = 0.25
     evaluation_tolerance_m: float = 0.2
+    decoder_from_conditioned: bool = False  # False reloads earlier surface checkpoints.
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
@@ -72,7 +74,8 @@ class RadarSurfaceHead(nn.Module):
         self.config = config
         width = 16
         source_widths = (16, 32, 64, config.feature_dim)
-        self.query = nn.Linear(width, width)
+        self.query = nn.Linear(config.feature_dim if config.decoder_from_conditioned else width,
+                               width)
         self.key = nn.ModuleList(nn.Linear(ch, width) for ch in source_widths)
         self.value = nn.ModuleList(nn.Linear(ch, width) for ch in source_widths)
         self.relative = nn.ModuleList(nn.Linear(3, 1, bias=False) for _ in source_widths)
@@ -109,8 +112,28 @@ class RadarSurfaceHead(nn.Module):
             centers.index_add_(0, inverse, fine.centers_xyz(GRID))
             centers = centers / count.clamp_min(1)
             batch = decode_keys(keys, shape)[:, 0]
-        query = self.query(pooled)
-        parts = [pooled]
+        if self.config.decoder_from_conditioned:
+            # A fine radar site inherits the distilled feature of its own
+            # stride-8 parent. The batch coordinate is part of each key.
+            parent = (fine.coords if self.config.anchor_stride == 1 else
+                      decode_keys(keys, GRID.scale_shape(self.config.anchor_stride)).clone())
+            parent = parent.clone()
+            parent[:, 1:] = parent[:, 1:] * self.config.anchor_stride // 8
+            shape = GRID.scale_shape(8)
+            source_keys = encode_keys(sources[3].coords, shape)
+            parent_keys = encode_keys(parent, shape)
+            sorted_keys, order = torch.sort(source_keys)
+            indices = torch.searchsorted(sorted_keys, parent_keys)
+            found = (indices < len(sorted_keys))
+            if len(sorted_keys):
+                found &= sorted_keys[indices.clamp_max(len(sorted_keys) - 1)] == parent_keys
+            if not bool(found.all()):
+                raise RuntimeError("A radar surface anchor has no conditioned stride-8 parent")
+            query = self.query(sources[3].features[order[indices]])
+            parts = [query]
+        else:
+            query = self.query(pooled)
+            parts = [pooled]
         for level, source in enumerate(sources):
             radius = self.config.context_radii_m[level]
             neighborhood = local_neighbors_xyz(
@@ -169,6 +192,26 @@ class RadarOnlySurfaceStudent(nn.Module):
         self.feature_norm = nn.LayerNorm(self.config.feature_dim)
         self.surface_head = RadarSurfaceHead(self.config)
 
+    def load_trained_student(self, checkpoint: dict) -> None:
+        """Install the trained radar-only representation before decoder training."""
+        if checkpoint.get("version") != "crossmodal_student_v5_multiscale_refined_raw64":
+            raise ValueError("Expected a trained radar-only student checkpoint")
+        if (Path(checkpoint.get("radar_checkpoint", "")).resolve()
+                != Path(self.radar_encoder.source_checkpoint).resolve()):
+            raise ValueError("Surface decoder and student use different radar encoders")
+        if checkpoint.get("config", {}).get("feature_dim") != self.config.feature_dim:
+            raise ValueError("Student and surface feature dimensions differ")
+        state = checkpoint["model"]
+        for key, value in self.radar_encoder.state_dict().items():
+            if not torch.equal(value.cpu(), state["radar_encoder." + key].cpu()):
+                raise ValueError("Student checkpoint radar encoder weights differ from the source")
+        for name in ("shared", "feature_head", "feature_norm"):
+            prefix = name + "."
+            module_state = {key[len(prefix):]: value for key, value in state.items()
+                            if key.startswith(prefix)}
+            getattr(self, name).load_state_dict(module_state, strict=True)
+            getattr(self, name).requires_grad_(False)
+
     def train(self, mode: bool = True):
         super().train(mode)
         self.radar_encoder.eval()
@@ -181,5 +224,6 @@ class RadarOnlySurfaceStudent(nn.Module):
         shared = radar.replace_features(self.shared(radar.features))
         conditioned = shared.replace_features(
             self.feature_norm(self.feature_head(shared.features)))
-        surface = self.surface_head((*levels, shared))
+        surface = self.surface_head((*levels, conditioned if self.config.decoder_from_conditioned
+                                     else shared))
         return SurfaceStudentOutput(conditioned, surface)

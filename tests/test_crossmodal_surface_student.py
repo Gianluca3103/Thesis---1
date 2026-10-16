@@ -64,6 +64,36 @@ def test_fine_anchors_do_not_cross_sample_boundaries():
     assert result.anchor_batch.tolist() == [0, 1]
 
 
+def test_sequential_head_queries_own_distilled_parent_and_keeps_batches_separate():
+    fine = _sites([[0, 8, 256, 256], [1, 8, 256, 256]], 16, 1)
+    levels = (fine, _sites([[0, 4, 128, 128], [1, 4, 128, 128]], 32, 2),
+              _sites([[0, 2, 64, 64], [1, 2, 64, 64]], 64, 4),
+              _sites([[0, 1, 32, 32], [1, 1, 32, 32]], 64, 8))
+    levels[3].features[0].fill_(1.)
+    levels[3].features[1].fill_(2.)
+    head = RadarSurfaceHead(SurfaceStudentConfig(decoder_from_conditioned=True))
+    captured = []
+    handle = head.query.register_forward_pre_hook(lambda _module, args: captured.append(args[0]))
+    try:
+        result = head(levels)
+    finally:
+        handle.remove()
+    assert result.anchor_batch.tolist() == [0, 1]
+    assert torch.equal(captured[0], levels[3].features)
+
+
+def test_sequential_head_rejects_missing_distilled_parent():
+    levels = list(_radar_levels())
+    levels[3] = _sites([[0, 1, 32, 35]], 64, 8)
+    head = RadarSurfaceHead(SurfaceStudentConfig(decoder_from_conditioned=True))
+    try:
+        head(tuple(levels))
+    except RuntimeError as exc:
+        assert "no conditioned stride-8 parent" in str(exc)
+    else:
+        raise AssertionError("Missing distilled parent was silently accepted")
+
+
 def test_geometry_and_confidence_supervise_moving_proposals():
     torch.manual_seed(2)
     config = SurfaceStudentConfig()
@@ -153,6 +183,62 @@ def test_end_to_end_student_inference_needs_only_radar(tmp_path):
     assert "confidence_coords" not in result.exported()
 
 
+def test_trained_student_is_frozen_before_radar_only_surface_decoding(tmp_path):
+    checkpoint = tmp_path / "radar_encoder.pth"
+    torch.save(PreviousStage1Sparse(modality="radar").state_dict(), checkpoint)
+    config = SurfaceStudentConfig(decoder_from_conditioned=True,
+                                  distillation_weight=0)
+    model = RadarOnlySurfaceStudent(str(checkpoint), config)
+    source = {"version": "crossmodal_student_v5_multiscale_refined_raw64",
+              "config": {"feature_dim": 64},
+              "radar_checkpoint": str(checkpoint.resolve()),
+              "model": {key: value.clone() for key, value in model.state_dict().items()
+                        if key.startswith(("radar_encoder.", "shared.",
+                                           "feature_head.", "feature_norm."))}}
+    source["model"]["feature_norm.bias"].fill_(0.25)
+    model.load_trained_student(source)
+    assert all(not parameter.requires_grad for name, parameter in model.named_parameters()
+               if name.startswith(("radar_encoder.", "shared.", "feature_head.",
+                                   "feature_norm.")))
+    assert all(parameter.requires_grad for parameter in model.surface_head.parameters())
+    radar = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
+                           [10.2, .1, 0., 1., 0., 0., 0.]]])
+    result = model(radar, torch.ones((1, 2), dtype=torch.bool))
+    assert result.surface.xyz.shape[1:] == (4, 3)
+    clean = clean_surface_sites(radar[..., :3], torch.ones((1, 2), dtype=torch.bool))
+    loss, pieces = surface_student_objective(result, None, clean, config)
+    assert pieces["distillation"].item() == 0
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in model.surface_head.parameters())
+    assert all(parameter.grad is None for parameter in model.shared.parameters())
+
+
+def test_decoder_epoch_uses_radar_and_clean_labels_without_teacher(tmp_path):
+    from models.radar_lidar_crossmodal_v1.train_surface_student import _epoch
+
+    checkpoint = tmp_path / "radar_encoder.pth"
+    torch.save(PreviousStage1Sparse(modality="radar").state_dict(), checkpoint)
+    config = SurfaceStudentConfig(decoder_from_conditioned=True,
+                                  distillation_weight=0)
+    model = RadarOnlySurfaceStudent(str(checkpoint), config)
+    model.load_trained_student({
+        "version": "crossmodal_student_v5_multiscale_refined_raw64",
+        "config": {"feature_dim": 64}, "radar_checkpoint": str(checkpoint.resolve()),
+        "model": {key: value.clone() for key, value in model.state_dict().items()}})
+    points = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
+                            [10.2, .1, 0., 1., 0., 0., 0.]]])
+    clean = torch.tensor([[[10., 0., 0., 1.], [10.2, .1, 0., 1.]]])
+    batch = {"frame_id": ["synthetic"], "radar": points,
+             "radar_valid": torch.ones((1, 2), dtype=torch.bool),
+             "clean_lidar": clean,
+             "clean_lidar_valid": torch.ones((1, 2), dtype=torch.bool)}
+    dataset = SimpleNamespace(set_epoch=lambda epoch: None)
+    optimizer = torch.optim.AdamW(model.surface_head.parameters(), lr=1e-4)
+    result = _epoch(model, dataset, [batch], "cpu", optimizer=optimizer)
+    assert result["loss_distillation"] == 0
+    assert result["proposals"] > 0
+
+
 def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
     from models.radar_lidar_crossmodal_v1.train_surface_student import (
         _save, load_surface_student,
@@ -176,3 +262,10 @@ def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
         assert loaded.config == student.config
         assert all(torch.equal(value, loaded.state_dict()[key])
                    for key, value in student.state_dict().items())
+        if index == 1:
+            legacy = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            legacy["version"] = "crossmodal_surface_student_v1"
+            legacy["config"].pop("decoder_from_conditioned")
+            torch.save(legacy, checkpoint)
+            old_model, _ = load_surface_student(checkpoint, "cpu")
+            assert old_model.config.decoder_from_conditioned is False
