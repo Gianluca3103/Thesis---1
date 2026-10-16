@@ -20,7 +20,7 @@ from .pipeline_data import annotate_batch, collate_stage1, paired_dataset
 from .history import log_record, open_writer, overfitting_warning
 from .plots import update_plots
 from .teacher import CrossModalTeacher, TeacherConfig
-from .teacher_static_cache import TeacherStaticCache
+from .teacher_compact_cache import open_teacher_cache
 from .teacher_loss import teacher_objective
 
 
@@ -214,7 +214,7 @@ def main():
     static_caches = None
     if args.static_cache_root:
         static_caches = {
-            split: TeacherStaticCache(args.static_cache_root, split=split,
+            split: open_teacher_cache(args.static_cache_root, split=split,
                                       radar_variant=args.radar_variant,
                                       radar_sha256=_hash(args.radar_encoder),
                                       lidar_sha256=_hash(args.lidar_encoder),

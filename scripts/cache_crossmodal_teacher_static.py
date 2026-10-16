@@ -15,7 +15,7 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import (
     annotate_batch, collate_stage1, paired_dataset,
 )
 from models.radar_lidar_crossmodal_v1.teacher import CrossModalTeacher, TeacherConfig
-from models.radar_lidar_crossmodal_v1.teacher_static_cache import TeacherStaticCache
+from models.radar_lidar_crossmodal_v1.teacher_compact_cache import open_teacher_cache
 from models.radar_lidar_crossmodal_v1.train_teacher import (
     _hash, _move, validate_lidar_pretraining_fov,
 )
@@ -35,6 +35,10 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--minimum-free-gib", type=float, default=10.)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--cache-format", choices=("auto", "compact", "legacy"),
+                        default="auto")
+    parser.add_argument("--compression-codec", choices=("zlib", "zstd"), default="zlib")
+    parser.add_argument("--compression-level", type=int, default=9)
     args = parser.parse_args()
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("Teacher static cache requires the CUDA sparse runtime")
@@ -42,12 +46,13 @@ def main() -> None:
     validate_lidar_pretraining_fov(args.lidar_encoder)
     model = CrossModalTeacher(str(args.radar_encoder), str(args.lidar_encoder),
                               config).to(args.device).eval()
-    cache = TeacherStaticCache(args.cache_root, split=args.split,
-                               radar_variant=args.radar_variant,
-                               radar_sha256=_hash(args.radar_encoder),
-                               lidar_sha256=_hash(args.lidar_encoder),
-                               radius_m=config.radius_m,
-                               max_candidates=config.max_candidates, create=True)
+    cache = open_teacher_cache(
+        args.cache_root, split=args.split, radar_variant=args.radar_variant,
+        radar_sha256=_hash(args.radar_encoder),
+        lidar_sha256=_hash(args.lidar_encoder), radius_m=config.radius_m,
+        max_candidates=config.max_candidates, create=True,
+        cache_format=args.cache_format, codec=args.compression_codec,
+        level=args.compression_level)
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
                              limit=args.limit, data_cache_root=args.data_cache_root)
     missing = [i for i, frame in enumerate(dataset.frames)

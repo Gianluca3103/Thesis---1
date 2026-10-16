@@ -291,6 +291,38 @@ no sparse CUDA backend. Run a one-frame GPU smoke test of each phase on the
 professor machine before starting full training. Previous one-frame results
 from the Downloads-PFE version do not establish the quality of this encoder.
 
+## Lossless teacher cache conversion
+
+Teacher training accepts both the existing `.pt` static cache and a new
+versioned `.ptz` format. A new teacher cache directory uses compact storage by
+default; an existing legacy directory stays readable. The compact format
+delta-packs stride-8 coordinates, stores neighbor indices in the smallest
+lossless integer width, byte-shuffles feature and distance tensors, then
+compresses them with zlib level 9 by default. Dtypes and every tensor bit are
+restored exactly. Optional zstd requires `zstandard` in the Python environment.
+
+Convert an existing cache without recomputing its frozen encoders or changing
+the source files. The first command samples 50 frames per split and prints
+the measured size ratio; the second resumes and converts the complete cache:
+
+```bash
+OLD=/path/to/existing/teacher_static
+NEW=/path/to/teacher_static_compact
+"$PY" -u -m scripts.compact_crossmodal_teacher_cache \
+  --source-root "$OLD" --destination-root "$NEW" --limit 50
+"$PY" -u -m scripts.compact_crossmodal_teacher_cache \
+  --source-root "$OLD" --destination-root "$NEW"
+```
+
+Each destination entry is decoded and compared bit-for-bit with the source
+before it is accepted. The converter is resumable and never removes the old
+cache. Use `--static-cache-root "$NEW"` for teacher training; the trainer
+selects the matching reader automatically. For a future complete no-augmentation
+run, set `TEACHER_CACHE="$NEW"` before invoking
+`scripts/train_crossmodal_noaug_30ep.sh`. This cache supports teacher training;
+the separate surface-proposal student currently evaluates its frozen teacher
+online and does not read teacher static cache entries.
+
 ## Radar-only surface proposal trial
 
 The earlier October 13 view used learned surface proposals before optional
