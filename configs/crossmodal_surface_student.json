@@ -1,0 +1,16 @@
+{
+  "feature_dim": 64,
+  "proposals_per_anchor": 2,
+  "anchor_stride": 8,
+  "offset_limit_m": 1.5,
+  "context_radii_m": [1.0, 2.0, 4.0, 6.0],
+  "context_neighbors": 16,
+  "confidence_sigma_m": 0.2,
+  "target_radius_m": 1.5,
+  "target_neighbors": 24,
+  "distillation_weight": 1.0,
+  "geometry_weight": 0.5,
+  "confidence_weight": 0.2,
+  "threshold": 0.25,
+  "evaluation_tolerance_m": 0.2
+}

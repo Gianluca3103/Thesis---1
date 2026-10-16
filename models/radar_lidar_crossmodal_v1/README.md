@@ -290,3 +290,61 @@ The Windows workspace has no trained checkpoint for this adapted encoder and
 no sparse CUDA backend. Run a one-frame GPU smoke test of each phase on the
 professor machine before starting full training. Previous one-frame results
 from the Downloads-PFE version do not establish the quality of this encoder.
+
+## Radar-only surface proposal trial
+
+The earlier October 13 view used learned surface proposals before optional
+interpolation. `train_surface_student` provides this as a separate student
+trial: the existing radar encoder and cross-attention teacher stay frozen, and
+the new head learns two continuous surface locations and confidence scores
+per local radar-pattern anchor. The student also retains a 64-channel
+stride-8 radar conditioning output. It does not enumerate all 512 fine cells
+under every bottleneck site. Clean LiDAR supervises proposal geometry and
+score during training; inference uses radar alone.
+
+The existing fixed student supervision cache contains labels on the former
+enumerated candidate grid, so it cannot supervise these moving proposals.
+The fixed aligned radar/LiDAR frame cache may still be supplied with
+`--data-cache-root`. Use a new output directory and train new student weights;
+the earlier encoder and teacher checkpoints can be reused if they have the
+same radar variant and forward LiDAR field of view.
+
+Run a one-frame smoke test in the foreground before the full run:
+
+```bash
+PY=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/.venv_model_v2/bin/python
+VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
+TEACHER=/path/to/teacher/best_object_r1.ckpt
+RUN=/path/to/new/surface_student_run
+export PYTHONPATH="$PWD"
+export LD_LIBRARY_PATH="/mnt/3D10B36523559581/Gianluca/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export OMP_NUM_THREADS=8
+
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
+  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --output-root "${RUN}_smoke" \
+  --config configs/crossmodal_surface_student.json \
+  --epochs 1 --batch-size 1 --validation-batch-size 1 \
+  --train-limit 1 --val-limit 1 --quick-val-frames 1 \
+  --full-val-every 1 --num-workers 0 --device cuda
+
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
+  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --output-root "$RUN" --config configs/crossmodal_surface_student.json \
+  --epochs 30 --batch-size 4 --validation-batch-size 4 \
+  --full-val-every 5 --num-workers 4 --device cuda
+
+"$PY" -m scripts.compare_crossmodal_surface \
+  --vod-root "$VOD" --checkpoint "$RUN/best_surface_f1.ckpt" \
+  --split val --frame-id 08236 00405 \
+  --output-root "$RUN/views" --device cuda
+```
+
+The viewer writes uncapped raw proposal and edge-aware point clouds, a
+synchronized four-panel HTML view with radar and forward-sector LiDAR as
+references, and per-frame comparison metrics. The edge-aware field is derived
+only from predicted positions, scores, and radar features. It is never fed
+back to the student or used as a training label. These new raw proposals are
+an alternative Stage I interface; the current Stage II candidate loader still
+expects the older fixed-grid confidence format and needs adaptation before it
+can consume this checkpoint.
