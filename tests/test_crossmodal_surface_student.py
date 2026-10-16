@@ -34,15 +34,34 @@ def _radar_levels():
             _sites([[0, 1, 32, 32]], 64, 8))
 
 
-def test_head_predicts_two_continuous_locations_without_filling_children():
+def test_head_uses_every_fine_radar_site_without_filling_children():
     config = SurfaceStudentConfig()
     head = RadarSurfaceHead(config)
-    result = head(_radar_levels())
-    assert result.xyz.shape == (1, 2, 3)
-    assert result.logits.shape == (1, 2)
-    assert result.guide.shape == (1, 32)
+    levels = _radar_levels()
+    result = head(levels)
+    assert result.xyz.shape == (2, 4, 3)
+    assert result.logits.shape == (2, 4)
+    assert result.guide.shape == (2, 32)
+    assert torch.equal(result.anchor_xyz, levels[0].centers_xyz(GRID))
     assert torch.all(torch.abs(result.xyz - result.anchor_xyz[:, None]) <= 1.5)
+    assert result.anchor_batch.tolist() == [0, 0]
+
+
+def test_previous_stride_eight_checkpoint_geometry_remains_supported():
+    config = SurfaceStudentConfig(anchor_stride=8, proposals_per_anchor=2)
+    result = RadarSurfaceHead(config)(_radar_levels())
+    assert result.xyz.shape == (1, 2, 3)
     assert result.anchor_batch.tolist() == [0]
+
+
+def test_fine_anchors_do_not_cross_sample_boundaries():
+    fine = _sites([[0, 8, 256, 256], [1, 8, 256, 256]], 16, 1)
+    levels = (fine, _sites([[0, 4, 128, 128], [1, 4, 128, 128]], 32, 2),
+              _sites([[0, 2, 64, 64], [1, 2, 64, 64]], 64, 4),
+              _sites([[0, 1, 32, 32], [1, 1, 32, 32]], 64, 8))
+    result = RadarSurfaceHead(SurfaceStudentConfig())(levels)
+    assert result.xyz.shape == (2, 4, 3)
+    assert result.anchor_batch.tolist() == [0, 1]
 
 
 def test_geometry_and_confidence_supervise_moving_proposals():
@@ -54,12 +73,12 @@ def test_geometry_and_confidence_supervise_moving_proposals():
     conditioned = levels[3]
     output = SurfaceStudentOutput(conditioned, proposals)
     teacher = conditioned.replace_features(torch.zeros_like(conditioned.features))
-    clean_point = proposals.anchor_xyz.detach()[:, None, :]
-    clean = clean_surface_sites(clean_point, torch.ones((1, 1), dtype=torch.bool))
+    clean_point = proposals.anchor_xyz.detach()[None, :, :]
+    clean = clean_surface_sites(clean_point, torch.ones((1, 2), dtype=torch.bool))
     loss, pieces = surface_student_objective(output, teacher, clean, config)
     assert torch.isfinite(loss)
-    assert pieces["anchors_with_targets"] == 1
-    assert pieces["proposals"] == 2
+    assert pieces["anchors_with_targets"] == 2
+    assert pieces["proposals"] == 8
     loss.backward()
     assert head.slots.weight.grad is not None
     assert torch.isfinite(head.slots.weight.grad).all()
@@ -127,7 +146,7 @@ def test_end_to_end_student_inference_needs_only_radar(tmp_path):
     radar = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
                            [10.2, .1, 0., 1., 0., 0., 0.]]])
     result = student(radar, torch.ones((1, 2), dtype=torch.bool))
-    assert result.surface.xyz.shape[1:] == (2, 3)
+    assert result.surface.xyz.shape[1:] == (4, 3)
     assert result.surface.xyz.shape[0] > 0
     assert result.conditioning.features.shape[1] == 64
     assert "surface_xyz" in result.exported()
@@ -141,16 +160,19 @@ def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
 
     encoder = tmp_path / "radar_encoder.pth"
     torch.save(PreviousStage1Sparse(modality="radar").state_dict(), encoder)
-    student = RadarOnlySurfaceStudent(str(encoder)).eval()
-    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
-    checkpoint = tmp_path / "surface.ckpt"
     args = SimpleNamespace(radar_variant="radar_20frames_verified_doppler_radial",
                            augmentation=GeometricAugmentationConfig())
-    _save(checkpoint, student, optimizer, scheduler, tmp_path / "teacher.ckpt",
-          "mock-hash", 3, args, {"val": {"surface_f1_20cm": .2}})
-    loaded, saved = load_surface_student(checkpoint, "cpu")
-    assert saved["epoch"] == 3
-    assert loaded.config == student.config
-    assert all(torch.equal(value, loaded.state_dict()[key])
-               for key, value in student.state_dict().items())
+    configs = (SurfaceStudentConfig(),
+               SurfaceStudentConfig(anchor_stride=8, proposals_per_anchor=2))
+    for index, config in enumerate(configs):
+        student = RadarOnlySurfaceStudent(str(encoder), config).eval()
+        optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
+        checkpoint = tmp_path / f"surface_{index}.ckpt"
+        _save(checkpoint, student, optimizer, scheduler, tmp_path / "teacher.ckpt",
+              "mock-hash", 3, args, {"val": {"surface_f1_20cm": .2}})
+        loaded, saved = load_surface_student(checkpoint, "cpu")
+        assert saved["epoch"] == 3
+        assert loaded.config == student.config
+        assert all(torch.equal(value, loaded.state_dict()[key])
+                   for key, value in student.state_dict().items())

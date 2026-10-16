@@ -25,8 +25,8 @@ from .teacher import ResidualAdapter
 @dataclass(frozen=True)
 class SurfaceStudentConfig:
     feature_dim: int = BOTTLENECK_CHANNELS
-    proposals_per_anchor: int = 2
-    anchor_stride: int = 8
+    proposals_per_anchor: int = 4
+    anchor_stride: int = 1
     offset_limit_m: float = 1.5
     context_radii_m: tuple[float, ...] = (1.0, 2.0, 4.0, 6.0)
     context_neighbors: int = 16
@@ -41,7 +41,7 @@ class SurfaceStudentConfig:
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
-                or self.anchor_stride != 8 or self.context_neighbors < 1
+                or self.anchor_stride not in (1, 2, 4, 8) or self.context_neighbors < 1
                 or self.target_neighbors < 1 or len(self.context_radii_m) != 4
                 or min(self.context_radii_m) <= 0
                 or min(self.offset_limit_m, self.confidence_sigma_m,
@@ -65,7 +65,7 @@ class SurfaceProposals:
 
 
 class RadarSurfaceHead(nn.Module):
-    """October-13-style local radar-pattern attention and surface hypotheses."""
+    """Local radar-pattern attention and continuous surface hypotheses."""
 
     def __init__(self, config: SurfaceStudentConfig):
         super().__init__()
@@ -88,19 +88,27 @@ class RadarSurfaceHead(nn.Module):
             raise ValueError("Expected radar features at strides 1, 2, 4, and 8")
         if fine.features.shape[1] != 16:
             raise ValueError("The previous Stage-I fine radar encoder has 16 channels")
-        coarse = fine.coords.clone()
-        coarse[:, 1:] //= self.config.anchor_stride
-        keys, inverse = torch.unique(encode_keys(coarse, GRID.scale_shape(8)),
-                                     sorted=True, return_inverse=True)
-        count = fine.features.new_zeros((len(keys), 1))
-        count.index_add_(0, inverse, fine.features.new_ones((len(inverse), 1)))
-        pooled = fine.features.new_zeros((len(keys), 16))
-        pooled.index_add_(0, inverse, fine.features)
-        pooled = pooled / count.clamp_min(1)
-        centers = fine.features.new_zeros((len(keys), 3))
-        centers.index_add_(0, inverse, fine.centers_xyz(GRID))
-        centers = centers / count.clamp_min(1)
-        batch = decode_keys(keys, GRID.scale_shape(8))[:, 0]
+        if self.config.anchor_stride == 1:
+            # Every active fine radar voxel can propose surfaces. No child
+            # lattice or radius-based candidate domain is generated here.
+            pooled = fine.features
+            centers = fine.centers_xyz(GRID)
+            batch = fine.coords[:, 0]
+        else:
+            coarse = fine.coords.clone()
+            coarse[:, 1:] //= self.config.anchor_stride
+            shape = GRID.scale_shape(self.config.anchor_stride)
+            keys, inverse = torch.unique(encode_keys(coarse, shape),
+                                         sorted=True, return_inverse=True)
+            count = fine.features.new_zeros((len(keys), 1))
+            count.index_add_(0, inverse, fine.features.new_ones((len(inverse), 1)))
+            pooled = fine.features.new_zeros((len(keys), 16))
+            pooled.index_add_(0, inverse, fine.features)
+            pooled = pooled / count.clamp_min(1)
+            centers = fine.features.new_zeros((len(keys), 3))
+            centers.index_add_(0, inverse, fine.centers_xyz(GRID))
+            centers = centers / count.clamp_min(1)
+            batch = decode_keys(keys, shape)[:, 0]
         query = self.query(pooled)
         parts = [pooled]
         for level, source in enumerate(sources):

@@ -327,12 +327,19 @@ online and does not read teacher static cache entries.
 
 The earlier October 13 view used learned surface proposals before optional
 interpolation. `train_surface_student` provides this as a separate student
-trial: the existing radar encoder and cross-attention teacher stay frozen, and
-the new head learns two continuous surface locations and confidence scores
-per local radar-pattern anchor. The student also retains a 64-channel
-stride-8 radar conditioning output. It does not enumerate all 512 fine cells
-under every bottleneck site. Clean LiDAR supervises proposal geometry and
-score during training; inference uses radar alone.
+trial: the existing radar encoder and cross-attention teacher stay frozen.
+The first trial grouped fine radar sites at stride 8 and predicted two
+locations per anchor. That could produce only 982 raw proposals from 491
+anchors even with the display threshold at zero. The current configuration
+uses every active stride-1 radar voxel as an anchor and learns four continuous
+surface locations and confidence scores from its local multiscale radar
+features. It still does not enumerate neighboring candidate cells or fill a
+sphere. The student retains its 64-channel stride-8 radar conditioning output.
+Clean LiDAR supervises proposal geometry and score during training; inference
+uses radar alone. Existing stride-8 surface checkpoints remain loadable using
+their saved config, but their output density cannot change without retraining
+the surface student. These additional learned proposals increase capacity;
+only validation precision and recall establish whether they improve accuracy.
 
 The existing fixed student supervision cache contains labels on the former
 enumerated candidate grid, so it cannot supervise these moving proposals.

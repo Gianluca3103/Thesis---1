@@ -1,7 +1,7 @@
 {
   "feature_dim": 64,
-  "proposals_per_anchor": 2,
-  "anchor_stride": 8,
+  "proposals_per_anchor": 4,
+  "anchor_stride": 1,
   "offset_limit_m": 1.5,
   "context_radii_m": [1.0, 2.0, 4.0, 6.0],
   "context_neighbors": 16,
