@@ -342,7 +342,9 @@ export OMP_NUM_THREADS=8
 
 The viewer writes uncapped raw proposal and edge-aware point clouds, a
 synchronized four-panel HTML view with radar and forward-sector LiDAR as
-references, and per-frame comparison metrics. The edge-aware field is derived
+references, and per-frame comparison metrics. Its display threshold starts at
+zero, so all raw proposals are visible until the slider is moved. The
+edge-aware field is derived
 only from predicted positions, scores, and radar features. It is never fed
 back to the student or used as a training label. These new raw proposals are
 an alternative Stage I interface; the current Stage II candidate loader still
