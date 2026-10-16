@@ -192,15 +192,18 @@ class RadarOnlySurfaceStudent(nn.Module):
         self.feature_norm = nn.LayerNorm(self.config.feature_dim)
         self.surface_head = RadarSurfaceHead(self.config)
 
-    def load_trained_student(self, checkpoint: dict) -> None:
-        """Install the trained radar-only representation before decoder training."""
-        if checkpoint.get("version") != "crossmodal_student_v5_multiscale_refined_raw64":
-            raise ValueError("Expected a trained radar-only student checkpoint")
+    def load_feature_student(self, checkpoint: dict) -> None:
+        """Install and freeze the separately distilled radar-only representation."""
+        if checkpoint.get("version") != "crossmodal_feature_student_v1":
+            raise ValueError("Expected a trained feature-only radar student checkpoint")
         if (Path(checkpoint.get("radar_checkpoint", "")).resolve()
                 != Path(self.radar_encoder.source_checkpoint).resolve()):
             raise ValueError("Surface decoder and student use different radar encoders")
         if checkpoint.get("config", {}).get("feature_dim") != self.config.feature_dim:
             raise ValueError("Student and surface feature dimensions differ")
+        from .train_teacher import _hash
+        if _hash(self.radar_encoder.source_checkpoint) != checkpoint.get("radar_sha256"):
+            raise ValueError("Frozen radar encoder source changed since feature distillation")
         state = checkpoint["model"]
         for key, value in self.radar_encoder.state_dict().items():
             if not torch.equal(value.cpu(), state["radar_encoder." + key].cpu()):

@@ -15,6 +15,7 @@ from models.radar_lidar_crossmodal_v1.surface_student import (
     SurfaceStudentOutput,
 )
 from models.radar_lidar_crossmodal_v1.previous_encoder import PreviousStage1Sparse
+from models.radar_lidar_crossmodal_v1.train_teacher import _hash
 from models.radar_lidar_crossmodal_v1.surface_student_loss import (
     clean_surface_sites, surface_student_objective,
 )
@@ -189,14 +190,15 @@ def test_trained_student_is_frozen_before_radar_only_surface_decoding(tmp_path):
     config = SurfaceStudentConfig(decoder_from_conditioned=True,
                                   distillation_weight=0)
     model = RadarOnlySurfaceStudent(str(checkpoint), config)
-    source = {"version": "crossmodal_student_v5_multiscale_refined_raw64",
+    source = {"version": "crossmodal_feature_student_v1",
               "config": {"feature_dim": 64},
               "radar_checkpoint": str(checkpoint.resolve()),
+              "radar_sha256": _hash(checkpoint),
               "model": {key: value.clone() for key, value in model.state_dict().items()
                         if key.startswith(("radar_encoder.", "shared.",
                                            "feature_head.", "feature_norm."))}}
     source["model"]["feature_norm.bias"].fill_(0.25)
-    model.load_trained_student(source)
+    model.load_feature_student(source)
     assert all(not parameter.requires_grad for name, parameter in model.named_parameters()
                if name.startswith(("radar_encoder.", "shared.", "feature_head.",
                                    "feature_norm.")))
@@ -221,9 +223,10 @@ def test_decoder_epoch_uses_radar_and_clean_labels_without_teacher(tmp_path):
     config = SurfaceStudentConfig(decoder_from_conditioned=True,
                                   distillation_weight=0)
     model = RadarOnlySurfaceStudent(str(checkpoint), config)
-    model.load_trained_student({
-        "version": "crossmodal_student_v5_multiscale_refined_raw64",
+    model.load_feature_student({
+        "version": "crossmodal_feature_student_v1",
         "config": {"feature_dim": 64}, "radar_checkpoint": str(checkpoint.resolve()),
+        "radar_sha256": _hash(checkpoint),
         "model": {key: value.clone() for key, value in model.state_dict().items()}})
     points = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
                             [10.2, .1, 0., 1., 0., 0., 0.]]])

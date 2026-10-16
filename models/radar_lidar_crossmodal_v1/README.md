@@ -319,16 +319,16 @@ before it is accepted. The converter is resumable and never removes the old
 cache. Use `--static-cache-root "$NEW"` for teacher training; the trainer
 selects the matching reader automatically. For a future complete no-augmentation
 run, set `TEACHER_CACHE="$NEW"` before invoking
-`scripts/train_crossmodal_noaug_30ep.sh`. This cache supports teacher training;
-the surface decoder instead loads the previously trained radar-only student
-and does not evaluate the teacher during decoder training.
+`scripts/train_crossmodal_noaug_30ep.sh`. This cache supports teacher training.
 
 ## Radar-only surface proposal trial
 
 The earlier October 13 view used learned surface proposals before optional
-interpolation. Train the cross-attention teacher, then the radar-only student,
-then `train_surface_student`. The surface decoder loads and freezes the
-trained student's radar encoder and 64-channel distilled bottleneck. Its
+interpolation. Train the cross-attention teacher, then the **feature-only**
+radar student with `train_feature_student`, then the confidence and surface
+decoder with `train_surface_student`. Feature distillation does not train a
+confidence decoder. The surface decoder loads and freezes the trained
+student's radar encoder and 64-channel distilled bottleneck. Its
 query comes from that bottleneck at each fine radar anchor; fine radar
 pyramid features provide local detail.
 The first trial grouped fine radar sites at stride 8 and predicted two
@@ -344,11 +344,13 @@ their saved config, but their output density cannot change without retraining
 the surface student. These additional learned proposals increase capacity;
 only validation precision and recall establish whether they improve accuracy.
 
-The existing fixed student supervision cache contains labels on the former
-enumerated candidate grid, so it cannot supervise these moving proposals.
+The existing fixed student supervision cache contains frozen teacher
+bottleneck features, which `train_feature_student` can reuse without calling
+the teacher each batch. Its fixed-grid occupancy labels cannot supervise the
+moving surface proposals.
 The fixed aligned radar/LiDAR frame cache may still be supplied with
-`--data-cache-root`. Use a new output directory and train new student weights;
-the trained radar-only student checkpoint is required and must use the same
+`--data-cache-root`. Use new output directories for both stages; the trained
+feature-only student checkpoint is required and must use the same
 radar variant and forward LiDAR field of view.
 
 Run a one-frame smoke test in the foreground before the full run:
@@ -356,30 +358,48 @@ Run a one-frame smoke test in the foreground before the full run:
 ```bash
 PY=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/.venv_model_v2/bin/python
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
-STUDENT=/path/to/student/best_radar_iou.ckpt
-RUN=/path/to/new/surface_student_run
+TEACHER=/path/to/teacher/best_object_r1.ckpt
+TRAIN_CACHE=/path/to/student_supervision_compact/train
+VAL_CACHE=/path/to/student_supervision_compact/val
+FEATURE_RUN=/path/to/new/feature_student_run
+SURFACE_RUN=/path/to/new/surface_student_run
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="/mnt/3D10B36523559581/Gianluca/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
 
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_feature_student \
+  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --training-cache-root "$TRAIN_CACHE" --validation-cache-root "$VAL_CACHE" \
+  --output-root "${FEATURE_RUN}_smoke" \
+  --epochs 1 --batch-size 1 --validation-batch-size 1 \
+  --train-limit 1 --val-limit 1 --quick-val-frames 1 \
+  --full-val-every 1 --num-workers 0 --device cuda
+
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_feature_student \
+  --vod-root "$VOD" --teacher-checkpoint "$TEACHER" \
+  --training-cache-root "$TRAIN_CACHE" --validation-cache-root "$VAL_CACHE" \
+  --output-root "$FEATURE_RUN" \
+  --epochs 30 --batch-size 8 --validation-batch-size 8 \
+  --full-val-every 5 --num-workers 4 --device cuda
+
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
-  --vod-root "$VOD" --student-checkpoint "$STUDENT" \
-  --output-root "${RUN}_smoke" \
+  --vod-root "$VOD" --feature-student-checkpoint "$FEATURE_RUN/best_distillation.ckpt" \
+  --output-root "${SURFACE_RUN}_smoke" \
   --config configs/crossmodal_surface_student.json \
   --epochs 1 --batch-size 1 --validation-batch-size 1 \
   --train-limit 1 --val-limit 1 --quick-val-frames 1 \
   --full-val-every 1 --num-workers 0 --device cuda
 
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_surface_student \
-  --vod-root "$VOD" --student-checkpoint "$STUDENT" \
-  --output-root "$RUN" --config configs/crossmodal_surface_student.json \
+  --vod-root "$VOD" --feature-student-checkpoint "$FEATURE_RUN/best_distillation.ckpt" \
+  --output-root "$SURFACE_RUN" --config configs/crossmodal_surface_student.json \
   --epochs 30 --batch-size 4 --validation-batch-size 4 \
   --full-val-every 5 --num-workers 4 --device cuda
 
 "$PY" -m scripts.compare_crossmodal_surface \
-  --vod-root "$VOD" --checkpoint "$RUN/best_surface_f1.ckpt" \
+  --vod-root "$VOD" --checkpoint "$SURFACE_RUN/best_surface_f1.ckpt" \
   --split val --frame-id 08236 00405 \
-  --output-root "$RUN/views" --device cuda
+  --output-root "$SURFACE_RUN/views" --device cuda
 ```
 
 The viewer writes uncapped raw proposal and edge-aware point clouds, a
