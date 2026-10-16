@@ -17,12 +17,12 @@ from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 from .history import log_record, open_writer, overfitting_warning
 from .pipeline_data import collate_stage1, paired_dataset
 from .surface_student import RadarOnlySurfaceStudent, SurfaceStudentConfig
-from .surface_student_loss import (SurfaceMetricCounts, clean_surface_sites,
-                                   surface_metric_counts, surface_student_objective)
+from .surface_student_loss import (SurfaceMetricCounts, surface_metric_counts,
+                                   surface_student_objective)
 from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move
 
 
-VERSION = "crossmodal_surface_student_v3_feature_first"
+VERSION = "crossmodal_surface_student_v4_pointer_voxels"
 
 
 def _epoch(student, dataset, loader, device, *, optimizer=None, epoch=1):
@@ -30,46 +30,43 @@ def _epoch(student, dataset, loader, device, *, optimizer=None, epoch=1):
     student.train(training)
     if training:
         dataset.set_epoch(epoch)
-    sums = {key: 0.0 for key in ("distillation", "geometry", "confidence")}
-    counts = {"frames": 0, "anchors": 0, "proposals": 0,
-              "anchors_with_targets": 0, "feature_elements": 0,
-              "geometry_elements": 0}
+    sums = {key: 0.0 for key in ("bce", "dice", "hit_reward")}
+    counts = {"frames": 0, "batches": 0, "pointer_slots": 0,
+              "in_grid_pointers": 0, "candidate_sites": 0,
+              "known_sites": 0, "occupied_sites": 0,
+              "known_free_sites": 0}
     metrics = SurfaceMetricCounts()
     for raw in tqdm(loader, desc=f"Surface {'train' if training else 'val'} {epoch:03d}",
                     unit="batch", dynamic_ncols=True, leave=training):
         batch = _move(raw, device)
-        with torch.no_grad():
-            clean = clean_surface_sites(batch["clean_lidar"], batch["clean_lidar_valid"])
         with torch.set_grad_enabled(training):
             output = student(batch["radar"], batch["radar_valid"])
-            loss, pieces = surface_student_objective(
-                output, None, clean, student.config)
+            loss, pieces, field, targets = surface_student_objective(
+                output, batch["clean_lidar"], batch["clean_lidar_valid"],
+                student.config)
         if training:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 (p for p in student.parameters() if p.requires_grad), 5.0)
             optimizer.step()
-        feature_count = output.conditioning.features.numel()
         counts["frames"] += len(batch["frame_id"])
-        counts["anchors"] += pieces["anchors"]
-        counts["proposals"] += pieces["proposals"]
-        counts["anchors_with_targets"] += pieces["anchors_with_targets"]
-        counts["feature_elements"] += feature_count
-        counts["geometry_elements"] += pieces["geometry_elements"]
-        sums["distillation"] += float(pieces["distillation"].detach()) * feature_count
-        sums["geometry"] += float(pieces["geometry"].detach()) * pieces["geometry_elements"]
-        sums["confidence"] += float(pieces["confidence"].detach()) * pieces["proposals"]
+        counts["batches"] += 1
+        for key in ("pointer_slots", "in_grid_pointers", "candidate_sites",
+                    "known_sites", "occupied_sites", "known_free_sites"):
+            counts[key] += pieces[key]
+        for key in sums:
+            sums[key] += float(pieces[key].detach())
         if not training:
-            metrics.add(surface_metric_counts(output, clean, student.config))
-    distill = sums["distillation"] / max(counts["feature_elements"], 1)
-    geometry = sums["geometry"] / max(counts["geometry_elements"], 1)
-    confidence = sums["confidence"] / max(counts["proposals"], 1)
-    report = {"loss_distillation": distill, "loss_geometry": geometry,
-              "loss_confidence": confidence,
-              "loss_total": (student.config.distillation_weight * distill
-                             + student.config.geometry_weight * geometry
-                             + student.config.confidence_weight * confidence), **counts}
+            metrics.add(surface_metric_counts(field, targets, student.config,
+                                              pointer_slots=pieces["pointer_slots"]))
+    bce, dice, reward = (sums[key] / max(counts["batches"], 1)
+                         for key in ("bce", "dice", "hit_reward"))
+    report = {"loss_bce": bce, "loss_dice": dice,
+              "distinct_hit_reward": reward,
+              "loss_total": (student.config.bce_weight * bce
+                             + student.config.dice_weight * dice
+                             - student.config.hit_weight * reward), **counts}
     if not training:
         report.update(metrics.report())
     return report
@@ -84,6 +81,9 @@ def _save(path, student, optimizer, scheduler, feature_student_path, feature_stu
                     "scheduler": scheduler.state_dict(), "epoch": epoch,
                     "feature_student_checkpoint": str(feature_student_path.resolve()),
                     "feature_student_sha256": feature_student_hash,
+                    "initialized_from_surface":
+                    str(getattr(args, "initialize_from_surface_checkpoint", None))
+                    if getattr(args, "initialize_from_surface_checkpoint", None) else None,
                     "radar_checkpoint": student.radar_encoder.source_checkpoint,
                     "radar_variant": args.radar_variant, "lidar_fov": RADAR_FOV_SPEC,
                     "augmentation": args.augmentation.to_dict(),
@@ -95,15 +95,52 @@ def _save(path, student, optimizer, scheduler, feature_student_path, feature_stu
 
 def load_surface_student(path: str | Path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") not in (VERSION, "crossmodal_surface_student_v2_sequential",
+    if saved.get("version") not in (VERSION, "crossmodal_surface_student_v3_feature_first",
+                                    "crossmodal_surface_student_v2_sequential",
                                     "crossmodal_surface_student_v1"):
         raise ValueError("Expected a trained raw surface-proposal student checkpoint")
     config = dict(saved["config"])
     config["context_radii_m"] = tuple(config["context_radii_m"])
+    if saved["version"] != VERSION:
+        config["pointer_voxel_mode"] = False
     model = RadarOnlySurfaceStudent(saved["radar_checkpoint"],
                                     SurfaceStudentConfig(**config))
     model.load_state_dict(saved["model"], strict=True)
     return model.to(device).eval(), saved
+
+
+def _initialize_head_from_surface(student, path: Path, feature_student_hash: str) -> None:
+    """Warm-start the first learned slots from a sequential 4-pointer head."""
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    if saved.get("version") != "crossmodal_surface_student_v3_feature_first":
+        raise ValueError("Pointer warm-start needs a sequential v3 surface checkpoint")
+    if saved.get("feature_student_sha256") != feature_student_hash:
+        raise ValueError("Warm-start surface head used a different distilled student")
+    old = saved["config"]
+    for name in ("feature_dim", "anchor_stride", "context_radii_m",
+                 "context_neighbors", "offset_limit_m", "decoder_from_conditioned"):
+        expected = getattr(student.config, name)
+        actual = tuple(old[name]) if name == "context_radii_m" else old[name]
+        if actual != expected:
+            raise ValueError(f"Warm-start surface head differs in {name}")
+    old_slots = int(old["proposals_per_anchor"])
+    if old_slots > student.config.proposals_per_anchor:
+        raise ValueError("Warm-start has more pointer slots than the new decoder")
+    source = saved["model"]
+    head = student.surface_head
+    with torch.no_grad():
+        for name, target in head.state_dict().items():
+            if name.startswith("slots."):
+                continue
+            previous = source["surface_head." + name]
+            if previous.shape != target.shape:
+                raise ValueError(f"Warm-start surface head shape differs at {name}")
+            target.copy_(previous.to(target.device))
+        width = head.slots.in_features
+        head.slots.weight.view(-1, 4, width)[:old_slots].copy_(
+            source["surface_head.slots.weight"].view(old_slots, 4, width).to(head.slots.weight.device))
+        head.slots.bias.view(-1, 4)[:old_slots].copy_(
+            source["surface_head.slots.bias"].view(old_slots, 4).to(head.slots.bias.device))
 
 
 def main():
@@ -130,6 +167,8 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--initialize-from-surface-checkpoint", type=Path,
+                        help="Optional trained sequential surface head used to initialize its first slots")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.batch_size < 1 or args.validation_batch_size < 1 or args.full_val_every < 1:
@@ -139,8 +178,10 @@ def main():
     raw_config = json.loads(args.config.read_text(encoding="utf-8"))
     raw_config["context_radii_m"] = tuple(raw_config["context_radii_m"])
     config = SurfaceStudentConfig(**raw_config)
-    if not config.decoder_from_conditioned or config.distillation_weight != 0:
-        parser.error("Sequential decoding requires decoder_from_conditioned=true and distillation_weight=0")
+    if (not config.decoder_from_conditioned or config.distillation_weight != 0
+            or not config.pointer_voxel_mode):
+        parser.error("Pointer decoding requires decoder_from_conditioned=true, "
+                     "pointer_voxel_mode=true, and distillation_weight=0")
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
@@ -171,6 +212,9 @@ def main():
     }
     student = RadarOnlySurfaceStudent(source["radar_checkpoint"], config).to(args.device)
     student.load_feature_student(source)
+    if args.initialize_from_surface_checkpoint and not args.resume:
+        _initialize_head_from_surface(student, args.initialize_from_surface_checkpoint,
+                                      feature_student_hash)
     frozen_student = _encoder_snapshot(student)
     frozen_features = {key: value.detach().cpu().clone()
                        for key, value in student.state_dict().items()
@@ -199,10 +243,19 @@ def main():
         for line in (args.output_root / "metrics.jsonl").read_text().splitlines():
             row = json.loads(line)
             if row.get("validation_scope") == "full":
-                best = max(best, row["val"].get("surface_f1_20cm") or float("-inf"))
+                if (score := row["val"].get("proposal_utility")) is not None:
+                    best = max(best, score)
     for epoch in range(start, args.epochs + 1):
         training = _epoch(student, train, loaders["train"], args.device,
                           optimizer=optimizer, epoch=epoch)
+        if epoch == start and training["occupied_sites"] == 0:
+            message = ("No pointed training voxels overlap clean LiDAR. The "
+                       "proposal-only loss has no positive signal; initialize "
+                       "from a compatible surface head or check alignment and pointer reach.")
+            if len(train) <= 16:
+                print(f"Small-sample smoke warning: {message}", flush=True)
+            else:
+                raise RuntimeError(message)
         scheduler.step()
         full = epoch % args.full_val_every == 0 or epoch == args.epochs
         validation = _epoch(student, val, loaders["full" if full else "quick"],
@@ -224,14 +277,16 @@ def main():
             json.dumps(record, indent=2), encoding="utf-8")
         _save(args.output_root / "last.ckpt", student, optimizer, scheduler,
               args.feature_student_checkpoint, feature_student_hash, epoch, args, record)
-        if full and (score := validation.get("surface_f1_20cm")) is not None and score > best:
+        if full and (score := validation.get("proposal_utility")) is not None and score > best:
             best = score
-            _save(args.output_root / "best_surface_f1.ckpt", student, optimizer,
+            _save(args.output_root / "best_proposal_utility.ckpt", student, optimizer,
                   scheduler, args.feature_student_checkpoint, feature_student_hash, epoch, args, record)
         print(f"Surface student {epoch:03d}/{args.epochs:03d} train {training['loss_total']:.4f} "
-              f"val {validation['loss_total']:.4f} raw F1@20cm "
-              f"{validation.get('surface_f1_20cm')} selected "
-              f"{validation['selected_proposals']} scope {'full' if full else 'quick'}",
+              f"val {validation['loss_total']:.4f} unique hits "
+              f"{validation['distinct_correct_voxels']} verified precision "
+              f"{validation['verified_proposal_precision']} utility "
+              f"{validation['proposal_utility']:.3f} selected "
+              f"{validation['selected_sites']} scope {'full' if full else 'quick'}",
               flush=True)
     if writer is not None:
         writer.close()

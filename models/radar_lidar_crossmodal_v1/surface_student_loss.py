@@ -1,144 +1,170 @@
-"""Supervise radar-conditioned proposal geometry without a filled voxel domain."""
+"""Proposal-only supervision for radar-predicted fine LiDAR voxels.
+
+Unproposed clean voxels never enter the loss. Unknown proposed voxels are
+unlabeled; only observed occupancy and verified free space are supervised.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 
-import numpy as np
-from scipy.spatial import cKDTree
 import torch
 from torch.nn import functional as F
 
-from models.radar_lidar_stage1.correspondence import local_neighbors_xyz
-from models.radar_lidar_stage1.sparse import SparseSites, voxelize
+from models.radar_lidar_stage1.sparse import SparseSites, encode_keys, voxelize
+from models.radar_lidar_stage2.candidate_domain import CandidateDomain
+from models.radar_lidar_stage2.voxel_target import make_targets
 
 from .encoder import GRID
-from .student_loss import aligned_teacher_features
+from .pointer_voxels import PointerVoxelField, merge_surface_pointers
 from .surface_student import SurfaceStudentConfig, SurfaceStudentOutput
 
 
 def clean_surface_sites(clean_points: torch.Tensor,
                         clean_valid: torch.Tensor) -> SparseSites:
+    """Fine clean-scan occupancy, retained for diagnostics and callers."""
     coords, _, _, _ = voxelize(clean_points, clean_valid, GRID)
-    features = clean_points.new_zeros((len(coords), 1))
-    return SparseSites._from_validated(coords, features, GRID.shape_zyx, 1)
+    return SparseSites._from_validated(
+        coords, clean_points.new_zeros((len(coords), 1)), GRID.shape_zyx, 1)
 
 
-def surface_student_objective(output: SurfaceStudentOutput, teacher_sites: SparseSites | None,
-                              clean: SparseSites, config: SurfaceStudentConfig):
-    if config.distillation_weight:
-        if teacher_sites is None:
-            raise ValueError("Feature distillation requires teacher features")
-        target_features = aligned_teacher_features(output, teacher_sites)
-        distill = (F.smooth_l1_loss(output.conditioning.features, target_features)
-                   if len(target_features) else output.conditioning.features.sum() * 0)
+def _soft_occupied_at_pointers(xyz: torch.Tensor, batch: torch.Tensor,
+                               clean_coords: torch.Tensor, *,
+                               chunk_size: int = 65536) -> torch.Tensor:
+    """Training-only trilinear occupancy sample at continuous pointer locations.
+
+    The forward loss uses exact discrete candidate labels. This sample gives
+    the unique-hit reward a local gradient with respect to pointer XYZ. It
+    creates no candidate or output voxels and does not label unknown as free.
+    """
+    if not len(xyz) or not len(clean_coords):
+        return xyz.new_zeros((len(xyz),))
+    clean_keys = encode_keys(clean_coords, GRID.shape_zyx)
+    origin = xyz.new_tensor(GRID.minimum_xyz)
+    size = xyz.new_tensor(GRID.size_xyz)
+    shape = batch.new_tensor(GRID.shape_zyx[::-1])
+    samples = []
+    for begin in range(0, len(xyz), chunk_size):
+        point = xyz[begin:begin + chunk_size]
+        point_batch = batch[begin:begin + chunk_size]
+        centered = (point - origin) / size - 0.5
+        base = torch.floor(centered).long()
+        fraction = centered - base
+        value = point.new_zeros(len(point))
+        for corner in product((0, 1), repeat=3):
+            offset = base.new_tensor(corner)
+            cell = base + offset
+            inside = ((cell >= 0) & (cell < shape)).all(-1)
+            safe = torch.minimum(torch.maximum(cell, torch.zeros_like(cell)), shape - 1)
+            rows = torch.stack((point_batch, safe[:, 2], safe[:, 1], safe[:, 0]), -1)
+            key = encode_keys(rows, GRID.shape_zyx)
+            where = torch.searchsorted(clean_keys, key)
+            present = inside & (where < len(clean_keys)) & (
+                clean_keys[where.clamp_max(len(clean_keys) - 1)] == key)
+            weight = torch.where(offset.bool(), fraction, 1 - fraction).prod(-1)
+            value = value + weight * present.to(weight.dtype)
+        samples.append(value)
+    return torch.cat(samples)
+
+
+def surface_student_objective(output: SurfaceStudentOutput,
+                              clean_points: torch.Tensor,
+                              clean_valid: torch.Tensor,
+                              config: SurfaceStudentConfig):
+    """BCE + Dice + distinct-hit reward on known, pointed voxels only."""
+    field = merge_surface_pointers(output.surface)
+    domain = CandidateDomain(field.coords, field.confidence, GRID, {})
+    targets = make_targets(domain, clean_points, clean_valid)
+    known = targets.occupied | targets.known_free
+    confidence = field.confidence
+    zero = output.surface.logits.sum() * 0
+    if bool(known.any()):
+        predicted = confidence[known]
+        target = targets.occupied[known].to(predicted.dtype)
+        bce = F.binary_cross_entropy(predicted.clamp(1e-6, 1 - 1e-6), target)
+        overlap = (predicted * target).sum()
+        dice = 1 - (2 * overlap + 1e-6) / (predicted.sum() + target.sum() + 1e-6)
+        hard_hits = (confidence * targets.occupied.to(confidence.dtype)).sum()
+
+        hits = hard_hits
+        if torch.is_grad_enabled() and field.pointer_xyz.requires_grad:
+            # Hard voxel assignment has no XYZ derivative. Use the clean scan
+            # for a local, training-only straight-through gradient. The
+            # forward reward remains exact distinct occupied candidate hits.
+            clean_coords, _, _, _ = voxelize(clean_points, clean_valid, GRID)
+            soft_at_pointer = _soft_occupied_at_pointers(
+                field.pointer_xyz, field.pointer_batch, clean_coords)
+            pointer_weight = field.pointer_strength.detach()
+            weighted_soft = confidence.new_zeros(len(confidence)).index_add(
+                0, field.pointer_voxel_index, pointer_weight * soft_at_pointer)
+            weight_sum = confidence.new_zeros(len(confidence)).index_add(
+                0, field.pointer_voxel_index, pointer_weight)
+            soft_by_voxel = weighted_soft / weight_sum.clamp_min(1e-8)
+            soft_hits = (confidence.detach() * soft_by_voxel * known.to(confidence.dtype)).sum()
+            hits = hard_hits + soft_hits - soft_hits.detach()
+        hit_reward = torch.log1p(hits / (config.hit_scale * clean_points.shape[0]))
     else:
-        distill = output.conditioning.features.sum() * 0
-    p = output.surface
-    if not len(p.anchor_xyz):
-        zero = p.logits.sum() * 0
-        pieces = {"distillation": distill, "geometry": zero, "confidence": zero,
-                  "anchors": 0, "proposals": 0, "anchors_with_targets": 0,
-                  "confidence_elements": 0, "geometry_elements": 0}
-        return config.distillation_weight * distill, pieces
-    neighbors = local_neighbors_xyz(p.anchor_xyz, p.anchor_batch, clean, GRID,
-                                    config.target_radius_m, config.target_neighbors)
-    valid = neighbors.valid
-    has_target = valid.any(1)
-    if len(clean.coords):
-        target_xyz = clean.centers_xyz(GRID)[neighbors.indices.clamp_min(0)]
-        delta = torch.linalg.vector_norm(p.xyz[:, :, None, :] - target_xyz[:, None, :, :],
-                                         dim=-1).masked_fill(~valid[:, None, :], float("inf"))
-        nearest = delta.min(-1).values
-        if bool(has_target.any()):
-            forward = F.smooth_l1_loss(nearest[has_target],
-                                       torch.zeros_like(nearest[has_target]), beta=.2)
-            reverse = delta.min(1).values[valid]
-            reverse = F.smooth_l1_loss(reverse, torch.zeros_like(reverse), beta=.2)
-            geometry = (forward + reverse) * .5
-        else:
-            geometry = p.xyz.sum() * 0
-        quality = torch.exp(-nearest.detach() / config.confidence_sigma_m)
-    else:
-        geometry = p.xyz.sum() * 0
-        quality = p.logits.new_zeros(p.logits.shape)
-    weights = 1 + has_target[:, None].to(p.logits.dtype)
-    per_site = F.binary_cross_entropy_with_logits(p.logits, quality, reduction="none")
-    confidence = (per_site * weights).sum() / weights.expand_as(per_site).sum().clamp_min(1)
-    total = (config.distillation_weight * distill + config.geometry_weight * geometry
-             + config.confidence_weight * confidence)
-    return total, {"distillation": distill, "geometry": geometry,
-                   "confidence": confidence, "anchors": len(p.anchor_xyz),
-                   "proposals": p.logits.numel(),
-                   "anchors_with_targets": int(has_target.sum()),
-                   "confidence_elements": p.logits.numel(),
-                   "geometry_elements": int(valid.sum())}
+        bce = dice = hit_reward = hard_hits = zero
+    total = (config.bce_weight * bce + config.dice_weight * dice
+             - config.hit_weight * hit_reward)
+    pieces = {"bce": bce, "dice": dice, "hit_reward": hit_reward,
+              "distinct_hit_mass": hard_hits,
+              "pointer_slots": output.surface.logits.numel(),
+              "in_grid_pointers": len(field.pointer_xyz),
+              "candidate_sites": len(field.coords),
+              "known_sites": int(known.sum()),
+              "occupied_sites": int(targets.occupied.sum()),
+              "known_free_sites": int(targets.known_free.sum())}
+    return total, pieces, field, targets
 
 
 @dataclass
 class SurfaceMetricCounts:
-    selected: int = 0
-    correct: int = 0
-    eligible_clean: int = 0
-    covered_clean: int = 0
-    all_clean: int = 0
+    candidate_sites: int = 0
+    selected_sites: int = 0
+    correct_unique: int = 0
+    false_positive_known_free: int = 0
+    unknown_selected: int = 0
+    pointer_slots: int = 0
+    in_grid_pointers: int = 0
+    support_sources_on_selected: int = 0
 
     def add(self, other: "SurfaceMetricCounts") -> None:
         for key in self.__dataclass_fields__:
             setattr(self, key, getattr(self, key) + getattr(other, key))
 
     def report(self) -> dict:
-        precision = self.correct / self.selected if self.selected else None
-        recall = self.covered_clean / self.eligible_clean if self.eligible_clean else None
-        f1 = (2 * precision * recall / (precision + recall)
-              if precision is not None and recall is not None and precision + recall
-              else 0.0 if precision is not None and recall is not None else None)
-        return {"proposal_precision_20cm": precision,
-                "radar_near_clean_recall_20cm": recall,
-                "surface_f1_20cm": f1,
-                "selected_proposals": self.selected,
-                "correct_proposals": self.correct,
-                "eligible_clean_sites": self.eligible_clean,
-                "covered_clean_sites": self.covered_clean,
-                "all_clean_sites": self.all_clean,
-                "radar_near_clean_fraction": self.eligible_clean / self.all_clean
-                if self.all_clean else None}
+        verified = self.correct_unique + self.false_positive_known_free
+        precision = self.correct_unique / verified if verified else None
+        return {
+            "distinct_correct_voxels": self.correct_unique,
+            "verified_proposal_precision": precision,
+            "proposal_utility": self.correct_unique * precision if precision is not None else 0.0,
+            "false_positive_known_free": self.false_positive_known_free,
+            "unknown_selected": self.unknown_selected,
+            "unknown_selected_fraction": self.unknown_selected / self.selected_sites
+            if self.selected_sites else None,
+            "candidate_sites": self.candidate_sites,
+            "selected_sites": self.selected_sites,
+            "pointer_slots": self.pointer_slots,
+            "in_grid_pointers": self.in_grid_pointers,
+            "mean_radar_sources_per_selected": self.support_sources_on_selected / self.selected_sites
+            if self.selected_sites else None,
+        }
 
 
 @torch.no_grad()
-def surface_metric_counts(output: SurfaceStudentOutput, clean: SparseSites,
-                          config: SurfaceStudentConfig) -> SurfaceMetricCounts:
-    """Score raw proposals against LiDAR near radar-pattern anchors.
-
-    All distances and counts are computed per batch. LiDAR is a reference only;
-    it cannot create inference proposals.
-    """
-    p = output.surface
-    result = SurfaceMetricCounts()
-    xyz = p.xyz.detach().cpu().numpy().reshape(-1, 3)
-    score = p.score.detach().cpu().numpy().reshape(-1)
-    batch = np.repeat(p.anchor_batch.detach().cpu().numpy(), p.xyz.shape[1])
-    anchor = p.anchor_xyz.detach().cpu().numpy()
-    anchor_batch = p.anchor_batch.detach().cpu().numpy()
-    clean_xyz = clean.centers_xyz(GRID).detach().cpu().numpy()
-    clean_batch = clean.coords[:, 0].detach().cpu().numpy()
-    for batch_id in np.unique(np.concatenate((batch, clean_batch))):
-        selected = (batch == batch_id) & (score >= config.threshold)
-        truth = clean_xyz[clean_batch == batch_id]
-        sites = xyz[selected]
-        result.selected += len(sites)
-        result.all_clean += len(truth)
-        if not len(truth):
-            continue
-        if len(sites):
-            result.correct += int((cKDTree(truth).query(sites)[0]
-                                   <= config.evaluation_tolerance_m).sum())
-        anchors = anchor[anchor_batch == batch_id]
-        if not len(anchors):
-            continue
-        eligible = cKDTree(anchors).query(truth)[0] <= config.target_radius_m
-        result.eligible_clean += int(eligible.sum())
-        if len(sites) and eligible.any():
-            result.covered_clean += int((cKDTree(sites).query(truth[eligible])[0]
-                                         <= config.evaluation_tolerance_m).sum())
-    return result
+def surface_metric_counts(field: PointerVoxelField, targets,
+                          config: SurfaceStudentConfig, *,
+                          pointer_slots: int = 0) -> SurfaceMetricCounts:
+    selected = field.confidence >= config.threshold
+    correct = selected & targets.occupied
+    free = selected & targets.known_free
+    unknown = selected & ~(targets.occupied | targets.known_free)
+    return SurfaceMetricCounts(
+        candidate_sites=len(field.coords), selected_sites=int(selected.sum()),
+        correct_unique=int(correct.sum()), false_positive_known_free=int(free.sum()),
+        unknown_selected=int(unknown.sum()), pointer_slots=pointer_slots,
+        in_grid_pointers=len(field.pointer_xyz),
+        support_sources_on_selected=int(field.source_count[selected].sum()))

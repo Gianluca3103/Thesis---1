@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from dataclasses import asdict
 from types import SimpleNamespace
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
@@ -17,7 +18,7 @@ from models.radar_lidar_crossmodal_v1.surface_student import (
 from models.radar_lidar_crossmodal_v1.previous_encoder import PreviousStage1Sparse
 from models.radar_lidar_crossmodal_v1.train_teacher import _hash
 from models.radar_lidar_crossmodal_v1.surface_student_loss import (
-    clean_surface_sites, surface_student_objective,
+    surface_student_objective,
 )
 
 
@@ -40,8 +41,8 @@ def test_head_uses_every_fine_radar_site_without_filling_children():
     head = RadarSurfaceHead(config)
     levels = _radar_levels()
     result = head(levels)
-    assert result.xyz.shape == (2, 4, 3)
-    assert result.logits.shape == (2, 4)
+    assert result.xyz.shape == (2, 24, 3)
+    assert result.logits.shape == (2, 24)
     assert result.guide.shape == (2, 32)
     assert torch.equal(result.anchor_xyz, levels[0].centers_xyz(GRID))
     assert torch.all(torch.abs(result.xyz - result.anchor_xyz[:, None]) <= 1.5)
@@ -61,7 +62,7 @@ def test_fine_anchors_do_not_cross_sample_boundaries():
               _sites([[0, 2, 64, 64], [1, 2, 64, 64]], 64, 4),
               _sites([[0, 1, 32, 32], [1, 1, 32, 32]], 64, 8))
     result = RadarSurfaceHead(SurfaceStudentConfig())(levels)
-    assert result.xyz.shape == (2, 4, 3)
+    assert result.xyz.shape == (2, 24, 3)
     assert result.anchor_batch.tolist() == [0, 1]
 
 
@@ -95,7 +96,7 @@ def test_sequential_head_rejects_missing_distilled_parent():
         raise AssertionError("Missing distilled parent was silently accepted")
 
 
-def test_geometry_and_confidence_supervise_moving_proposals():
+def test_occupancy_and_hit_reward_supervise_moving_proposals():
     torch.manual_seed(2)
     config = SurfaceStudentConfig()
     head = RadarSurfaceHead(config)
@@ -103,13 +104,13 @@ def test_geometry_and_confidence_supervise_moving_proposals():
     proposals = head(levels)
     conditioned = levels[3]
     output = SurfaceStudentOutput(conditioned, proposals)
-    teacher = conditioned.replace_features(torch.zeros_like(conditioned.features))
     clean_point = proposals.anchor_xyz.detach()[None, :, :]
-    clean = clean_surface_sites(clean_point, torch.ones((1, 2), dtype=torch.bool))
-    loss, pieces = surface_student_objective(output, teacher, clean, config)
+    loss, pieces, field, targets = surface_student_objective(
+        output, clean_point, torch.ones((1, 2), dtype=torch.bool), config)
     assert torch.isfinite(loss)
-    assert pieces["anchors_with_targets"] == 2
-    assert pieces["proposals"] == 8
+    assert pieces["pointer_slots"] == 48
+    assert pieces["occupied_sites"] > 0
+    assert len(field.coords) == len(targets.occupied)
     loss.backward()
     assert head.slots.weight.grad is not None
     assert torch.isfinite(head.slots.weight.grad).all()
@@ -148,11 +149,12 @@ def test_clean_targets_do_not_cross_sample_boundaries():
         logits=torch.zeros((1, 2), requires_grad=True),
         anchor_xyz=torch.zeros((1, 3)), anchor_batch=torch.tensor([0]),
         guide=torch.ones((1, 32)))
-    clean = _sites([[1, 8, 256, 256]], 1, 1)
-    _, pieces = surface_student_objective(
-        SurfaceStudentOutput(conditioned, proposals), conditioned, clean, config)
-    assert pieces["anchors_with_targets"] == 0
-    assert pieces["geometry"].item() == 0
+    clean_point = torch.tensor([[[0., 0., 0.]], [[.1, .1, .1]]])
+    valid = torch.tensor([[False], [True]])
+    _, pieces, _, _ = surface_student_objective(
+        SurfaceStudentOutput(conditioned, proposals), clean_point, valid, config)
+    assert pieces["known_sites"] == 0
+    assert pieces["hit_reward"].item() == 0
 
 
 def test_view_contains_only_raw_and_edge_confidence_panels(tmp_path):
@@ -177,11 +179,11 @@ def test_end_to_end_student_inference_needs_only_radar(tmp_path):
     radar = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
                            [10.2, .1, 0., 1., 0., 0., 0.]]])
     result = student(radar, torch.ones((1, 2), dtype=torch.bool))
-    assert result.surface.xyz.shape[1:] == (4, 3)
+    assert result.surface.xyz.shape[1:] == (24, 3)
     assert result.surface.xyz.shape[0] > 0
     assert result.conditioning.features.shape[1] == 64
     assert "surface_xyz" in result.exported()
-    assert "confidence_coords" not in result.exported()
+    assert "confidence_coords" in result.exported()
 
 
 def test_trained_student_is_frozen_before_radar_only_surface_decoding(tmp_path):
@@ -202,14 +204,15 @@ def test_trained_student_is_frozen_before_radar_only_surface_decoding(tmp_path):
     assert all(not parameter.requires_grad for name, parameter in model.named_parameters()
                if name.startswith(("radar_encoder.", "shared.", "feature_head.",
                                    "feature_norm.")))
-    assert all(parameter.requires_grad for parameter in model.surface_head.parameters())
+    assert all(parameter.requires_grad for name, parameter in model.surface_head.named_parameters()
+               if not name.startswith("guide."))
     radar = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.],
                            [10.2, .1, 0., 1., 0., 0., 0.]]])
     result = model(radar, torch.ones((1, 2), dtype=torch.bool))
-    assert result.surface.xyz.shape[1:] == (4, 3)
-    clean = clean_surface_sites(radar[..., :3], torch.ones((1, 2), dtype=torch.bool))
-    loss, pieces = surface_student_objective(result, None, clean, config)
-    assert pieces["distillation"].item() == 0
+    assert result.surface.xyz.shape[1:] == (24, 3)
+    loss, pieces, _, _ = surface_student_objective(
+        result, radar[..., :3], torch.ones((1, 2), dtype=torch.bool), config)
+    assert "distillation" not in pieces
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.surface_head.parameters())
     assert all(parameter.grad is None for parameter in model.shared.parameters())
@@ -238,8 +241,9 @@ def test_decoder_epoch_uses_radar_and_clean_labels_without_teacher(tmp_path):
     dataset = SimpleNamespace(set_epoch=lambda epoch: None)
     optimizer = torch.optim.AdamW(model.surface_head.parameters(), lr=1e-4)
     result = _epoch(model, dataset, [batch], "cpu", optimizer=optimizer)
-    assert result["loss_distillation"] == 0
-    assert result["proposals"] > 0
+    assert "loss_distillation" not in result
+    assert "loss_bce" in result and "loss_dice" in result
+    assert result["pointer_slots"] > 0
 
 
 def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
@@ -259,7 +263,7 @@ def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
         checkpoint = tmp_path / f"surface_{index}.ckpt"
         _save(checkpoint, student, optimizer, scheduler, tmp_path / "teacher.ckpt",
-              "mock-hash", 3, args, {"val": {"surface_f1_20cm": .2}})
+              "mock-hash", 3, args, {"val": {"proposal_utility": .2}})
         loaded, saved = load_surface_student(checkpoint, "cpu")
         assert saved["epoch"] == 3
         assert loaded.config == student.config
@@ -272,3 +276,36 @@ def test_surface_checkpoint_reloads_for_raw_vs_edge_view(tmp_path):
             torch.save(legacy, checkpoint)
             old_model, _ = load_surface_student(checkpoint, "cpu")
             assert old_model.config.decoder_from_conditioned is False
+            radar = torch.tensor([[[10., 0., 0., 1., 0., 0., 0.]]])
+            legacy_output = old_model(radar, torch.ones((1, 1), dtype=torch.bool))
+            assert "confidence_coords" not in legacy_output.exported()
+
+
+def test_new_pointer_head_can_warm_start_four_trained_slots(tmp_path):
+    from models.radar_lidar_crossmodal_v1.train_surface_student import (
+        _initialize_head_from_surface,
+    )
+
+    encoder = tmp_path / "radar_encoder.pth"
+    torch.save(PreviousStage1Sparse(modality="radar").state_dict(), encoder)
+    old_config = SurfaceStudentConfig(proposals_per_anchor=4,
+                                      decoder_from_conditioned=True,
+                                      distillation_weight=0)
+    old = RadarOnlySurfaceStudent(str(encoder), old_config)
+    with torch.no_grad():
+        old.surface_head.slots.weight.fill_(.123)
+        old.surface_head.slots.bias.fill_(.234)
+    path = tmp_path / "old_surface.ckpt"
+    torch.save({"version": "crossmodal_surface_student_v3_feature_first",
+                "config": asdict(old_config), "model": old.state_dict(),
+                "feature_student_sha256": "matching-feature-student"}, path)
+    new = RadarOnlySurfaceStudent(
+        str(encoder), SurfaceStudentConfig(decoder_from_conditioned=True,
+                                          distillation_weight=0))
+    _initialize_head_from_surface(new, path, "matching-feature-student")
+    assert torch.allclose(new.surface_head.slots.weight.view(24, 4, -1)[:4],
+                          old.surface_head.slots.weight.view(4, 4, -1))
+    assert torch.allclose(new.surface_head.slots.bias.view(24, 4)[:4],
+                          old.surface_head.slots.bias.view(4, 4))
+    assert not torch.allclose(new.surface_head.slots.weight.view(24, 4, -1)[4:],
+                              torch.full_like(new.surface_head.slots.weight.view(24, 4, -1)[4:], .123))

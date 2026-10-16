@@ -14,6 +14,8 @@ from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.radar_fov import (RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG,
                                                   RADAR_MAX_RANGE_M)
 from models.radar_lidar_crossmodal_v1.edge_aware_surface import edge_aware_surface
+from models.radar_lidar_crossmodal_v1.encoder import GRID
+from models.radar_lidar_crossmodal_v1.pointer_voxels import merge_surface_pointers
 from models.radar_lidar_crossmodal_v1.train_surface_student import load_surface_student
 from scripts.visualize_crossmodal_student import _write_ply
 
@@ -59,7 +61,7 @@ input[type=range]{width:230px}button{background:#253847;color:inherit;border:1px
 section{min-width:0;background:#182633;border:1px solid #3b5164;padding:5px;border-radius:5px}
 h2{font-size:12px;margin:0 0 5px;min-height:30px}canvas{width:100%;height:69vh;min-height:420px;background:#0c1620;touch-action:none;cursor:grab}
 @media(max-width:1000px){.panels{grid-template-columns:repeat(2,minmax(0,1fr))}canvas{height:48vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only model output: continuous surface locations and scores. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap.</p>
+</style><h1 id="title"></h1><p>Radar-only model output: predicted surface locations and scores. Pointer-decoder checkpoints merge duplicate fine voxels and combine radar support. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap.</p>
 <p id="links"></p><div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><p>Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one metric camera.</p>
 <script id="data" type="application/json">__DATA__</script><script>
@@ -111,11 +113,18 @@ def main():
         output = student(batch["radar"].to(args.device),
                          batch["radar_valid"].to(args.device))
         surface = output.surface
-        raw_xyz = surface.xyz.reshape(-1, 3).cpu().numpy()
-        raw_score = surface.score.reshape(-1).cpu().numpy()
-        slots = surface.xyz.shape[1]
-        guide = np.repeat(surface.guide.cpu().numpy(), slots, axis=0)
-        groups = np.repeat(np.arange(len(surface.anchor_xyz)), slots)
+        if saved["version"] == "crossmodal_surface_student_v4_pointer_voxels":
+            field = merge_surface_pointers(surface)
+            raw_xyz = GRID.centers_xyz(field.coords).cpu().numpy()
+            raw_score = field.confidence.cpu().numpy()
+            guide = surface.guide[field.representative_source].cpu().numpy()
+            groups = field.representative_source.cpu().numpy()
+        else:
+            raw_xyz = surface.xyz.reshape(-1, 3).cpu().numpy()
+            raw_score = surface.score.reshape(-1).cpu().numpy()
+            slots = surface.xyz.shape[1]
+            guide = np.repeat(surface.guide.cpu().numpy(), slots, axis=0)
+            groups = np.repeat(np.arange(len(surface.anchor_xyz)), slots)
         edge = edge_aware_surface(raw_xyz, raw_score, guide, groups,
                                   seed_threshold=args.edge_seed_threshold)
         edge_xyz = edge.centers_xyz()

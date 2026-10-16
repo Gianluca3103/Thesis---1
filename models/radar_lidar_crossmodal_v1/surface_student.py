@@ -20,36 +20,46 @@ from models.radar_lidar_stage1.sparse import SparseSites, decode_keys, encode_ke
 
 from .encoder import BOTTLENECK_CHANNELS, GRID
 from .previous_encoder import FrozenPreviousStage1Sparse
+from .pointer_voxels import merge_surface_pointers
 from .teacher import ResidualAdapter
 
 
 @dataclass(frozen=True)
 class SurfaceStudentConfig:
     feature_dim: int = BOTTLENECK_CHANNELS
-    proposals_per_anchor: int = 4
+    proposals_per_anchor: int = 24
     anchor_stride: int = 1
     offset_limit_m: float = 1.5
     context_radii_m: tuple[float, ...] = (1.0, 2.0, 4.0, 6.0)
     context_neighbors: int = 16
+    # Retained only to deserialize older surface checkpoints.
     confidence_sigma_m: float = 0.2
     target_radius_m: float = 1.5
     target_neighbors: int = 24
-    distillation_weight: float = 1.0
-    geometry_weight: float = 0.5
-    confidence_weight: float = 0.2
+    distillation_weight: float = 0.0
+    geometry_weight: float = 0.0
+    confidence_weight: float = 0.0
+    bce_weight: float = 1.0
+    dice_weight: float = 1.0
+    hit_weight: float = 0.5
+    hit_scale: float = 100.0
     threshold: float = 0.25
     evaluation_tolerance_m: float = 0.2
     decoder_from_conditioned: bool = False  # False reloads earlier surface checkpoints.
+    pointer_voxel_mode: bool = True  # Old checkpoints reload with this disabled.
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
+                or (self.pointer_voxel_mode and self.proposals_per_anchor > 24)
                 or self.anchor_stride not in (1, 2, 4, 8) or self.context_neighbors < 1
                 or self.target_neighbors < 1 or len(self.context_radii_m) != 4
                 or min(self.context_radii_m) <= 0
                 or min(self.offset_limit_m, self.confidence_sigma_m,
                        self.target_radius_m, self.evaluation_tolerance_m) <= 0
                 or min(self.distillation_weight, self.geometry_weight,
-                       self.confidence_weight) < 0 or not 0 < self.threshold < 1):
+                       self.confidence_weight, self.bce_weight,
+                       self.dice_weight, self.hit_weight) < 0
+                or self.hit_scale <= 0 or not 0 < self.threshold < 1):
             raise ValueError("Invalid radar-only surface proposal configuration")
 
 
@@ -60,6 +70,8 @@ class SurfaceProposals:
     anchor_xyz: torch.Tensor  # [anchors, 3]
     anchor_batch: torch.Tensor  # [anchors]
     guide: torch.Tensor  # learned radar-only features for optional interpolation
+    pointer_voxel_mode: bool = True
+    selection_threshold: float = 0.25
 
     @property
     def score(self) -> torch.Tensor:
@@ -81,7 +93,11 @@ class RadarSurfaceHead(nn.Module):
         self.relative = nn.ModuleList(nn.Linear(3, 1, bias=False) for _ in source_widths)
         self.hidden = nn.Sequential(nn.Linear(width * 5, width * 2),
                                     nn.LayerNorm(width * 2), nn.SiLU())
+        # Retained so older surface checkpoints still reload. The trained
+        # decoder hidden state itself guides optional edge-aware viewing;
+        # this separate projection has no occupancy supervision.
         self.guide = nn.Linear(width * 2, width * 2)
+        self.guide.requires_grad_(not config.pointer_voxel_mode)
         self.slots = nn.Linear(width * 2, 4 * config.proposals_per_anchor)
 
     def forward(self, sources: tuple[SparseSites, SparseSites, SparseSites, SparseSites]
@@ -154,8 +170,11 @@ class RadarSurfaceHead(nn.Module):
         hidden = self.hidden(torch.cat(parts, -1))
         raw = self.slots(hidden).reshape(-1, self.config.proposals_per_anchor, 4)
         xyz = centers[:, None, :] + torch.tanh(raw[..., :3]) * self.config.offset_limit_m
+        guide = hidden if self.config.pointer_voxel_mode else self.guide(hidden)
         return SurfaceProposals(xyz, raw[..., 3], centers, batch,
-                                F.normalize(self.guide(hidden), dim=-1))
+                                F.normalize(guide, dim=-1),
+                                self.config.pointer_voxel_mode,
+                                self.config.threshold)
 
 
 @dataclass
@@ -165,7 +184,7 @@ class SurfaceStudentOutput:
 
     def exported(self) -> dict:
         p = self.surface
-        return {
+        exported = {
             "conditioning_features": self.conditioning.features,
             "conditioning_coords": self.conditioning.coords,
             "surface_xyz": p.xyz,
@@ -180,6 +199,15 @@ class SurfaceStudentOutput:
                               "coordinate_order": "batch,z,y,x"},
             "interface_version": "crossmodal_surface_proposals_v1",
         }
+        if p.pointer_voxel_mode:
+            field = merge_surface_pointers(p)
+            selected = field.confidence >= p.selection_threshold
+            exported.update({"confidence_coords": field.coords[selected],
+                             "confidence_scores": field.confidence[selected],
+                             "confidence_radar_support_count": field.source_count[selected],
+                             "confidence_threshold": p.selection_threshold,
+                             "interface_version": "crossmodal_surface_proposals_v2_pointer_voxels"})
+        return exported
 
 
 class RadarOnlySurfaceStudent(nn.Module):

@@ -115,7 +115,8 @@ def test_feature_checkpoint_handoff_freezes_representation(tmp_path):
     assert all(not p.requires_grad for name, p in surface.named_parameters()
                if name.startswith(("radar_encoder.", "shared.", "feature_head.",
                                    "feature_norm.")))
-    assert all(p.requires_grad for p in surface.surface_head.parameters())
+    assert all(p.requires_grad for name, p in surface.surface_head.named_parameters()
+               if not name.startswith("guide."))
     batch = _radar_batch()
     assert torch.allclose(reloaded(batch["radar"], batch["radar_valid"]).features,
                           surface(batch["radar"], batch["radar_valid"]).conditioning.features)

@@ -333,21 +333,20 @@ query comes from that bottleneck at each fine radar anchor; fine radar
 pyramid features provide local detail.
 The first trial grouped fine radar sites at stride 8 and predicted two
 locations per anchor. That could produce only 982 raw proposals from 491
-anchors even with the display threshold at zero. The current configuration
-uses every active stride-1 radar voxel as an anchor and learns four continuous
-surface locations and confidence scores from the trained student and local
-multiscale radar features. It still does not enumerate neighboring candidate
-cells or fill a sphere. Clean LiDAR supervises proposal geometry and score
-during decoder training; the teacher is absent from this phase and inference
-uses radar alone. Existing stride-8 surface checkpoints remain loadable using
-their saved config, but their output density cannot change without retraining
-the surface student. These additional learned proposals increase capacity;
-only validation precision and recall establish whether they improve accuracy.
+anchors even with the display threshold at zero. The pointer configuration
+uses every active stride-1 radar voxel as an anchor and predicts up to 24
+continuous locations with strengths. It merges pointers into unique fine
+voxels; no neighboring output cells or spherical region are filled. Clean
+LiDAR supervises only proposed voxels where occupancy or free space is known.
+The teacher is absent from this phase, and inference uses radar alone. Older
+surface checkpoints remain loadable with their original per-pointer viewer.
+The new loss and 24-slot head require a new decoder checkpoint.
 
 The existing fixed student supervision cache contains frozen teacher
 bottleneck features, which `train_feature_student` can reuse without calling
 the teacher each batch. Its fixed-grid occupancy labels cannot supervise the
-moving surface proposals.
+moving pointers; clean occupancy and visibility are queried at their newly
+proposed coordinates.
 The fixed aligned radar/LiDAR frame cache may still be supplied with
 `--data-cache-root`. Use new output directories for both stages; the trained
 feature-only student checkpoint is required and must use the same
@@ -397,15 +396,30 @@ export OMP_NUM_THREADS=8
   --full-val-every 5 --num-workers 4 --device cuda
 
 "$PY" -m scripts.compare_crossmodal_surface \
-  --vod-root "$VOD" --checkpoint "$SURFACE_RUN/best_surface_f1.ckpt" \
+  --vod-root "$VOD" --checkpoint "$SURFACE_RUN/best_proposal_utility.ckpt" \
   --split val --frame-id 08236 00405 \
   --output-root "$SURFACE_RUN/views" --device cuda
 ```
 
-The viewer writes uncapped raw proposal and edge-aware point clouds, a
+The decoder predicts up to 24 optional fine-voxel pointers per active radar
+voxel. Pointers from one radar voxel to the same destination count once;
+pointers from different radar voxels raise that destination's bounded
+confidence. Training compares only pointed voxels with clean-LiDAR occupancy
+or verified free space, using masked BCE, Dice, and a distinct-hit reward.
+Unknown voxels are ignored, and unproposed clean voxels are not penalized.
+The checkpoint metric is distinct correct proposed voxels times precision on
+verified proposals, aggregated over the full validation split.
+If a trained sequential four-pointer checkpoint used the exact same distilled
+feature student, add `--initialize-from-surface-checkpoint /path/to/old.ckpt`
+to the new decoder run. This copies its first four pointer slots and keeps the
+remaining 20 newly initialized. A full run with no occupied pointed voxels in
+its first epoch stops with a clear error because the proposal-only objective
+has no positive signal. A tiny smoke run prints a warning instead.
+
+The viewer writes uncapped merged raw-voxel and edge-aware point clouds, a
 synchronized four-panel HTML view with radar and forward-sector LiDAR as
 references, and per-frame comparison metrics. Its display threshold starts at
-zero, so all raw proposals are visible until the slider is moved. The
+zero, so all raw candidate voxels are visible until the slider is moved. The
 edge-aware field is derived
 only from predicted positions, scores, and radar features. It is never fed
 back to the student or used as a training label. These new raw proposals are
