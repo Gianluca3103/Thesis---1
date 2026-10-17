@@ -16,7 +16,9 @@ from models.radar_lidar_stage1.radar_fov import (RADAR_FOV_SPEC, RADAR_HALF_FOV_
 from models.radar_lidar_crossmodal_v1.edge_aware_surface import edge_aware_surface
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.pointer_voxels import merge_surface_pointers
-from models.radar_lidar_crossmodal_v1.train_surface_student import load_surface_student
+from models.radar_lidar_crossmodal_v1.train_surface_student import (
+    JOINT_VERSION, VERSION as POINTER_VERSION, load_surface_student,
+)
 from scripts.visualize_crossmodal_student import _write_ply
 
 
@@ -113,7 +115,7 @@ def main():
         output = student(batch["radar"].to(args.device),
                          batch["radar_valid"].to(args.device))
         surface = output.surface
-        if saved["version"] == "crossmodal_surface_student_v4_pointer_voxels":
+        if saved["version"] in (POINTER_VERSION, JOINT_VERSION):
             field = merge_surface_pointers(surface)
             raw_xyz = GRID.centers_xyz(field.coords).cpu().numpy()
             raw_score = field.confidence.cpu().numpy()

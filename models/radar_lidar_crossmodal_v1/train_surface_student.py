@@ -23,6 +23,7 @@ from .train_teacher import _assert_frozen, _encoder_snapshot, _hash, _move
 
 
 VERSION = "crossmodal_surface_student_v4_pointer_voxels"
+JOINT_VERSION = "crossmodal_surface_student_v5_joint_pointer_voxels"
 
 
 def _epoch(student, dataset, loader, device, *, optimizer=None, epoch=1):
@@ -95,13 +96,14 @@ def _save(path, student, optimizer, scheduler, feature_student_path, feature_stu
 
 def load_surface_student(path: str | Path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") not in (VERSION, "crossmodal_surface_student_v3_feature_first",
+    if saved.get("version") not in (VERSION, JOINT_VERSION,
+                                    "crossmodal_surface_student_v3_feature_first",
                                     "crossmodal_surface_student_v2_sequential",
                                     "crossmodal_surface_student_v1"):
         raise ValueError("Expected a trained raw surface-proposal student checkpoint")
     config = dict(saved["config"])
     config["context_radii_m"] = tuple(config["context_radii_m"])
-    if saved["version"] != VERSION:
+    if saved["version"] not in (VERSION, JOINT_VERSION):
         config["pointer_voxel_mode"] = False
     model = RadarOnlySurfaceStudent(saved["radar_checkpoint"],
                                     SurfaceStudentConfig(**config))
