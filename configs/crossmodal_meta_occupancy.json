@@ -1,0 +1,11 @@
+{
+  "radius_m": 3.2,
+  "max_candidates": 24,
+  "teacher_sigma_m": 2.0,
+  "distillation_weight": 1.0,
+  "inner_lr": 0.05,
+  "smooth_l1_beta": 1.0,
+  "teacher_geometry_weight": 0.05,
+  "teacher_fusion_weight": 0.05,
+  "threshold": 0.5
+}

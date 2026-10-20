@@ -1,5 +1,80 @@
 # Native Stage-I sparse encoders, cross-modal teacher, radar-only student
 
+## Joint relationship and radar-only occupancy experiment
+
+`train_meta_occupancy.py` implements the proposed bilevel experiment without
+changing the older teacher/student training scripts. Start with independently
+pretrained radar and clean-LiDAR encoders:
+
+```powershell
+python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy `
+  --vod-root PATH_TO_VOD --radar-encoder PATH_TO_RADAR_ENCODER `
+  --lidar-encoder PATH_TO_LIDAR_ENCODER --output-root PATH_TO_NEW_RUN
+```
+
+The default config is `configs/crossmodal_meta_occupancy.json`. Teacher
+attention takes radar queries and up to 24 clean-LiDAR bottleneck candidates
+within **3.2 m** (Euclidean distance in the calibrated LiDAR frame). A
+candidate farther away is excluded even if fewer than 24 remain. The student
+starts with two map-only warmup epochs. On subsequent epochs, each teacher
+update uses a paired training batch A to compute its LiDAR-conditioned feature,
+simulates one differentiable student feature-distillation step, and scores the
+**radar-only** student map on a distinct training batch B. The quiz BCE flows
+back through that simulated step to the teacher attention and gate. Small
+geometric-attention and LiDAR-feature anchors keep the relationship branch
+grounded; their weights are configurable. A real student step on A then uses
+known-voxel map BCE plus Smooth L1 distillation from the updated teacher.
+The decoder consumes the student's distilled feature without direct pyramid
+skip connections, and no teacher or LiDAR tensor enters its forward path.
+`--teacher-init` optionally initializes the
+teacher from an existing compatible teacher checkpoint; its weights are then
+trained with the new 3.2 m neighborhood. `--resume` restores a joint run.
+
+Fine voxel labels use the existing 0.2 × 0.2 × 0.25 m grid. A generated
+candidate is scored only when its center is at most 3.2 m from a radar point
+in the same frame **and** clean LiDAR marks it occupied or conservatively
+known free. Unobserved voxels do not become negatives. BCE is unweighted so
+its sigmoid can be assessed as a probability; validation logs Brier score,
+known-space IoU at a fixed 0.5 threshold, and the fraction of clean returns
+inside radar support represented by generated, supported candidates.
+The present stride-8 generative decoder emits the 8³ children of its active
+radar cells. It does **not** emit every voxel in the 3.2 m union of spheres.
+The reported `iou_known_supported` is on the intersection of that sphere
+support and generated candidates. `iou_full_support` additionally counts every
+nearby clean occupied voxel absent from the decoder output as a false negative;
+this is the checkpoint-selection metric. Coverage reports the missing support.
+
+Starting at epoch 5, validation also logs `iou_exact`, `iou_at_0_2m`,
+`f1_exact`, and `f1_at_0_2m` every five epochs (change with
+`--scan-metrics-every`). These compare thresholded predicted occupied voxels
+with **all** clean-LiDAR occupied voxels whose centers are in the 3.2 m radar
+support, including voxels the decoder never generated. Exact means the same
+voxel key. The 0.2 m metrics use maximum one-to-one matching of voxel centers
+within 0.2 m and never match across frames. For each metric,
+`IoU = TP / (predicted + observed - TP)` and
+`F1 = 2 TP / (predicted + observed)`. Predictions in LiDAR-unobserved space
+count as unmatched predictions here, so these are clean-scan agreement metrics,
+not definitive physical occupancy scores. Existing BCE, Brier, and known-space
+IoU continue to be evaluated every epoch.
+
+`last.ckpt` and `best_iou.ckpt` contain both training models. Their matching
+`last_student.ckpt` and `best_student.ckpt` files contain only the radar-only
+inference model:
+
+```python
+from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probability_map
+from models.radar_lidar_crossmodal_v1.train_meta_occupancy import load_meta_student
+
+student, checkpoint = load_meta_student("PATH_TO_RUN/best_student.ckpt")
+output = radar_only_probability_map(
+    student, radar_points, radar_valid, checkpoint["radius_m"])
+```
+
+The virtual update uses a one-step SGD proxy for the student's feature-path
+update; the real student optimizer remains AdamW. It needs PyTorch 2.3+ and
+appreciably more GPU memory than ordinary student training. The full run also
+requires the existing native sparse encoder and MinkowskiEngine installation.
+
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and
 their existing checkpoints. The active radar and LiDAR encoders use the native
 Stage-I `PointVoxelEncoder` and `SparseBackbone` from

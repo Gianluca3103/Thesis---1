@@ -34,6 +34,7 @@ class StudentConfig:
     smooth_l1_beta: float = 1.0
     confidence_threshold: float = 0.5
     thresholds: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    decoder_from_conditioned: bool = False
 
     def __post_init__(self):
         if self.feature_dim != BOTTLENECK_CHANNELS or min(self.decoder_channels) < 1:
@@ -184,7 +185,7 @@ class RadarOnlyStudent(nn.Module):
         self.radar_encoder.eval()
         return self
 
-    def forward(self, radar_points, radar_valid) -> StudentOutput:
+    def encode_conditioning(self, radar_points, radar_valid):
         # No LiDAR, teacher, LiDAR coordinates or target labels enter this path.
         with torch.no_grad():
             if hasattr(self.radar_encoder, "forward_pyramid"):
@@ -194,6 +195,16 @@ class RadarOnlyStudent(nn.Module):
                 pyramid = None
         shared = radar.replace_features(self.shared(radar.features))
         feature = shared.replace_features(self.feature_norm(self.feature_head(shared.features)))
-        confidence = (self.confidence_decoder(shared, pyramid) if pyramid is not None
-                      else self.confidence_decoder(shared))
+        return feature, shared, pyramid
+
+    def forward(self, radar_points, radar_valid) -> StudentOutput:
+        feature, shared, pyramid = self.encode_conditioning(radar_points, radar_valid)
+        conditioned = getattr(getattr(self, "config", None), "decoder_from_conditioned", False)
+        decoder_input = feature if conditioned else shared
+        # The meta-trained path cannot bypass the distilled bottleneck through
+        # direct radar pyramid skips. The older student keeps its skip behavior.
+        decoder_pyramid = None if conditioned else pyramid
+        confidence = (self.confidence_decoder(decoder_input, decoder_pyramid)
+                      if decoder_pyramid is not None
+                      else self.confidence_decoder(decoder_input))
         return StudentOutput(feature, confidence)
