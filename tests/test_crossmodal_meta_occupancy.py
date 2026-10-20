@@ -10,7 +10,11 @@ from models.radar_lidar_stage1.correspondence import Neighborhood
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.meta_occupancy import (
     MetaOccupancyConfig, candidate_support, feature_distillation,
-    meta_teacher_step, occupancy_loss, scan_overlap_counts, scan_overlap_rates)
+    meta_teacher_step, occupancy_loss, scan_overlap_counts,
+    scan_overlap_counts_observed, scan_overlap_rates)
+from models.radar_lidar_crossmodal_v1.meta_cache import (
+    CachedOccupancyTargets, MetaOccupancyCache, collate_meta_cache,
+    prepare_meta_batch)
 from models.radar_lidar_crossmodal_v1.student import RadarOnlyStudent, StudentOutput
 from models.radar_lidar_crossmodal_v1.teacher import BottleneckTeacherCore, TeacherConfig
 
@@ -77,6 +81,7 @@ def test_exact_and_0_2m_scan_matches_count_unrepresented_lidar_voxels():
                                  radar, valid, support, 0.5, 3.2)
     assert result == {"predicted": 3, "observed": 2,
                       "tp_exact": 1, "tp_at_0_2m": 2}
+    assert scan_overlap_counts_observed(predicted_coords, observed_coords) == result
     rates = scan_overlap_rates(result)
     assert rates["iou_exact"] == 0.25
     assert rates["f1_exact"] == 0.4
@@ -206,3 +211,93 @@ def test_map_loss_reaches_actual_cross_attention_query_through_virtual_step():
         radar_only_quiz_logit, torch.ones_like(radar_only_quiz_logit))
     query_gradient = torch.autograd.grad(map_loss, core.query.weight)[0]
     assert query_gradient.norm().item() > 0
+
+
+def test_meta_cache_batch_offsets_and_cached_targets(tmp_path):
+    def row(frame):
+        return {
+            "frame_id": frame, "radar_coords": torch.tensor([[0, 1, 2, 3]]),
+            "radar_features": torch.ones(1, 64),
+            "lidar_coords": torch.tensor([[0, 1, 2, 3]]),
+            "lidar_features": torch.ones(1, 64),
+            "neighbor_indices": torch.tensor([[0, -1]]),
+            "neighbor_distances": torch.tensor([[0.2, float("inf")]]),
+            "candidate_coords": torch.tensor([[0, 8, 16, 24]]),
+            "observed_coords": torch.tensor([[0, 8, 16, 24]]),
+            "occupied": torch.tensor([True]),
+            "known_free": torch.tensor([False]),
+            "support": torch.tensor([True]),
+            "clean_supported_points": 2,
+            "represented_clean_points_supported": 2,
+        }
+    manifest = {"frame_ids": ["1", "2"], "max_candidates": 2}
+    cache = MetaOccupancyCache(tmp_path, manifest, create=True)
+    for frame in ("1", "2"):
+        cache.write(frame, {key: value for key, value in row(frame).items()
+                            if key != "frame_id"})
+    cache.check_complete()
+    batch = prepare_meta_batch(collate_meta_cache([cache[0], cache[1]]), "cpu")
+    assert batch["neighbors"].indices.tolist() == [[0, -1], [1, -1]]
+    assert batch["candidate_coords"][:, 0].tolist() == [0, 1]
+    assert batch["observed_coords"][:, 0].tolist() == [0, 1]
+    assert batch["clean_supported_points"] == 4
+    assert batch["targets"].represented_clean_points_supported == 4
+
+
+def test_cached_virtual_student_step_reaches_teacher_parameter():
+    class Core(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(0.8))
+
+        def forward(self, radar, lidar, neighbors):
+            fused = radar.replace_features(lidar.features * self.weight)
+            return SimpleNamespace(
+                fused=fused, lidar_frozen=lidar, neighbors=neighbors,
+                attention=torch.ones(1, 1, 1))
+
+    class Teacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.core = Core()
+
+    class Student(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(decoder_from_conditioned=True)
+            self.shared = nn.Linear(1, 1, bias=False)
+            self.shared.weight.data.fill_(0.2)
+
+        def encode_conditioning_sites(self, radar):
+            feature = radar.replace_features(self.shared(radar.features))
+            return feature, feature
+
+        def forward_encoded(self, radar):
+            feature, _ = self.encode_conditioning_sites(radar)
+            confidence = SparseSites(
+                torch.tensor([[0, 8, 256, 256]]), feature.features,
+                GRID.shape_zyx)
+            return StudentOutput(feature, confidence)
+
+    def batch(frame, strength):
+        coarse = torch.tensor([[0, 1, 32, 32]])
+        radar = SparseSites(coarse, torch.tensor([[strength]]), GRID.scale_shape(8), 8)
+        lidar = SparseSites(coarse, torch.tensor([[1.0]]), GRID.scale_shape(8), 8)
+        return {
+            "frame_id": [frame], "radar_sites": radar, "lidar_sites": lidar,
+            "neighbors": Neighborhood(torch.tensor([[0]]), torch.tensor([[0.1]])),
+            "candidate_coords": torch.tensor([[0, 8, 256, 256]]),
+            "targets": CachedOccupancyTargets(torch.tensor([True]),
+                                              torch.tensor([False]), 1),
+            "support": torch.tensor([True]),
+        }
+
+    teacher, student = Teacher(), Student()
+    optimizer = torch.optim.SGD(teacher.core.parameters(), lr=0.2)
+    before = teacher.core.weight.detach().clone()
+    result = meta_teacher_step(
+        teacher, student, batch("A", 1.0), batch("B", 1.5), optimizer,
+        MetaOccupancyConfig(inner_lr=0.5, teacher_geometry_weight=0,
+                            teacher_fusion_weight=0))
+    assert not result.get("skipped", False)
+    assert not torch.equal(teacher.core.weight, before)

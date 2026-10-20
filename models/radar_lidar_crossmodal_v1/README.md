@@ -12,6 +12,45 @@ python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy `
   --lidar-encoder PATH_TO_LIDAR_ENCODER --output-root PATH_TO_NEW_RUN
 ```
 
+For fixed, unaugmented VoD frames, build the meta cache once per split and
+reuse it for every epoch. The builder reads the existing fixed-frame cache.
+It stores frozen radar and LiDAR bottleneck features, exact 3.2 m neighbors,
+radar-only candidate coordinates, clean occupancy and known-free labels,
+radar support, and supported clean voxel coordinates for scan metrics. It
+never stores trainable teacher attention, distilled student features, decoder
+logits, or probabilities. An interrupted build resumes missing frames.
+
+```bash
+for split in train val; do
+  python -m scripts.cache_meta_occupancy \
+    --vod-root "$VOD" --data-cache-root "$PREV/fixed_frames" \
+    --cache-root "$OUT/meta_cache" \
+    --radar-encoder "$PREV/full/radar/best_encoder.pth" \
+    --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
+    --split "$split" --num-workers 2 --device cuda
+done
+
+python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy \
+  --vod-root "$VOD" --meta-cache-root "$OUT/meta_cache" \
+  --radar-encoder "$PREV/full/radar/best_encoder.pth" \
+  --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
+  --output-root "$OUT/train" --epochs 25 --warmup-epochs 2 \
+  --batch-size 8 --num-workers 2 --scan-metrics-every 5 \
+  --quick-val-frames 32 --full-val-every 5 --device cuda
+```
+
+The manifest binds this cache to the VoD frame IDs, encoder hashes, grid,
+radius, and geometry/label source code. Every cached candidate-coordinate
+tensor is checked against the live decoder output. Validation uses 32 frames
+on ordinary epochs and the full split every five epochs (and at the final
+epoch); checkpoint selection uses full validation only. The four scan metrics
+remain full-split measurements every five epochs. The old student supervision
+cache has a different source fingerprint and is not silently accepted.
+Before the full build, create two training entries with `--split train --limit 2`
+and compare them to the uncached path with `python -m scripts.smoke_meta_cache`
+using the same root and encoder arguments. The smoke checks student features,
+decoder logits, occupancy masks, support, and teacher features.
+
 The default config is `configs/crossmodal_meta_occupancy.json`. Teacher
 attention takes radar queries and up to 24 clean-LiDAR bottleneck candidates
 within **3.2 m** (Euclidean distance in the calibrated LiDAR frame). A

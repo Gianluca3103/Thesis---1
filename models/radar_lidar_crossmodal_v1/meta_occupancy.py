@@ -120,6 +120,12 @@ def scan_overlap_counts(output, clean: torch.Tensor, clean_valid: torch.Tensor,
     predicted = coordinates[support & (torch.sigmoid(logits) >= threshold)]
     observed, _, _, _ = voxelize(clean, clean_valid, GRID)
     observed = observed[candidate_support(observed, radar, radar_valid, radius_m)]
+    return scan_overlap_counts_observed(predicted, observed)
+
+
+def scan_overlap_counts_observed(predicted: torch.Tensor,
+                                 observed: torch.Tensor) -> dict[str, int]:
+    """Scan agreement from fixed, radar-supported clean voxel coordinates."""
     prediction_count, observation_count = len(predicted), len(observed)
     if not prediction_count or not observation_count:
         return {"predicted": prediction_count, "observed": observation_count,
@@ -231,7 +237,10 @@ def occupancy_loss(output, targets, support: torch.Tensor, threshold: float):
         "free": int((support & free).sum()),
         "candidate_sites": len(logits),
         "supported_candidate_sites": int(support.sum()),
-        "represented_clean_points": int(targets.clean_point_count[support].sum()),
+        "represented_clean_points": (
+            targets.represented_clean_points_supported
+            if hasattr(targets, "represented_clean_points_supported")
+            else int(targets.clean_point_count[support].sum())),
         "intersection": intersection,
         "union": union,
     }
@@ -260,6 +269,17 @@ def relationship_loss(teacher_output, config: MetaOccupancyConfig):
                    "fusion": float(fusion.detach()), "eligible": int(eligible.sum())}
 
 
+class _EncodedStudent(nn.Module):
+    """Expose the cached-input forward path to torch.func.functional_call."""
+
+    def __init__(self, student: nn.Module):
+        super().__init__()
+        self.student = student
+
+    def forward(self, radar_sites):
+        return self.student.forward_encoded(radar_sites)
+
+
 def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict,
                       quiz_batch: dict, teacher_optimizer: torch.optim.Optimizer,
                       config: MetaOccupancyConfig):
@@ -271,13 +291,20 @@ def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict
     """
     if not student.config.decoder_from_conditioned:
         raise ValueError("Meta training requires the decoder to consume distilled features")
-    teacher_output = teacher(paired_batch["radar"], paired_batch["radar_valid"],
-                             paired_batch["clean_lidar"], paired_batch["clean_lidar_valid"])
+    cached = "radar_sites" in paired_batch
+    teacher_output = (teacher.core(paired_batch["radar_sites"],
+                                   paired_batch["lidar_sites"], paired_batch["neighbors"])
+                      if cached else teacher(paired_batch["radar"], paired_batch["radar_valid"],
+                                             paired_batch["clean_lidar"],
+                                             paired_batch["clean_lidar_valid"]))
     eligible = teacher_output.neighbors.valid.any(-1)
     if not bool(eligible.any()):
         return {"skipped": True, "reason": "no LiDAR neighbors"}
-    student_feature, _, _ = student.encode_conditioning(
-        paired_batch["radar"], paired_batch["radar_valid"])
+    if cached:
+        student_feature, _ = student.encode_conditioning_sites(paired_batch["radar_sites"])
+    else:
+        student_feature, _, _ = student.encode_conditioning(
+            paired_batch["radar"], paired_batch["radar_valid"])
     distill = feature_distillation(student_feature, teacher_output.fused,
                                    beta=config.smooth_l1_beta, detach_teacher=False,
                                    eligible=eligible)
@@ -291,13 +318,25 @@ def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict
     virtual = {name: parameter - config.inner_lr * config.distillation_weight * gradient
                for (name, parameter), gradient in zip(selected, inner_grads)
                if gradient is not None}
-    quiz_output = functional_call(student, virtual,
-                                  (quiz_batch["radar"], quiz_batch["radar_valid"]))
-    quiz_targets = student_targets(quiz_output, quiz_batch["clean_lidar"],
-                                   quiz_batch["clean_lidar_valid"])
-    support = candidate_support(quiz_output.confidence_logits.coords,
-                                quiz_batch["radar"], quiz_batch["radar_valid"],
-                                config.radius_m)
+    if cached:
+        # functional_call needs a module entry point that consumes frozen sites.
+        quiz_output = functional_call(_EncodedStudent(student),
+                                      {f"student.{name}": value
+                                       for name, value in virtual.items()},
+                                      (quiz_batch["radar_sites"],))
+        quiz_targets = quiz_batch["targets"]
+        support = quiz_batch["support"]
+        if not torch.equal(quiz_output.confidence_logits.coords,
+                           quiz_batch["candidate_coords"]):
+            raise ValueError("Cached quiz candidate coordinates differ")
+    else:
+        quiz_output = functional_call(student, virtual,
+                                      (quiz_batch["radar"], quiz_batch["radar_valid"]))
+        quiz_targets = student_targets(quiz_output, quiz_batch["clean_lidar"],
+                                       quiz_batch["clean_lidar_valid"])
+        support = candidate_support(quiz_output.confidence_logits.coords,
+                                    quiz_batch["radar"], quiz_batch["radar_valid"],
+                                    config.radius_m)
     quiz_loss, quiz_stats = occupancy_loss(quiz_output, quiz_targets, support,
                                            config.threshold)
     if not quiz_stats["known"]:

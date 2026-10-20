@@ -193,9 +193,21 @@ class RadarOnlyStudent(nn.Module):
             else:
                 radar = self.radar_encoder(radar_points, radar_valid)
                 pyramid = None
+        feature, shared = self.encode_conditioning_sites(radar)
+        return feature, shared, pyramid
+
+    def encode_conditioning_sites(self, radar):
+        """Trainable radar path after the frozen encoder (for static caches)."""
         shared = radar.replace_features(self.shared(radar.features))
         feature = shared.replace_features(self.feature_norm(self.feature_head(shared.features)))
-        return feature, shared, pyramid
+        return feature, shared
+
+    def forward_encoded(self, radar) -> StudentOutput:
+        """Decode cached frozen radar sites with the same radar-only path."""
+        if not self.config.decoder_from_conditioned:
+            raise ValueError("Cached radar sites require the conditioned decoder")
+        feature, _ = self.encode_conditioning_sites(radar)
+        return StudentOutput(feature, self.confidence_decoder(feature))
 
     def forward(self, radar_points, radar_valid) -> StudentOutput:
         feature, shared, pyramid = self.encode_conditioning(radar_points, radar_valid)

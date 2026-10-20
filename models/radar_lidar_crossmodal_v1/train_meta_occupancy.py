@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_stage1.online_augmentation import GeometricAugmentationConfig
@@ -20,9 +20,12 @@ from models.radar_lidar_stage1.radar_fov import RADAR_FOV_SPEC
 
 from .meta_occupancy import (MetaOccupancyConfig, candidate_support,
                              feature_distillation, meta_teacher_step,
-                             occupancy_loss, scan_overlap_counts, scan_overlap_rates,
+                             occupancy_loss, scan_overlap_counts,
+                             scan_overlap_counts_observed, scan_overlap_rates,
                              supported_clean_points,
                              supported_clean_voxels)
+from .meta_cache import (MetaOccupancyCache, cache_manifest, collate_meta_cache,
+                         prepare_meta_batch)
 from .pipeline_data import collate_stage1, paired_dataset
 from .student import RadarOnlyStudent, StudentConfig
 from .student_loss import student_targets
@@ -32,6 +35,37 @@ from .train_teacher import (_assert_frozen, _encoder_snapshot, _hash, _move,
 
 
 VERSION = "crossmodal_meta_occupancy_v1"
+
+
+def _prepare_batch(raw, device):
+    return (prepare_meta_batch(raw, device) if "radar_coords" in raw
+            else _move(raw, device))
+
+
+def _student_output(student, batch):
+    output = (student.forward_encoded(batch["radar_sites"])
+              if "radar_sites" in batch
+              else student(batch["radar"], batch["radar_valid"]))
+    if "candidate_coords" in batch and not torch.equal(
+            output.confidence_logits.coords, batch["candidate_coords"]):
+        raise ValueError("Meta cache candidate coordinates differ from decoder output")
+    return output
+
+
+def _teacher_output(teacher, batch):
+    return (teacher.core(batch["radar_sites"], batch["lidar_sites"], batch["neighbors"])
+            if "radar_sites" in batch else
+            teacher(batch["radar"], batch["radar_valid"],
+                    batch["clean_lidar"], batch["clean_lidar_valid"]))
+
+
+def _targets_and_support(output, batch, config):
+    if "targets" in batch:
+        return batch["targets"], batch["support"]
+    targets = student_targets(output, batch["clean_lidar"], batch["clean_lidar_valid"])
+    support = candidate_support(output.confidence_logits.coords, batch["radar"],
+                                batch["radar_valid"], config.radius_m)
+    return targets, support
 
 
 class EpochMetrics:
@@ -95,17 +129,14 @@ class EpochMetrics:
 
 
 def _student_step(student, teacher, batch, optimizer, config, *, use_teacher):
-    output = student(batch["radar"], batch["radar_valid"])
-    targets = student_targets(output, batch["clean_lidar"], batch["clean_lidar_valid"])
-    support = candidate_support(output.confidence_logits.coords, batch["radar"],
-                                batch["radar_valid"], config.radius_m)
+    output = _student_output(student, batch)
+    targets, support = _targets_and_support(output, batch, config)
     map_loss, stats = occupancy_loss(output, targets, support, config.threshold)
     distill = None
     feature_elements = 0
     if use_teacher:
         with torch.no_grad():
-            teacher_output = teacher(batch["radar"], batch["radar_valid"],
-                                     batch["clean_lidar"], batch["clean_lidar_valid"])
+            teacher_output = _teacher_output(teacher, batch)
         eligible = teacher_output.neighbors.valid.any(-1)
         feature_elements = int(eligible.sum()) * output.conditioning.features.shape[-1]
         if feature_elements:
@@ -130,13 +161,14 @@ def _train_epoch(student, teacher, dataset, loader, student_optimizer,
     summary = EpochMetrics()
     iterator = iter(loader)
     try:
-        previous = _move(next(iterator), device)
+        previous = _prepare_batch(next(iterator), device)
     except StopIteration:
         raise ValueError("The training split has no frames") from None
     progress = tqdm(range(len(loader)), desc=f"Meta train {epoch:03d}", unit="batch")
     for index in progress:
         raw_next = next(iterator, None)
-        following = _move(raw_next, device) if raw_next is not None else None
+        following = (_prepare_batch(raw_next, device)
+                     if raw_next is not None and epoch > warmup_epochs else None)
         meta = None
         if epoch > warmup_epochs and following is not None:
             if set(previous["frame_id"]) & set(following["frame_id"]):
@@ -146,16 +178,20 @@ def _train_epoch(student, teacher, dataset, loader, student_optimizer,
         stats, distill, feature_elements = _student_step(
             student, teacher, previous, student_optimizer, config,
             use_teacher=epoch > warmup_epochs)
-        clean_supported = supported_clean_points(
-            previous["clean_lidar"], previous["clean_lidar_valid"],
-            previous["radar"], previous["radar_valid"], config.radius_m)
-        clean_voxels = supported_clean_voxels(
-            previous["clean_lidar"], previous["clean_lidar_valid"],
-            previous["radar"], previous["radar_valid"], config.radius_m)
+        if "radar_sites" in previous:
+            clean_supported = previous["clean_supported_points"]
+            clean_voxels = previous["clean_supported_voxels"]
+        else:
+            clean_supported = supported_clean_points(
+                previous["clean_lidar"], previous["clean_lidar_valid"],
+                previous["radar"], previous["radar_valid"], config.radius_m)
+            clean_voxels = supported_clean_voxels(
+                previous["clean_lidar"], previous["clean_lidar_valid"],
+                previous["radar"], previous["radar_valid"], config.radius_m)
         summary.add(stats, previous, clean_supported, clean_voxels,
                     distill, feature_elements, meta)
-        if following is not None:
-            previous = following
+        if raw_next is not None:
+            previous = following if following is not None else _prepare_batch(raw_next, device)
     return summary.finish()
 
 
@@ -164,22 +200,31 @@ def _validate(student, loader, config, device, *, evaluate_scan_metrics=False):
     student.eval()
     summary = EpochMetrics()
     for raw in tqdm(loader, desc="Radar-only val", unit="batch"):
-        batch = _move(raw, device)
-        output = student(batch["radar"], batch["radar_valid"])
-        targets = student_targets(output, batch["clean_lidar"], batch["clean_lidar_valid"])
-        support = candidate_support(output.confidence_logits.coords, batch["radar"],
-                                    batch["radar_valid"], config.radius_m)
+        batch = _prepare_batch(raw, device)
+        output = _student_output(student, batch)
+        targets, support = _targets_and_support(output, batch, config)
         _, stats = occupancy_loss(output, targets, support, config.threshold)
-        clean_supported = supported_clean_points(
-            batch["clean_lidar"], batch["clean_lidar_valid"], batch["radar"],
-            batch["radar_valid"], config.radius_m)
-        scan = (scan_overlap_counts(
-            output, batch["clean_lidar"], batch["clean_lidar_valid"],
-            batch["radar"], batch["radar_valid"], support,
-            config.threshold, config.radius_m) if evaluate_scan_metrics else None)
-        clean_voxels = (scan["observed"] if scan is not None else supported_clean_voxels(
-            batch["clean_lidar"], batch["clean_lidar_valid"], batch["radar"],
-            batch["radar_valid"], config.radius_m))
+        if "radar_sites" in batch:
+            clean_supported = batch["clean_supported_points"]
+            clean_voxels = batch["clean_supported_voxels"]
+            if evaluate_scan_metrics:
+                predicted = output.confidence_logits.coords[
+                    support & (torch.sigmoid(output.confidence_logits.features[:, 0])
+                               >= config.threshold)]
+                scan = scan_overlap_counts_observed(predicted, batch["observed_coords"])
+            else:
+                scan = None
+        else:
+            clean_supported = supported_clean_points(
+                batch["clean_lidar"], batch["clean_lidar_valid"], batch["radar"],
+                batch["radar_valid"], config.radius_m)
+            scan = (scan_overlap_counts(
+                output, batch["clean_lidar"], batch["clean_lidar_valid"],
+                batch["radar"], batch["radar_valid"], support,
+                config.threshold, config.radius_m) if evaluate_scan_metrics else None)
+            clean_voxels = (scan["observed"] if scan is not None else supported_clean_voxels(
+                batch["clean_lidar"], batch["clean_lidar_valid"], batch["radar"],
+                batch["radar_valid"], config.radius_m))
         summary.add(stats, batch, clean_supported, clean_voxels)
         if scan is not None:
             summary.add_scan(scan)
@@ -245,6 +290,8 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--data-cache-root", type=Path)
+    parser.add_argument("--meta-cache-root", type=Path,
+                        help="Precomputed frozen features, target labels, and radar support")
     parser.add_argument("--online-augmentation-config", type=Path)
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=25)
@@ -256,11 +303,14 @@ def main():
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--scan-metrics-every", type=int, default=5)
+    parser.add_argument("--quick-val-frames", type=int, default=32)
+    parser.add_argument("--full-val-every", type=int, default=5)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available()
             or args.epochs < 1 or not 0 <= args.warmup_epochs < args.epochs
             or args.batch_size < 1 or args.scan_metrics_every < 1
+            or args.quick_val_frames < 1 or args.full_val_every < 1
             or min(args.student_lr, args.teacher_lr) <= 0):
         parser.error("Training needs CUDA, positive rates/batch size/metric period, and warmup < epochs")
     if args.resume and args.teacher_init:
@@ -270,18 +320,44 @@ def main():
     args.augmentation = GeometricAugmentationConfig.from_dict(
         json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
         if args.online_augmentation_config else None)
-    train = paired_dataset(args.vod_root, "train", args.radar_variant,
-                           augmentation=args.augmentation, seed=args.augmentation_seed,
-                           limit=args.train_limit, data_cache_root=args.data_cache_root)
-    val = paired_dataset(args.vod_root, "val", args.radar_variant,
-                         limit=args.val_limit, data_cache_root=args.data_cache_root)
+    if args.meta_cache_root:
+        if args.augmentation.enabled:
+            parser.error("Meta cache requires disabled geometric augmentation")
+
+        def open_split(split, limit):
+            ids = paired_dataset(args.vod_root, split, args.radar_variant, id_only=True)
+            expected = cache_manifest(
+                split=split, frame_ids=[frame.frame_id for frame in ids.frames],
+                vod_root=args.vod_root, radar_variant=args.radar_variant,
+                radar_encoder=args.radar_encoder, lidar_encoder=args.lidar_encoder,
+                radius_m=config.radius_m, max_candidates=config.max_candidates)
+            cache = MetaOccupancyCache(args.meta_cache_root / split, expected)
+            if limit is not None:
+                cache.frames = cache.frames[:limit]
+            cache.check_complete()
+            return cache
+
+        train = open_split("train", args.train_limit)
+        val = open_split("val", args.val_limit)
+        collate = collate_meta_cache
+    else:
+        train = paired_dataset(args.vod_root, "train", args.radar_variant,
+                               augmentation=args.augmentation, seed=args.augmentation_seed,
+                               limit=args.train_limit, data_cache_root=args.data_cache_root)
+        val = paired_dataset(args.vod_root, "val", args.radar_variant,
+                             limit=args.val_limit, data_cache_root=args.data_cache_root)
+        collate = collate_stage1
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
-                            num_workers=args.num_workers, collate_fn=collate_stage1,
+                            num_workers=args.num_workers, collate_fn=collate,
                             pin_memory=True),
         "val": DataLoader(val, batch_size=args.batch_size, shuffle=False,
-                          num_workers=args.num_workers, collate_fn=collate_stage1,
+                          num_workers=args.num_workers, collate_fn=collate,
                           pin_memory=True),
+        "quick": DataLoader(Subset(val, list(range(min(args.quick_val_frames, len(val))))),
+                            batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, collate_fn=collate,
+                            pin_memory=True),
     }
     if len(loaders["train"]) < 2 or len(loaders["val"]) < 1:
         parser.error("Meta training needs at least two train batches and one val batch")
@@ -334,7 +410,10 @@ def main():
     best = float("-inf")
     if history.exists():
         for line in history.read_text(encoding="utf-8").splitlines():
-            value = json.loads(line)["val"].get("iou_full_support")
+            previous = json.loads(line)
+            if previous.get("validation_scope", "full") != "full":
+                continue
+            value = previous["val"].get("iou_full_support")
             if value is not None:
                 best = max(best, value)
     for epoch in range(start, args.epochs + 1):
@@ -342,11 +421,15 @@ def main():
                                 student_optimizer, teacher_optimizer, config,
                                 epoch, args.warmup_epochs, args.device)
         evaluate_scan = epoch % args.scan_metrics_every == 0
-        validation = _validate(student, loaders["val"], config, args.device,
+        full = (epoch % args.full_val_every == 0 or evaluate_scan
+                or epoch == args.epochs)
+        validation = _validate(student, loaders["val" if full else "quick"],
+                               config, args.device,
                                evaluate_scan_metrics=evaluate_scan)
         _assert_frozen(teacher, frozen_teacher)
         _assert_frozen(student, frozen_student)
         record = {"epoch": epoch, "train": training, "val": validation,
+                  "validation_scope": "full" if full else "quick",
                   "radius_m": config.radius_m, "threshold": config.threshold,
                   "scan_metrics_every": args.scan_metrics_every}
         with history.open("a", encoding="utf-8") as stream:
@@ -356,7 +439,7 @@ def main():
         _save_student_only(args.output_root / "last_student.ckpt", student,
                            epoch, config, args)
         score = validation["iou_full_support"]
-        if score is not None and score > best:
+        if full and score is not None and score > best:
             best = score
             _save(args.output_root / "best_iou.ckpt", teacher, student,
                   teacher_optimizer, student_optimizer, epoch, config, args, record)
