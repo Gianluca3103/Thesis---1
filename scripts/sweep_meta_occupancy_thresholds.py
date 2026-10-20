@@ -1,7 +1,8 @@
-"""Evaluate radar-only occupancy IoU across thresholds on one VoD split.
+"""Evaluate either radar-only student across thresholds on one VoD split.
 
 Each frame is decoded once. The existing version-3 geometry cache supplies
 occupancy, known-free, radar support, and clean-scan voxel coordinates.
+Both students are scored with identical labels and the same support region.
 """
 
 from __future__ import annotations
@@ -18,13 +19,16 @@ from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.meta_cache import (
     VERSION as CACHE_VERSION, MetaOccupancyCache, MetaOccupancyDataset,
-    _source_hash, collate_meta_cache,
+    _sha256, _source_hash, collate_meta_cache,
 )
 from models.radar_lidar_crossmodal_v1.meta_occupancy import (
     scan_overlap_counts_observed, scan_overlap_rates,
 )
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
-from models.radar_lidar_crossmodal_v1.train_meta_occupancy import load_meta_student
+from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
+    VERSION as META_VERSION, load_meta_student,
+)
+from models.radar_lidar_crossmodal_v1.train_student import load_student
 
 
 DEFAULT_THRESHOLDS = tuple(round(index / 10, 2) for index in range(1, 10))
@@ -40,17 +44,43 @@ def _ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
 
+def _load_checkpoint(path: Path, device: str):
+    version = torch.load(path, map_location="cpu", weights_only=False).get("version")
+    if version in (META_VERSION, META_VERSION + "_student"):
+        model, saved = load_meta_student(path, device)
+        model_type = "meta_occupancy"
+    elif version == "crossmodal_student_v5_multiscale_refined_raw64":
+        model, saved = load_student(path, device)
+        model_type = "multiloss_student"
+    else:
+        raise ValueError(f"Unsupported student checkpoint version: {version!r}")
+    # Full training checkpoints contain optimizer states, which the sweep does
+    # not need to keep in memory once the model has been loaded.
+    fields = ("epoch", "radar_variant", "radar_checkpoint", "radar_sha256",
+              "lidar_sha256", "radius_m", "meta_config", "selected_threshold",
+              "threshold")
+    metadata = {field: saved[field] for field in fields if field in saved}
+    return model, metadata, model_type
+
+
 def _check_manifest(path: Path, saved: dict, dataset, split: str,
-                    vod_root: Path) -> dict:
+                    vod_root: Path, model_type: str) -> dict:
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    radius_m = saved.get("radius_m", saved.get("meta_config", {}).get("radius_m"))
+    if model_type == "meta_occupancy":
+        radius_m = saved.get("radius_m", saved.get("meta_config", {}).get("radius_m"))
+        radar_hash = saved["radar_sha256"]
+    else:
+        # The older checkpoint predates the geometry cache. Its radar encoder
+        # must still be the one from which cached candidate sites were built.
+        radius_m = manifest.get("radius_m")
+        radar_hash = _sha256(Path(saved["radar_checkpoint"]))
     expected = {
         "version": CACHE_VERSION,
         "split": split,
         "frame_ids": [frame.frame_id for frame in dataset.frames],
         "vod_root": str(vod_root.resolve()),
         "radar_variant": saved["radar_variant"],
-        "radar_initial_sha256": saved["radar_sha256"],
+        "radar_initial_sha256": radar_hash,
         "radius_m": radius_m,
         "source_hash": _source_hash(),
     }
@@ -131,12 +161,12 @@ def main() -> None:
             or len(set(args.thresholds)) != len(args.thresholds)):
         parser.error("Use positive limits/batch size, nonnegative workers, and unique thresholds in (0,1)")
     thresholds = tuple(sorted(args.thresholds))
-    model, saved = load_meta_student(args.checkpoint, args.device)
+    model, saved, model_type = _load_checkpoint(args.checkpoint, args.device)
     points = paired_dataset(args.vod_root, args.split, saved["radar_variant"],
                             data_cache_root=args.data_cache_root)
     cache_root = args.meta_cache_root / args.split
     manifest = _check_manifest(cache_root / "manifest.json", saved, points,
-                               args.split, args.vod_root)
+                               args.split, args.vod_root, model_type)
     cache = MetaOccupancyCache(cache_root, manifest)
     cache.check_complete()
     joined = MetaOccupancyDataset(points, cache)
@@ -151,6 +181,8 @@ def main() -> None:
                          "iou_at_0_2m")}
     result = {
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_epoch": saved["epoch"],
+        "model_type": model_type,
+        "training_selected_threshold": saved.get("selected_threshold", saved.get("threshold")),
         "split": args.split, "frames": len(selected),
         "radar_variant": saved["radar_variant"],
         "radius_m": manifest["radius_m"], "best_thresholds": best, "rows": rows,
