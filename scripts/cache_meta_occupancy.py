@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--reuse-v2-cache-root", type=Path,
+                        help="Convert existing version 2 frames without recomputing them")
     parser.add_argument("--radar-encoder", type=Path, required=True)
     parser.add_argument("--lidar-encoder", type=Path, required=True)
     parser.add_argument("--config", type=Path,
@@ -96,6 +98,28 @@ def main():
         max_candidates=config.max_candidates)
     cache = MetaOccupancyCache(args.cache_root / args.split, manifest, create=True)
     selected = frame_ids[:args.limit] if args.limit is not None else frame_ids
+    if args.reuse_v2_cache_root:
+        old_root = args.reuse_v2_cache_root / args.split
+        old_manifest = json.loads((old_root / "manifest.json").read_text(encoding="utf-8"))
+        stable = ("split", "frame_ids", "vod_root", "radar_variant",
+                  "radar_initial_sha256", "lidar_initial_sha256", "radius_m",
+                  "max_candidates", "grid_minimum_xyz", "grid_size_xyz",
+                  "grid_shape_zyx")
+        if old_manifest.get("version") != 2 or any(
+                old_manifest.get(key) != manifest[key] for key in stable):
+            raise ValueError("Version 2 cache does not match these data and encoder sources")
+        reusable = [frame_id for frame_id in selected
+                    if not cache.path(frame_id).is_file()
+                    and (old_root / f"{frame_id}.pt").is_file()]
+        for frame_id in tqdm(reusable, desc=f"Compress existing {args.split}", unit="frame"):
+            old = torch.load(old_root / f"{frame_id}.pt", map_location="cpu",
+                             weights_only=True)
+            if old.get("version") != 2 or old.get("frame_id") != frame_id:
+                raise ValueError(f"Invalid version 2 frame: {frame_id}")
+            cache.write(frame_id, {key: value for key, value in old.items()
+                                   if key not in ("version", "frame_id")})
+        if reusable:
+            print(f"{args.split}: reused {len(reusable)} version 2 frames", flush=True)
     missing_indices = [index for index, frame_id in enumerate(selected)
                        if not cache.path(frame_id).is_file()]
     if not missing_indices:

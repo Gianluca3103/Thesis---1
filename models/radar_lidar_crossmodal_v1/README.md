@@ -12,20 +12,25 @@ python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy `
   --lidar-encoder PATH_TO_LIDAR_ENCODER --output-root PATH_TO_NEW_RUN
 ```
 
-For fixed, unaugmented VoD frames, build the **version 2 geometry cache** once
+For fixed, unaugmented VoD frames, build the **version 3 compressed geometry cache** once
 per split and reuse it for every epoch. The builder reads the existing
 fixed-frame cache. It stores exact 3.2 m neighbor indices, radar-only candidate
 coordinates, clean occupancy and known-free labels, radar support, and
 supported clean voxel coordinates for scan metrics. It stores no encoder
 features, attention, distilled features, logits, or probabilities. The trainer
 reads raw point clouds from the fixed-frame cache each epoch and recomputes
-the trainable radar and LiDAR encoders. Use a new cache root for version 2.
+the trainable radar and LiDAR encoders. Coordinates are stored as voxel ID deltas,
+label masks as packed bits, and each entry is compressed losslessly with LZMA.
+Use a new cache root for version 3. Existing version 2 entries can be converted
+with `--reuse-v2-cache-root "$OUT/meta_geometry_v2"` without running either
+encoder again. Each compressed frame is decoded and compared with the original
+tensors before it is published.
 
 ```bash
 for split in train val; do
   python -m scripts.cache_meta_occupancy \
     --vod-root "$VOD" --data-cache-root "$PREV/fixed_frames" \
-    --cache-root "$OUT/meta_geometry_v2" \
+    --cache-root "$OUT/meta_geometry_v3" \
     --radar-encoder "$PREV/full/radar/best_encoder.pth" \
     --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
     --split "$split" --num-workers 2 --device cuda
@@ -33,7 +38,7 @@ done
 
 python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy \
   --vod-root "$VOD" --data-cache-root "$PREV/fixed_frames" \
-  --meta-cache-root "$OUT/meta_geometry_v2" \
+  --meta-cache-root "$OUT/meta_geometry_v3" \
   --radar-encoder "$PREV/full/radar/best_encoder.pth" \
   --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
   --output-root "$OUT/train" --epochs 25 --warmup-epochs 2 \

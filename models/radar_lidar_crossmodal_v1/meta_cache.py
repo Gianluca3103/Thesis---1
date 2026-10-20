@@ -4,19 +4,68 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from io import BytesIO
 import json
+import lzma
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from models.radar_lidar_stage1.correspondence import Neighborhood
+from models.radar_lidar_stage1.sparse import decode_keys, encode_keys
 
 from .encoder import GRID
 from .pipeline_data import collate_stage1
 
 
-VERSION = 2
+VERSION = 3
+LZMA_PRESET = 9
+COARSE_SHAPE = GRID.scale_shape(8)
+COORD_SHAPES = {
+    "radar": COARSE_SHAPE, "lidar": COARSE_SHAPE,
+    "candidate": GRID.shape_zyx, "observed": GRID.shape_zyx,
+}
+MASK_NAMES = ("occupied", "known_free", "support")
+
+
+def _pack(entry: dict) -> dict:
+    """Store delta-coded voxel IDs and bit-packed masks without changing values."""
+    packed = {key: value for key, value in entry.items()
+              if key not in {*(f"{name}_coords" for name in COORD_SHAPES), *MASK_NAMES}}
+    for name, shape in COORD_SHAPES.items():
+        keys = encode_keys(entry[f"{name}_coords"].long(), shape)
+        delta = keys.clone()
+        delta[1:] -= keys[:-1]
+        # One frame has batch ID zero. Coarse keys fit int16; fine keys fit int32.
+        packed[f"{name}_deltas"] = delta.to(torch.int16 if name in ("radar", "lidar")
+                                            else torch.int32)
+    count = len(entry["candidate_coords"])
+    packed["candidate_count"] = count
+    for name in MASK_NAMES:
+        packed[f"{name}_bits"] = torch.from_numpy(
+            np.packbits(entry[name].numpy(), bitorder="little").copy())
+    indices = entry["neighbor_indices"]
+    packed["neighbor_indices"] = indices.to(torch.int16 if len(entry["lidar_coords"]) <= 32767
+                                           else torch.int32)
+    return packed
+
+
+def _unpack(packed: dict) -> dict:
+    entry = {key: value for key, value in packed.items()
+             if key not in {*(f"{name}_deltas" for name in COORD_SHAPES),
+                            *(f"{name}_bits" for name in MASK_NAMES), "candidate_count"}}
+    for name, shape in COORD_SHAPES.items():
+        keys = torch.cumsum(packed[f"{name}_deltas"].long(), dim=0)
+        entry[f"{name}_coords"] = decode_keys(keys, shape).to(torch.int32)
+    count = packed["candidate_count"]
+    for name in MASK_NAMES:
+        bits = packed[f"{name}_bits"].numpy()
+        entry[name] = torch.from_numpy(np.unpackbits(bits, count=count,
+                                                    bitorder="little").astype(np.bool_))
+    entry["neighbor_indices"] = entry["neighbor_indices"].to(torch.int32)
+    return entry
 
 
 def _sha256(path: Path) -> str:
@@ -57,6 +106,7 @@ def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
         raise ValueError("Invalid geometry cache split or neighborhood")
     return {
         "version": VERSION, "split": split, "frame_ids": frame_ids,
+        "codec": "delta-voxel-ids+bitmask+lzma9",
         "vod_root": str(vod_root.resolve()), "radar_variant": radar_variant,
         "radar_initial_sha256": _sha256(radar_encoder),
         "lidar_initial_sha256": _sha256(lidar_encoder),
@@ -88,7 +138,7 @@ class MetaOccupancyCache:
     def path(self, frame_id: str) -> Path:
         if frame_id not in self.frames or not frame_id.isdigit():
             raise ValueError("Frame is not in this cache split")
-        return self.root / f"{frame_id}.pt"
+        return self.root / f"{frame_id}.pt.xz"
 
     def check_complete(self) -> None:
         missing = [frame_id for frame_id in self.frames if not self.path(frame_id).is_file()]
@@ -104,7 +154,21 @@ class MetaOccupancyCache:
         self._check(entry, frame_id)
         temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
         try:
-            torch.save(entry, temporary)
+            stream = BytesIO()
+            torch.save(_pack(entry), stream)
+            temporary.write_bytes(lzma.compress(stream.getvalue(), preset=LZMA_PRESET))
+            # Verify the compressed round trip before publishing the entry.
+            decoded = torch.load(BytesIO(lzma.decompress(temporary.read_bytes())),
+                                 map_location="cpu", weights_only=True)
+            restored = _unpack(decoded)
+            self._check(restored, frame_id)
+            for name, value in entry.items():
+                recovered = restored[name]
+                if isinstance(value, torch.Tensor):
+                    if not torch.equal(value, recovered):
+                        raise ValueError(f"Compression changed {name}: {frame_id}")
+                elif value != recovered:
+                    raise ValueError(f"Compression changed {name}: {frame_id}")
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -134,7 +198,10 @@ class MetaOccupancyCache:
             raise ValueError(f"Invalid geometry cache shapes: {frame_id}")
 
     def _read(self, frame_id: str) -> dict:
-        entry = torch.load(self.path(frame_id), map_location="cpu", weights_only=True)
+        compressed = self.path(frame_id).read_bytes()
+        packed = torch.load(BytesIO(lzma.decompress(compressed)),
+                            map_location="cpu", weights_only=True)
+        entry = _unpack(packed)
         self._check(entry, frame_id)
         return entry
 

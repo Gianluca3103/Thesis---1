@@ -253,6 +253,36 @@ def test_meta_cache_batch_offsets_and_cached_targets(tmp_path):
     assert "radar_features" not in batch and "lidar_features" not in batch
 
 
+def test_geometry_cache_compression_is_lossless_across_mask_byte_boundary(tmp_path):
+    candidate = torch.tensor([[0, 1, 2, index] for index in range(13)],
+                             dtype=torch.int32)
+    occupied = torch.tensor([index % 3 == 0 for index in range(13)])
+    known_free = torch.tensor([index % 3 == 1 for index in range(13)])
+    entry = {
+        "radar_coords": torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        "lidar_coords": torch.tensor([[0, 1, 2, 4]], dtype=torch.int32),
+        "neighbor_indices": torch.tensor([[0, -1]], dtype=torch.int32),
+        "neighbor_distances": torch.tensor([[0.2, float("inf")]]),
+        "candidate_coords": candidate,
+        "observed_coords": candidate[[0, 7, 12]],
+        "occupied": occupied,
+        "known_free": known_free,
+        "support": torch.tensor([index % 2 == 0 for index in range(13)]),
+        "clean_supported_points": 3,
+        "represented_clean_points_supported": 2,
+    }
+    cache = MetaOccupancyCache(tmp_path, {"frame_ids": ["1"], "max_candidates": 2},
+                               create=True)
+    cache.write("1", entry)
+    assert cache.path("1").name == "1.pt.xz"
+    restored = cache[0]
+    for name, original in entry.items():
+        if isinstance(original, torch.Tensor):
+            assert torch.equal(restored[name], original)
+        else:
+            assert restored[name] == original
+
+
 def test_cached_virtual_student_step_reaches_teacher_parameter():
     class Teacher(nn.Module):
         def __init__(self):

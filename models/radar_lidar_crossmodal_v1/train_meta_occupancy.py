@@ -294,7 +294,7 @@ def main():
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--meta-cache-root", type=Path,
-                        help="Version 2 fixed geometry and labels; raw points come from --data-cache-root")
+                        help="Version 3 losslessly compressed geometry and labels; raw points come from --data-cache-root")
     parser.add_argument("--online-augmentation-config", type=Path)
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=25)
