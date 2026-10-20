@@ -17,6 +17,10 @@ from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.radar_fov import (
     RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M,
 )
+from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probability_map
+from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
+    VERSION as META_VERSION, load_meta_student,
+)
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 
 
@@ -41,7 +45,8 @@ def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None
 
 def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
-                *, checkpoint_uses_fov: bool) -> None:
+                *, checkpoint_uses_fov: bool,
+                support_radius_m: float | None = None) -> None:
     clouds = [
         {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
         {"name": "Clean LiDAR in forward radar sector", "xyz": np.round(lidar, 3).tolist()},
@@ -55,6 +60,7 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                          "radar_half_fov_deg": RADAR_HALF_FOV_DEG,
                          "radar_max_range_m": RADAR_MAX_RANGE_M,
                          "checkpoint_uses_fov": checkpoint_uses_fov,
+                         "support_radius_m": support_radius_m,
                          "minimum": minimum, "maximum": maximum},
                         separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
@@ -72,7 +78,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 @media(max-width:900px){.panels{display:block}section{margin-bottom:8px}canvas{height:55vh;min-height:300px}}
 </style>
 <h1 id="title"></h1>
-<p>Raw radar-only confidence at fine voxel centers. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.</p>
+<p id="map-note"></p>
 <p id="range-note"></p>
 <div class="controls"><label>Minimum confidence <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="value">0.00</output></label>
 <button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
@@ -84,6 +90,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent), panes=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${data.frame} · student epoch ${data.epoch}`;
+document.getElementById('map-note').textContent=`Raw radar-only confidence at fine voxel centers${data.support_radius_m===null?'':` within ${data.support_radius_m.toFixed(1)} m of a radar point`}. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.`;
 document.getElementById('range-note').textContent=`Clean LiDAR reference: ${data.clouds[1].xyz.length.toLocaleString()} points in the calibrated forward sector (±${data.radar_half_fov_deg.toFixed(0)}° azimuth, up to ${data.radar_max_range_m.toFixed(0)} m). This is a fixed crop, not measured free space or per-frame radar visibility.${data.checkpoint_uses_fov?'':' This checkpoint predates the training crop; the green reference is cropped for display only.'}`;
 const canvases=[], headings=[];
 for(const cloud of data.clouds){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');
@@ -130,31 +137,48 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
-    parser.add_argument("--frame-id", nargs="+", required=True)
+    parser.add_argument("--frame-id", nargs="+")
+    parser.add_argument("--limit", type=int, default=5,
+                        help="Number of split frames to render when --frame-id is omitted")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    student, saved = load_student(args.checkpoint, args.device)
+    if args.limit < 1:
+        parser.error("--limit must be positive")
+    version = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("version")
+    meta = version in (META_VERSION, META_VERSION + "_student")
+    loader = load_meta_student if meta else load_student
+    student, saved = loader(args.checkpoint, args.device)
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
                                frame_ids=args.frame_id, include_clean=True,
                                lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
                                lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
+    if args.frame_id is None:
+        dataset.frames = dataset.frames[:args.limit]
     args.output_root.mkdir(parents=True, exist_ok=True)
     found = {frame.frame_id for frame in dataset.frames}
-    if missing := set(args.frame_id) - found:
+    if args.frame_id and (missing := set(args.frame_id) - found):
         raise ValueError(f"Frames absent from {args.split}: {sorted(missing)}")
     for row in dataset:
         batch = collate_stage1([row])
-        output = student(batch["radar"].to(args.device),
-                         batch["radar_valid"].to(args.device))
-        sites = output.confidence_logits
-        coords = sites.coords.detach().cpu().numpy()
-        grid = output.exported()["grid_metadata"]
+        radar_input = batch["radar"].to(args.device)
+        radar_valid = batch["radar_valid"].to(args.device)
+        if meta:
+            output = radar_only_probability_map(
+                student, radar_input, radar_valid, saved["radius_m"])
+            coords = output["confidence_coords"].detach().cpu().numpy()
+            confidence = output["confidence_probabilities"].detach().cpu().numpy().reshape(-1)
+            grid = output["grid_metadata"]
+        else:
+            output = student(radar_input, radar_valid)
+            sites = output.confidence_logits
+            coords = sites.coords.detach().cpu().numpy()
+            confidence = sites.features.sigmoid().detach().cpu().numpy().reshape(-1)
+            grid = output.exported()["grid_metadata"]
         origin = np.asarray(grid["origin_xyz_m"], dtype=np.float32)
         size = np.asarray(grid["voxel_xyz_m"], dtype=np.float32)
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
-        confidence = sites.features.sigmoid().detach().cpu().numpy().reshape(-1)
         radar = row["radar"][:, :3].numpy()
         lidar = row["clean_lidar"][:, :3].numpy()
         stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}"
@@ -164,10 +188,13 @@ def main() -> None:
         html = stem.with_suffix(".html")
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
                     centers, confidence,
-                    checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC)
+                    checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
+                    support_radius_m=saved["radius_m"] if meta else None)
+        support_note = f", radar support {saved['radius_m']:.1f} m" if meta else ""
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
               f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
-              f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m | {html}",
+              f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
+              f"{support_note} | {html}",
               flush=True)
 
 
