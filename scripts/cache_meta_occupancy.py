@@ -1,4 +1,4 @@
-"""Precompute fixed geometry and labels for bilevel meta-occupancy training."""
+"""Precompute fixed geometry and labels; training recomputes encoder features."""
 
 from __future__ import annotations
 
@@ -53,9 +53,7 @@ def build_entry(student, lidar_encoder, raw, config, device):
         batch["radar"], batch["radar_valid"], config.radius_m)
     return {
         "radar_coords": radar.coords.cpu().to(torch.int32),
-        "radar_features": radar.features.cpu(),
         "lidar_coords": lidar.coords.cpu().to(torch.int32),
-        "lidar_features": lidar.features.cpu(),
         "neighbor_indices": neighbors.indices.cpu().to(torch.int32),
         "neighbor_distances": neighbors.distances_m.cpu(),
         "candidate_coords": candidate.cpu().to(torch.int32),

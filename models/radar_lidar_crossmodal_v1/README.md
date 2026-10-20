@@ -12,26 +12,28 @@ python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy `
   --lidar-encoder PATH_TO_LIDAR_ENCODER --output-root PATH_TO_NEW_RUN
 ```
 
-For fixed, unaugmented VoD frames, build the meta cache once per split and
-reuse it for every epoch. The builder reads the existing fixed-frame cache.
-It stores frozen radar and LiDAR bottleneck features, exact 3.2 m neighbors,
-radar-only candidate coordinates, clean occupancy and known-free labels,
-radar support, and supported clean voxel coordinates for scan metrics. It
-never stores trainable teacher attention, distilled student features, decoder
-logits, or probabilities. An interrupted build resumes missing frames.
+For fixed, unaugmented VoD frames, build the **version 2 geometry cache** once
+per split and reuse it for every epoch. The builder reads the existing
+fixed-frame cache. It stores exact 3.2 m neighbor indices, radar-only candidate
+coordinates, clean occupancy and known-free labels, radar support, and
+supported clean voxel coordinates for scan metrics. It stores no encoder
+features, attention, distilled features, logits, or probabilities. The trainer
+reads raw point clouds from the fixed-frame cache each epoch and recomputes
+the trainable radar and LiDAR encoders. Use a new cache root for version 2.
 
 ```bash
 for split in train val; do
   python -m scripts.cache_meta_occupancy \
     --vod-root "$VOD" --data-cache-root "$PREV/fixed_frames" \
-    --cache-root "$OUT/meta_cache" \
+    --cache-root "$OUT/meta_geometry_v2" \
     --radar-encoder "$PREV/full/radar/best_encoder.pth" \
     --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
     --split "$split" --num-workers 2 --device cuda
 done
 
 python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy \
-  --vod-root "$VOD" --meta-cache-root "$OUT/meta_cache" \
+  --vod-root "$VOD" --data-cache-root "$PREV/fixed_frames" \
+  --meta-cache-root "$OUT/meta_geometry_v2" \
   --radar-encoder "$PREV/full/radar/best_encoder.pth" \
   --lidar-encoder "$PREV/full/lidar/best_encoder.pth" \
   --output-root "$OUT/train" --epochs 25 --warmup-epochs 2 \
@@ -39,17 +41,19 @@ python -m models.radar_lidar_crossmodal_v1.train_meta_occupancy \
   --quick-val-frames 32 --full-val-every 5 --device cuda
 ```
 
-The manifest binds this cache to the VoD frame IDs, encoder hashes, grid,
+The manifest binds this cache to the VoD frame IDs, initial encoder hashes, grid,
 radius, and geometry/label source code. Every cached candidate-coordinate
 tensor is checked against the live decoder output. Validation uses 32 frames
 on ordinary epochs and the full split every five epochs (and at the final
 epoch); checkpoint selection uses full validation only. The four scan metrics
 remain full-split measurements every five epochs. The old student supervision
-cache has a different source fingerprint and is not silently accepted.
+cache has a different version and is not accepted.
 Before the full build, create two training entries with `--split train --limit 2`
 and compare them to the uncached path with `python -m scripts.smoke_meta_cache`
-using the same root and encoder arguments. The smoke checks student features,
-decoder logits, occupancy masks, support, and teacher features.
+using the same root and encoder arguments. The smoke checks live student and
+teacher features, decoder logits, occupancy masks, and support.
+Pass `--check-gradients` to run one paired teacher quiz and one real student
+step, verifying finite, nonzero gradients in all three trainable encoders.
 
 The default config is `configs/crossmodal_meta_occupancy.json`. Teacher
 attention takes radar queries and up to 24 clean-LiDAR bottleneck candidates
@@ -62,7 +66,11 @@ simulates one differentiable student feature-distillation step, and scores the
 back through that simulated step to the teacher attention and gate. Small
 geometric-attention and LiDAR-feature anchors keep the relationship branch
 grounded; their weights are configurable. A real student step on A then uses
-known-voxel map BCE plus Smooth L1 distillation from the updated teacher.
+known-voxel map BCE plus Smooth L1 distillation from the updated teacher. Its
+radar encoder is trainable. The teacher radar and LiDAR encoders are trainable
+through the quiz map BCE and relationship terms. The virtual student step moves
+only its feature head as a proxy; the real student step updates its encoder.
+The original masked reconstruction pretraining loss is not added.
 The decoder consumes the student's distilled feature without direct pyramid
 skip connections, and no teacher or LiDAR tensor enters its forward path.
 `--teacher-init` optionally initializes the
@@ -111,7 +119,7 @@ output = radar_only_probability_map(
 
 The virtual update uses a one-step SGD proxy for the student's feature-path
 update; the real student optimizer remains AdamW. It needs PyTorch 2.3+ and
-appreciably more GPU memory than ordinary student training. The full run also
+more GPU memory and encoder computation than the frozen-feature run. The full run also
 requires the existing native sparse encoder and MinkowskiEngine installation.
 
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and

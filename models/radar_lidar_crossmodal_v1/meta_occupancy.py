@@ -270,7 +270,7 @@ def relationship_loss(teacher_output, config: MetaOccupancyConfig):
 
 
 class _EncodedStudent(nn.Module):
-    """Expose the cached-input forward path to torch.func.functional_call."""
+    """Decode radar sites for the virtual step without re-encoding the quiz."""
 
     def __init__(self, student: nn.Module):
         super().__init__()
@@ -286,25 +286,28 @@ def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict
     """Update teacher from the radar-only map after one virtual distillation step.
 
     The quiz batch is a different *training* batch. Validation never updates
-    weights. Only student feature-path parameters move in the virtual step;
-    decoder parameters and all frozen encoders retain their real values.
+    weights. The virtual step moves student feature-head parameters. The real
+    student step updates its encoder, and this outer step updates both teacher
+    encoders through the quiz loss and relationship anchor.
     """
     if not student.config.decoder_from_conditioned:
         raise ValueError("Meta training requires the decoder to consume distilled features")
-    cached = "radar_sites" in paired_batch
-    teacher_output = (teacher.core(paired_batch["radar_sites"],
-                                   paired_batch["lidar_sites"], paired_batch["neighbors"])
-                      if cached else teacher(paired_batch["radar"], paired_batch["radar_valid"],
-                                             paired_batch["clean_lidar"],
-                                             paired_batch["clean_lidar_valid"]))
+    teacher_output = teacher(paired_batch["radar"], paired_batch["radar_valid"],
+                             paired_batch["clean_lidar"],
+                             paired_batch["clean_lidar_valid"],
+                             neighbors=paired_batch.get("neighbors"))
+    if "radar_coords" in paired_batch:
+        if (not torch.equal(teacher_output.radar_frozen.coords, paired_batch["radar_coords"])
+                or not torch.equal(teacher_output.lidar_frozen.coords,
+                                   paired_batch["lidar_coords"])):
+            raise ValueError("Cached neighbor coordinates differ from live encoders")
     eligible = teacher_output.neighbors.valid.any(-1)
     if not bool(eligible.any()):
         return {"skipped": True, "reason": "no LiDAR neighbors"}
-    if cached:
-        student_feature, _ = student.encode_conditioning_sites(paired_batch["radar_sites"])
-    else:
-        student_feature, _, _ = student.encode_conditioning(
-            paired_batch["radar"], paired_batch["radar_valid"])
+    with torch.no_grad():
+        paired_radar = student.radar_encoder(paired_batch["radar"],
+                                             paired_batch["radar_valid"])
+    student_feature, _ = student.encode_conditioning_sites(paired_radar)
     distill = feature_distillation(student_feature, teacher_output.fused,
                                    beta=config.smooth_l1_beta, detach_teacher=False,
                                    eligible=eligible)
@@ -318,20 +321,20 @@ def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict
     virtual = {name: parameter - config.inner_lr * config.distillation_weight * gradient
                for (name, parameter), gradient in zip(selected, inner_grads)
                if gradient is not None}
-    if cached:
-        # functional_call needs a module entry point that consumes frozen sites.
-        quiz_output = functional_call(_EncodedStudent(student),
-                                      {f"student.{name}": value
-                                       for name, value in virtual.items()},
-                                      (quiz_batch["radar_sites"],))
-        quiz_targets = quiz_batch["targets"]
-        support = quiz_batch["support"]
+    with torch.no_grad():
+        quiz_radar = student.radar_encoder(quiz_batch["radar"],
+                                           quiz_batch["radar_valid"])
+    quiz_output = functional_call(_EncodedStudent(student),
+                                  {f"student.{name}": value
+                                   for name, value in virtual.items()},
+                                  (quiz_radar,))
+    if "candidate_coords" in quiz_batch:
         if not torch.equal(quiz_output.confidence_logits.coords,
                            quiz_batch["candidate_coords"]):
             raise ValueError("Cached quiz candidate coordinates differ")
+        quiz_targets = quiz_batch["targets"]
+        support = quiz_batch["support"]
     else:
-        quiz_output = functional_call(student, virtual,
-                                      (quiz_batch["radar"], quiz_batch["radar_valid"]))
         quiz_targets = student_targets(quiz_output, quiz_batch["clean_lidar"],
                                        quiz_batch["clean_lidar_valid"])
         support = candidate_support(quiz_output.confidence_logits.coords,
@@ -344,7 +347,7 @@ def meta_teacher_step(teacher: nn.Module, student: nn.Module, paired_batch: dict
     relation, relation_stats = relationship_loss(teacher_output, config)
     outer_loss = quiz_loss + relation
     teacher_optimizer.zero_grad(set_to_none=True)
-    teacher_params = [parameter for parameter in teacher.core.parameters()
+    teacher_params = [parameter for parameter in teacher.parameters()
                       if parameter.requires_grad]
     gradients = torch.autograd.grad(outer_loss, teacher_params, allow_unused=True)
     for parameter, gradient in zip(teacher_params, gradients):

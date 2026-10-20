@@ -79,12 +79,12 @@ class PreviousStage1Sparse(nn.Module):
                         ) -> tuple[SparseSites, tuple[SparseSites, ...]]:
         """Expose the existing fine levels for radar-only learned decoding.
 
-        The encoder weights and its ordinary bottleneck forward stay unchanged.
+        Trainable encoders retain the graph; frozen encoders avoid building one.
         """
-        if not self.frozen:
-            raise ValueError("The decoder pyramid requires a frozen encoder")
-        with torch.no_grad():
-            return self._encode_and_levels(points, valid, 0.0, 0)
+        if self.frozen:
+            with torch.no_grad():
+                return self._encode_and_levels(points, valid, 0.0, 0)
+        return self._encode_and_levels(points, valid, 0.0, 0)
 
     def _encode(self, points: torch.Tensor, valid: torch.Tensor,
                 input_mask_rate: float, mask_salt: int) -> SparseSites:

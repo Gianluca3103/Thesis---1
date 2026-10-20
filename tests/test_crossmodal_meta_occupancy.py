@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -217,9 +218,7 @@ def test_meta_cache_batch_offsets_and_cached_targets(tmp_path):
     def row(frame):
         return {
             "frame_id": frame, "radar_coords": torch.tensor([[0, 1, 2, 3]]),
-            "radar_features": torch.ones(1, 64),
             "lidar_coords": torch.tensor([[0, 1, 2, 3]]),
-            "lidar_features": torch.ones(1, 64),
             "neighbor_indices": torch.tensor([[0, -1]]),
             "neighbor_distances": torch.tensor([[0.2, float("inf")]]),
             "candidate_coords": torch.tensor([[0, 8, 16, 24]]),
@@ -236,30 +235,40 @@ def test_meta_cache_batch_offsets_and_cached_targets(tmp_path):
         cache.write(frame, {key: value for key, value in row(frame).items()
                             if key != "frame_id"})
     cache.check_complete()
-    batch = prepare_meta_batch(collate_meta_cache([cache[0], cache[1]]), "cpu")
+    with pytest.raises(ValueError, match="features cannot be cached"):
+        cache._check({**row("1"), "version": 2,
+                      "radar_features": torch.ones(1, 64)}, "1")
+    points = [
+        {"frame_id": frame, "split": "train", "radar": torch.zeros(1, 7),
+         "clean_lidar": torch.zeros(1, 4), "geometry": cache[index]}
+        for index, frame in enumerate(("1", "2"))
+    ]
+    batch = prepare_meta_batch(collate_meta_cache(points), "cpu")
     assert batch["neighbors"].indices.tolist() == [[0, -1], [1, -1]]
     assert batch["candidate_coords"][:, 0].tolist() == [0, 1]
     assert batch["observed_coords"][:, 0].tolist() == [0, 1]
     assert batch["clean_supported_points"] == 4
     assert batch["targets"].represented_clean_points_supported == 4
+    assert "radar" in batch and "clean_lidar" in batch
+    assert "radar_features" not in batch and "lidar_features" not in batch
 
 
 def test_cached_virtual_student_step_reaches_teacher_parameter():
-    class Core(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.tensor(0.8))
-
-        def forward(self, radar, lidar, neighbors):
-            fused = radar.replace_features(lidar.features * self.weight)
-            return SimpleNamespace(
-                fused=fused, lidar_frozen=lidar, neighbors=neighbors,
-                attention=torch.ones(1, 1, 1))
-
     class Teacher(nn.Module):
         def __init__(self):
             super().__init__()
-            self.core = Core()
+            self.encoder_weight = nn.Parameter(torch.tensor(0.8))
+
+        def forward(self, radar, radar_valid, lidar, lidar_valid, *, neighbors=None):
+            coords = torch.tensor([[0, 1, 32, 32]])
+            radar_sites = SparseSites(coords, radar[:, :1, :1].reshape(1, 1),
+                                      GRID.scale_shape(8), 8)
+            lidar_sites = SparseSites(coords, lidar[:, :1, :1].reshape(1, 1),
+                                      GRID.scale_shape(8), 8)
+            fused = radar_sites.replace_features(lidar_sites.features * self.encoder_weight)
+            return SimpleNamespace(
+                fused=fused, radar_frozen=radar_sites, lidar_frozen=lidar_sites,
+                neighbors=neighbors, attention=torch.ones(1, 1, 1))
 
     class Student(nn.Module):
         def __init__(self):
@@ -267,6 +276,12 @@ def test_cached_virtual_student_step_reaches_teacher_parameter():
             self.config = SimpleNamespace(decoder_from_conditioned=True)
             self.shared = nn.Linear(1, 1, bias=False)
             self.shared.weight.data.fill_(0.2)
+            self.radar_encoder = self._radar_encoder
+
+        def _radar_encoder(self, radar, radar_valid):
+            return SparseSites(torch.tensor([[0, 1, 32, 32]]),
+                               radar[:, :1, :1].reshape(1, 1),
+                               GRID.scale_shape(8), 8)
 
         def encode_conditioning_sites(self, radar):
             feature = radar.replace_features(self.shared(radar.features))
@@ -280,11 +295,13 @@ def test_cached_virtual_student_step_reaches_teacher_parameter():
             return StudentOutput(feature, confidence)
 
     def batch(frame, strength):
-        coarse = torch.tensor([[0, 1, 32, 32]])
-        radar = SparseSites(coarse, torch.tensor([[strength]]), GRID.scale_shape(8), 8)
-        lidar = SparseSites(coarse, torch.tensor([[1.0]]), GRID.scale_shape(8), 8)
         return {
-            "frame_id": [frame], "radar_sites": radar, "lidar_sites": lidar,
+            "frame_id": [frame], "radar": torch.tensor([[[strength]]]),
+            "radar_valid": torch.tensor([[True]]),
+            "clean_lidar": torch.tensor([[[1.0]]]),
+            "clean_lidar_valid": torch.tensor([[True]]),
+            "radar_coords": torch.tensor([[0, 1, 32, 32]]),
+            "lidar_coords": torch.tensor([[0, 1, 32, 32]]),
             "neighbors": Neighborhood(torch.tensor([[0]]), torch.tensor([[0.1]])),
             "candidate_coords": torch.tensor([[0, 8, 256, 256]]),
             "targets": CachedOccupancyTargets(torch.tensor([True]),
@@ -293,11 +310,11 @@ def test_cached_virtual_student_step_reaches_teacher_parameter():
         }
 
     teacher, student = Teacher(), Student()
-    optimizer = torch.optim.SGD(teacher.core.parameters(), lr=0.2)
-    before = teacher.core.weight.detach().clone()
+    optimizer = torch.optim.SGD(teacher.parameters(), lr=0.2)
+    before = teacher.encoder_weight.detach().clone()
     result = meta_teacher_step(
         teacher, student, batch("A", 1.0), batch("B", 1.5), optimizer,
         MetaOccupancyConfig(inner_lr=0.5, teacher_geometry_weight=0,
                             teacher_fusion_weight=0))
     assert not result.get("skipped", False)
-    assert not torch.equal(teacher.core.weight, before)
+    assert not torch.equal(teacher.encoder_weight, before)

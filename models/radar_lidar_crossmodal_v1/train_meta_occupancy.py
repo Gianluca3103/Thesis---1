@@ -24,17 +24,18 @@ from .meta_occupancy import (MetaOccupancyConfig, candidate_support,
                              scan_overlap_counts_observed, scan_overlap_rates,
                              supported_clean_points,
                              supported_clean_voxels)
-from .meta_cache import (MetaOccupancyCache, cache_manifest, collate_meta_cache,
+from .meta_cache import (MetaOccupancyCache, MetaOccupancyDataset,
+                         cache_manifest, collate_meta_cache,
                          prepare_meta_batch)
 from .pipeline_data import collate_stage1, paired_dataset
 from .student import RadarOnlyStudent, StudentConfig
 from .student_loss import student_targets
 from .teacher import CrossModalTeacher, TeacherConfig
-from .train_teacher import (_assert_frozen, _encoder_snapshot, _hash, _move,
+from .train_teacher import (_hash, _move,
                             load_teacher, validate_lidar_pretraining_fov)
 
 
-VERSION = "crossmodal_meta_occupancy_v1"
+VERSION = "crossmodal_meta_occupancy_trainable_encoders_v2"
 
 
 def _prepare_batch(raw, device):
@@ -43,9 +44,7 @@ def _prepare_batch(raw, device):
 
 
 def _student_output(student, batch):
-    output = (student.forward_encoded(batch["radar_sites"])
-              if "radar_sites" in batch
-              else student(batch["radar"], batch["radar_valid"]))
+    output = student(batch["radar"], batch["radar_valid"])
     if "candidate_coords" in batch and not torch.equal(
             output.confidence_logits.coords, batch["candidate_coords"]):
         raise ValueError("Meta cache candidate coordinates differ from decoder output")
@@ -53,10 +52,14 @@ def _student_output(student, batch):
 
 
 def _teacher_output(teacher, batch):
-    return (teacher.core(batch["radar_sites"], batch["lidar_sites"], batch["neighbors"])
-            if "radar_sites" in batch else
-            teacher(batch["radar"], batch["radar_valid"],
-                    batch["clean_lidar"], batch["clean_lidar_valid"]))
+    output = teacher(batch["radar"], batch["radar_valid"],
+                     batch["clean_lidar"], batch["clean_lidar_valid"],
+                     neighbors=batch.get("neighbors"))
+    if "radar_coords" in batch and (
+            not torch.equal(output.radar_frozen.coords, batch["radar_coords"])
+            or not torch.equal(output.lidar_frozen.coords, batch["lidar_coords"])):
+        raise ValueError("Cached teacher geometry differs from live encoder coordinates")
+    return output
 
 
 def _targets_and_support(output, batch, config):
@@ -178,7 +181,7 @@ def _train_epoch(student, teacher, dataset, loader, student_optimizer,
         stats, distill, feature_elements = _student_step(
             student, teacher, previous, student_optimizer, config,
             use_teacher=epoch > warmup_epochs)
-        if "radar_sites" in previous:
+        if "targets" in previous:
             clean_supported = previous["clean_supported_points"]
             clean_voxels = previous["clean_supported_voxels"]
         else:
@@ -204,7 +207,7 @@ def _validate(student, loader, config, device, *, evaluate_scan_metrics=False):
         output = _student_output(student, batch)
         targets, support = _targets_and_support(output, batch, config)
         _, stats = occupancy_loss(output, targets, support, config.threshold)
-        if "radar_sites" in batch:
+        if "targets" in batch:
             clean_supported = batch["clean_supported_points"]
             clean_voxels = batch["clean_supported_voxels"]
             if evaluate_scan_metrics:
@@ -269,11 +272,11 @@ def load_meta_student(path, device="cuda"):
         raise ValueError("Expected a meta-occupancy student checkpoint")
     radar_path = Path(saved["radar_checkpoint"])
     if not radar_path.is_file() or _hash(radar_path) != saved["radar_sha256"]:
-        raise FileNotFoundError("Frozen radar encoder checkpoint missing or changed")
+        raise FileNotFoundError("Initial radar encoder checkpoint missing or changed")
     config = StudentConfig(**saved["student_config"])
     if not config.decoder_from_conditioned:
         raise ValueError("Meta student must decode its distilled feature")
-    model = RadarOnlyStudent(str(radar_path), config)
+    model = RadarOnlyStudent(str(radar_path), config, trainable_encoder=True)
     model.load_state_dict(saved["student"], strict=True)
     return model.to(device).eval(), saved
 
@@ -291,7 +294,7 @@ def main():
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--meta-cache-root", type=Path,
-                        help="Precomputed frozen features, target labels, and radar support")
+                        help="Version 2 fixed geometry and labels; raw points come from --data-cache-root")
     parser.add_argument("--online-augmentation-config", type=Path)
     parser.add_argument("--augmentation-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=25)
@@ -323,19 +326,23 @@ def main():
     if args.meta_cache_root:
         if args.augmentation.enabled:
             parser.error("Meta cache requires disabled geometric augmentation")
+        if args.data_cache_root is None:
+            parser.error("Trainable encoders require --data-cache-root with --meta-cache-root")
 
         def open_split(split, limit):
-            ids = paired_dataset(args.vod_root, split, args.radar_variant, id_only=True)
+            points = paired_dataset(args.vod_root, split, args.radar_variant,
+                                    data_cache_root=args.data_cache_root)
             expected = cache_manifest(
-                split=split, frame_ids=[frame.frame_id for frame in ids.frames],
+                split=split, frame_ids=[frame.frame_id for frame in points.frames],
                 vod_root=args.vod_root, radar_variant=args.radar_variant,
                 radar_encoder=args.radar_encoder, lidar_encoder=args.lidar_encoder,
                 radius_m=config.radius_m, max_candidates=config.max_candidates)
             cache = MetaOccupancyCache(args.meta_cache_root / split, expected)
-            if limit is not None:
-                cache.frames = cache.frames[:limit]
             cache.check_complete()
-            return cache
+            joined = MetaOccupancyDataset(points, cache)
+            if limit is not None:
+                joined.frames = joined.frames[:limit]
+            return joined
 
         train = open_split("train", args.train_limit)
         val = open_split("val", args.val_limit)
@@ -370,8 +377,9 @@ def main():
                                    lambda_teacher_evidence=0,
                                    decoder_from_conditioned=True)
     teacher = CrossModalTeacher(str(args.radar_encoder), str(args.lidar_encoder),
-                                teacher_config).to(args.device)
-    student = RadarOnlyStudent(str(args.radar_encoder), student_config).to(args.device)
+                                teacher_config, trainable_encoders=True).to(args.device)
+    student = RadarOnlyStudent(str(args.radar_encoder), student_config,
+                               trainable_encoder=True).to(args.device)
     if args.teacher_init:
         pretrained, source = load_teacher(args.teacher_init, args.device)
         if (source["radar_sha256"] != _hash(args.radar_encoder)
@@ -381,7 +389,7 @@ def main():
             raise ValueError("Teacher initialization uses different encoder or radar data")
         teacher.load_state_dict(pretrained.state_dict(), strict=True)
         del pretrained
-    teacher_optimizer = torch.optim.AdamW(teacher.core.parameters(), lr=args.teacher_lr)
+    teacher_optimizer = torch.optim.AdamW(teacher.parameters(), lr=args.teacher_lr)
     student_optimizer = torch.optim.AdamW(
         (parameter for parameter in student.parameters() if parameter.requires_grad),
         lr=args.student_lr)
@@ -405,8 +413,6 @@ def main():
         teacher_optimizer.load_state_dict(saved["teacher_optimizer"])
         student_optimizer.load_state_dict(saved["student_optimizer"])
         start = saved["epoch"] + 1
-    frozen_teacher = _encoder_snapshot(teacher)
-    frozen_student = _encoder_snapshot(student)
     best = float("-inf")
     if history.exists():
         for line in history.read_text(encoding="utf-8").splitlines():
@@ -426,8 +432,6 @@ def main():
         validation = _validate(student, loaders["val" if full else "quick"],
                                config, args.device,
                                evaluate_scan_metrics=evaluate_scan)
-        _assert_frozen(teacher, frozen_teacher)
-        _assert_frozen(student, frozen_student)
         record = {"epoch": epoch, "train": training, "val": validation,
                   "validation_scope": "full" if full else "quick",
                   "radius_m": config.radius_m, "threshold": config.threshold,

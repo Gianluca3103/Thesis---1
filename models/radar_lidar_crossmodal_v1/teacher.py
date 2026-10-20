@@ -14,7 +14,7 @@ from models.radar_lidar_stage1.correspondence import Neighborhood, local_neighbo
 from models.radar_lidar_stage1.sparse import SparseSites
 
 from .encoder import BOTTLENECK_CHANNELS, GRID
-from .previous_encoder import FrozenPreviousStage1Sparse
+from .previous_encoder import FrozenPreviousStage1Sparse, PreviousStage1Sparse
 
 
 @dataclass(frozen=True)
@@ -124,29 +124,31 @@ class BottleneckTeacherCore(nn.Module):
 
 class CrossModalTeacher(nn.Module):
     def __init__(self, radar_checkpoint: str, lidar_checkpoint: str,
-                 config: TeacherConfig | None = None):
+                 config: TeacherConfig | None = None, *,
+                 trainable_encoders: bool = False):
         super().__init__()
         self.config = config or TeacherConfig()
-        self.radar_encoder = FrozenPreviousStage1Sparse(radar_checkpoint, modality="radar")
-        self.lidar_encoder = FrozenPreviousStage1Sparse(lidar_checkpoint, modality="lidar")
+        encoder = PreviousStage1Sparse if trainable_encoders else FrozenPreviousStage1Sparse
+        self.radar_encoder = encoder(radar_checkpoint, modality="radar")
+        self.lidar_encoder = encoder(lidar_checkpoint, modality="lidar")
         self.core = BottleneckTeacherCore(self.config)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.radar_encoder.eval()
-        self.lidar_encoder.eval()
         return self
 
-    def forward(self, radar_points, radar_valid, lidar_points, lidar_valid):
-        with torch.no_grad():
-            radar = self.radar_encoder(radar_points, radar_valid)
-            lidar = self.lidar_encoder(lidar_points, lidar_valid)
-            if radar.coords.is_cuda and os.environ.get("CROSSMODAL_GPU_NEIGHBORS") == "1":
-                neighbors = tiled_local_neighbors(radar, lidar, self.config.radius_m,
-                                                  self.config.max_candidates)
-            else:
-                neighbors = local_neighbors(radar, lidar, GRID, self.config.radius_m,
-                                            self.config.max_candidates)
+    def forward(self, radar_points, radar_valid, lidar_points, lidar_valid,
+                *, neighbors: Neighborhood | None = None):
+        radar = self.radar_encoder(radar_points, radar_valid)
+        lidar = self.lidar_encoder(lidar_points, lidar_valid)
+        if neighbors is None:
+            with torch.no_grad():
+                if radar.coords.is_cuda and os.environ.get("CROSSMODAL_GPU_NEIGHBORS") == "1":
+                    neighbors = tiled_local_neighbors(radar, lidar, self.config.radius_m,
+                                                      self.config.max_candidates)
+                else:
+                    neighbors = local_neighbors(radar, lidar, GRID, self.config.radius_m,
+                                                self.config.max_candidates)
         return self.core(radar, lidar, neighbors)
 
 

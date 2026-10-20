@@ -12,7 +12,7 @@ from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
 
 from . import INTERFACE_VERSION
 from .encoder import BOTTLENECK_CHANNELS, GRID
-from .previous_encoder import FrozenPreviousStage1Sparse
+from .previous_encoder import FrozenPreviousStage1Sparse, PreviousStage1Sparse
 from .teacher import ResidualAdapter
 
 try:
@@ -63,8 +63,8 @@ class GenerativeBlock(nn.Module):
             in_channels, out_channels, kernel_size=2, stride=2, dimension=3)
         self.norm = nn.LayerNorm(out_channels)
 
-        # These radar features were already computed by the frozen encoder at
-        # the matching resolution. Exact coordinate joins keep inference radar-only.
+        # Radar features at the matching resolution are joined by coordinate.
+        # The inference path still uses radar only.
         self.skip_projection = nn.Linear(skip_channels, out_channels, bias=False)
         self.spatial = ME.MinkowskiConvolution(
             out_channels, out_channels, kernel_size=3, stride=1, dimension=3)
@@ -170,10 +170,12 @@ class StudentOutput:
 
 
 class RadarOnlyStudent(nn.Module):
-    def __init__(self, radar_checkpoint: str, config: StudentConfig | None = None):
+    def __init__(self, radar_checkpoint: str, config: StudentConfig | None = None,
+                 *, trainable_encoder: bool = False):
         super().__init__()
         self.config = config or StudentConfig()
-        self.radar_encoder = FrozenPreviousStage1Sparse(radar_checkpoint, modality="radar")
+        encoder = PreviousStage1Sparse if trainable_encoder else FrozenPreviousStage1Sparse
+        self.radar_encoder = encoder(radar_checkpoint, modality="radar")
         d = self.config.feature_dim
         self.shared = ResidualAdapter(d)
         self.feature_head = ResidualAdapter(d)
@@ -182,28 +184,29 @@ class RadarOnlyStudent(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.radar_encoder.eval()
         return self
 
     def encode_conditioning(self, radar_points, radar_valid):
         # No LiDAR, teacher, LiDAR coordinates or target labels enter this path.
-        with torch.no_grad():
-            if hasattr(self.radar_encoder, "forward_pyramid"):
-                radar, pyramid = self.radar_encoder.forward_pyramid(radar_points, radar_valid)
-            else:
-                radar = self.radar_encoder(radar_points, radar_valid)
-                pyramid = None
+        if getattr(getattr(self, "config", None), "decoder_from_conditioned", False):
+            radar = self.radar_encoder(radar_points, radar_valid)
+            pyramid = None
+        elif hasattr(self.radar_encoder, "forward_pyramid"):
+            radar, pyramid = self.radar_encoder.forward_pyramid(radar_points, radar_valid)
+        else:
+            radar = self.radar_encoder(radar_points, radar_valid)
+            pyramid = None
         feature, shared = self.encode_conditioning_sites(radar)
         return feature, shared, pyramid
 
     def encode_conditioning_sites(self, radar):
-        """Trainable radar path after the frozen encoder (for static caches)."""
+        """Radar-only feature path from live or independently supplied sites."""
         shared = radar.replace_features(self.shared(radar.features))
         feature = shared.replace_features(self.feature_norm(self.feature_head(shared.features)))
         return feature, shared
 
     def forward_encoded(self, radar) -> StudentOutput:
-        """Decode cached frozen radar sites with the same radar-only path."""
+        """Decode independently supplied radar sites with the same radar-only path."""
         if not self.config.decoder_from_conditioned:
             raise ValueError("Cached radar sites require the conditioned decoder")
         feature, _ = self.encode_conditioning_sites(radar)
