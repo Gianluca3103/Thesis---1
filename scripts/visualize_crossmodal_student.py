@@ -1,7 +1,7 @@
-"""View raw radar-only confidence beside radar and forward-sector clean LiDAR.
+"""View radar-only voxel confidence beside radar and forward-sector clean LiDAR.
 
-Every radar point and confidence candidate is shown. Clean LiDAR uses the
-same fixed calibration-aware radar sector as cross-modal training.
+Meta checkpoints show candidates in radar support by default; --all-candidates
+shows the decoder's full candidate domain. Clean LiDAR is display-only.
 """
 
 from __future__ import annotations
@@ -140,6 +140,8 @@ def main() -> None:
     parser.add_argument("--frame-id", nargs="+")
     parser.add_argument("--limit", type=int, default=5,
                         help="Number of split frames to render when --frame-id is omitted")
+    parser.add_argument("--all-candidates", action="store_true",
+                        help="Show every decoder candidate before the radar-support filter")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -147,6 +149,8 @@ def main() -> None:
         parser.error("--limit must be positive")
     version = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("version")
     meta = version in (META_VERSION, META_VERSION + "_student")
+    if args.all_candidates and not meta:
+        parser.error("--all-candidates applies to meta-occupancy checkpoints only")
     loader = load_meta_student if meta else load_student
     student, saved = loader(args.checkpoint, args.device)
     dataset = VoDStage1Dataset(args.vod_root, args.split,
@@ -164,24 +168,22 @@ def main() -> None:
         batch = collate_stage1([row])
         radar_input = batch["radar"].to(args.device)
         radar_valid = batch["radar_valid"].to(args.device)
-        if meta:
+        supported_only = meta and not args.all_candidates
+        if supported_only:
             output = radar_only_probability_map(
                 student, radar_input, radar_valid, saved["radius_m"])
-            coords = output["confidence_coords"].detach().cpu().numpy()
-            confidence = output["confidence_probabilities"].detach().cpu().numpy().reshape(-1)
-            grid = output["grid_metadata"]
         else:
-            output = student(radar_input, radar_valid)
-            sites = output.confidence_logits
-            coords = sites.coords.detach().cpu().numpy()
-            confidence = sites.features.sigmoid().detach().cpu().numpy().reshape(-1)
-            grid = output.exported()["grid_metadata"]
+            output = student(radar_input, radar_valid).exported()
+        coords = output["confidence_coords"].detach().cpu().numpy()
+        confidence = output["confidence_probabilities"].detach().cpu().numpy().reshape(-1)
+        grid = output["grid_metadata"]
         origin = np.asarray(grid["origin_xyz_m"], dtype=np.float32)
         size = np.asarray(grid["voxel_xyz_m"], dtype=np.float32)
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
         radar = row["radar"][:, :3].numpy()
         lidar = row["clean_lidar"][:, :3].numpy()
-        stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}"
+        suffix = "_all_candidates" if args.all_candidates else ""
+        stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}{suffix}"
         _write_ply(stem.with_name(stem.name + "_radar.ply"), radar)
         _write_ply(stem.with_name(stem.name + "_clean_lidar.ply"), lidar)
         _write_ply(stem.with_name(stem.name + "_confidence.ply"), centers, confidence)
@@ -189,8 +191,9 @@ def main() -> None:
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
                     centers, confidence,
                     checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
-                    support_radius_m=saved["radius_m"] if meta else None)
-        support_note = f", radar support {saved['radius_m']:.1f} m" if meta else ""
+                    support_radius_m=saved["radius_m"] if supported_only else None)
+        support_note = (f", radar support {saved['radius_m']:.1f} m"
+                        if supported_only else ", all decoder candidates" if meta else "")
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
               f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
               f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
