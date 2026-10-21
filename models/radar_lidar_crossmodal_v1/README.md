@@ -33,6 +33,20 @@ The saved `best_student.ckpt` runs from radar alone. Both
 `scripts.visualize_crossmodal_student` accept it for threshold analysis and
 prediction-map inspection.
 
+For the official five-scan ablation, use its matching cache and radar encoder:
+
+```bash
+OUT5=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/meta_occupancy_official5_20261021
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_radar_autoencoder \
+  --vod-root "$VOD" --radar-variant radar_5frames \
+  --radar-encoder "$OUT5/radar_pretrain/best_encoder.pth" \
+  --data-cache-root "$OUT5/fixed_frames" \
+  --meta-cache-root "$OUT5/meta_geometry_v3" \
+  --output-root "$OUT5/radar_autoencoder" \
+  --epochs 25 --batch-size 8 --num-workers 8 \
+  --scan-metrics-every 5 --device cuda
+```
+
 ## Joint relationship and radar-only occupancy experiment
 
 ### Official five-scan radar ablation
