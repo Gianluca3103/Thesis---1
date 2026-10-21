@@ -33,6 +33,15 @@ LiDAR point cloud or a trained Stage II diffusion model.
 See [the pipeline guide](models/radar_lidar_crossmodal_v1/README.md) for
 losses, metrics, checkpoint formats, and individual training commands.
 
+## Independent R2LDM LiDAR reconstruction baseline
+
+`models/r2ldm_lidar_lpcr/` contains a separate implementation of the LiDAR
+encoder and LPCR point decoder from R2LDM's first stage. It uses R2LDM's
+`0.1 × 0.1 × 0.15 m` grid over `x=[0,32]`, `y=[-16,16]`, `z=[-2,4]`,
+and trains only on VoD LiDAR. It does not read the cross-modal caches or change
+the existing radar occupancy model. See its
+[README](models/r2ldm_lidar_lpcr/README.md) for training and reconstruction.
+
 For a full run, `scripts/prepare_and_train_crossmodal.sh` checks
 the complete train/val verified 20-scan Doppler radar cache, fills missing
 derived frames when possible, then trains the radar and LiDAR encoders in
