@@ -14,6 +14,7 @@ trees into this repository. Install spconv separately in the training environmen
 
 The R2LDM release does not include pretrained weights or its exact paper
 preprocessing. This implementation uses the official VoD train/validation
-splits and raw LiDAR XYZ inside the released LPCR grid. It supports R2LDM's
-corrected `centered_tanh` offset mode by default. The resulting checkpoints
-are new and cannot be loaded into R2LDM's original classes without conversion.
+splits and raw LiDAR XYZ inside the released LPCR grid. It defaults to the
+released `legacy_sigmoid` offset mode and offers `centered_tanh` as a separate
+experiment. The resulting checkpoints are new and cannot be loaded into
+R2LDM's original classes without conversion.

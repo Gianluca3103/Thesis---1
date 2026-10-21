@@ -183,7 +183,7 @@ class LPCROutput:
 
 class R2LDMLidarLPCR(nn.Module):
     def __init__(self, grid: R2LDMGrid = R2LDMGrid(), *,
-                 offset_activation: str = "centered_tanh"):
+                 offset_activation: str = "legacy_sigmoid"):
         super().__init__()
         if offset_activation not in ("legacy_sigmoid", "centered_tanh"):
             raise ValueError("Unknown LPCR offset activation")
@@ -194,7 +194,8 @@ class R2LDMLidarLPCR(nn.Module):
 
     def forward(self, means: torch.Tensor, coords: torch.Tensor,
                 batch_size: int) -> LPCROutput:
-        latent = self.encoder(means, coords, batch_size)
+        # Stage 0 bounds the sparse LiDAR embedding before S2D decoding.
+        latent = torch.tanh(self.encoder(means, coords, batch_size))
         logits, offsets = self.decoder(latent)
         return LPCROutput(latent, logits, offsets)
 
