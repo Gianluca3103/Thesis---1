@@ -27,8 +27,9 @@ screenshot also used a surface proposal head and interpolation; the backbone
 alone does not reproduce those five clouds. The student still outputs raw
 fine-voxel confidence.
 The student's fine-grid output is **raw confidence logits and probabilities**, with no
-interpolation or spherical influence expansion. It is not a reconstructed
-LiDAR point cloud or a trained Stage II diffusion model.
+interpolation or spherical influence expansion. A separate sparse Stage II
+implementation now consumes that map; see
+[Stage II](models/radar_lidar_stage2/README.md). Its weights require a new run.
 
 See [the pipeline guide](models/radar_lidar_crossmodal_v1/README.md) for
 losses, metrics, checkpoint formats, and individual training commands.
