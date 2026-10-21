@@ -4,12 +4,14 @@
 
 ### Official five-scan radar ablation
 
-Run `bash scripts/run_meta_occupancy_official5_ablation.sh` on the professor
-machine to repeat the joint occupancy experiment with VoD's supplied
-`radar_5frames` point clouds. The script builds a separate fixed-frame cache,
+On the professor machine, first run
+`bash scripts/run_meta_occupancy_official5_ablation.sh prepare`. This builds
+a separate fixed-frame cache for VoD's supplied `radar_5frames` point clouds,
 pretrains a new radar encoder for 30 epochs, checks and fills a separate
-lossless geometry cache, trains the joint teacher/student for 25 epochs, and
-sweeps the best radar-only student on the full validation split. It then runs a
+lossless geometry cache, and verifies that all training and validation entries
+are present. Then run `bash scripts/run_meta_occupancy_official5_ablation.sh train`
+to train the joint teacher/student for 25 epochs and sweep the best radar-only
+student on the full validation split. It then runs a
 paired five-versus-20-scan threshold sweep on the intersection of their 3.2 m
 radar support and the union of their decoder candidate voxels. Both models are
 scored against the same clean-LiDAR labels and observed voxels in that paired

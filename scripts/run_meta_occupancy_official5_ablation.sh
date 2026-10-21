@@ -3,6 +3,11 @@ set -Eeuo pipefail
 
 # Retrain the radar path on VoD's supplied five-scan point clouds. Keep the
 # existing LiDAR initialization, voxel grid, losses, splits, and schedules.
+MODE=${1:-all}
+if [[ $# -gt 1 || "$MODE" != all && "$MODE" != prepare && "$MODE" != train ]]; then
+  printf 'Usage: bash %s [prepare|train|all]\n' "$0" >&2
+  exit 2
+fi
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BASE=${BASE:-/mnt/3D10B36523559581/Gianluca}
 VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC}
@@ -58,6 +63,7 @@ export CROSSMODAL_GPU_NEIGHBORS=0
 export MPLCONFIGDIR="$OUT5/matplotlib" MPLBACKEND=Agg
 cd "$REPO"
 
+if [[ "$MODE" != train ]]; then
 printf '\n=== Cache official five-scan radar and the unchanged clean LiDAR ===\n'
 for split in train val; do
   "$PY" -u -m scripts.cache_crossmodal_fixed_frames \
@@ -106,6 +112,42 @@ for split in train val; do
     --config "$CONFIG" --split "$split" --verify-existing 2 \
     --num-workers "$WORKERS"
 done
+
+fi
+
+test -s "$RADAR_ENCODER"
+printf '\n=== Verify all five-scan fixed frames and geometry entries ===\n'
+"$PY" - "$VOD" "$RAW" "$GEOMETRY" "$RADAR_ENCODER" "$LIDAR_ENCODER" \
+  "$RADAR_VARIANT" "$CONFIG" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+from models.radar_lidar_crossmodal_v1.meta_cache import (
+    MetaOccupancyCache, cache_manifest,
+)
+from models.radar_lidar_crossmodal_v1.meta_occupancy import MetaOccupancyConfig
+from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+
+vod, raw, geometry, radar, lidar = map(Path, sys.argv[1:6])
+variant = sys.argv[6]
+config = MetaOccupancyConfig(**json.loads(Path(sys.argv[7]).read_text(encoding="utf-8")))
+for split in ("train", "val"):
+    points = paired_dataset(vod, split, variant, data_cache_root=raw)
+    expected = cache_manifest(
+        split=split, frame_ids=[frame.frame_id for frame in points.frames],
+        vod_root=vod, radar_variant=variant, radar_encoder=radar,
+        lidar_encoder=lidar, radius_m=config.radius_m,
+        max_candidates=config.max_candidates,
+    )
+    cache = MetaOccupancyCache(geometry / split, expected)
+    cache.check_complete()
+    print(f"{split}: {len(points)} fixed frames and geometry entries complete", flush=True)
+PY
+if [[ "$MODE" == prepare ]]; then
+  printf '\nCaches are ready. Start the joint model with: bash scripts/run_meta_occupancy_official5_ablation.sh train\n'
+  exit 0
+fi
 
 printf '\n=== Joint teacher/student training for 25 epochs ===\n'
 meta_resume=()
