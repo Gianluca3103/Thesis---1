@@ -43,6 +43,9 @@ dimensions cannot be substituted into the released decoder's fixed latent and
 output shapes. The paper reports batch size 1, AdamW, and initial LPCR learning
 rate `1e-3`; its epoch count and other optimizer settings come from the code.
 This run follows the executable source grid and schedule, not the paper grid.
+The source-aligned `v2` model requires a fresh training run; `v1` checkpoints
+cannot be resumed because the encoder-to-decoder path changed. Existing LPCR
+voxel caches remain valid because the voxelization code and grid are unchanged.
 
 The data input and exact loss are still an adaptation: this run uses the
 official raw VoD LiDAR train/val splits because R2LDM did not release its
