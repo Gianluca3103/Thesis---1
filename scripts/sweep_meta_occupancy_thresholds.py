@@ -1,4 +1,4 @@
-"""Evaluate either radar-only student across thresholds on one VoD split.
+"""Evaluate radar-only occupancy models across thresholds on one VoD split.
 
 Each frame is decoded once. The existing version-3 geometry cache supplies
 occupancy, known-free, radar support, and clean-scan voxel coordinates.
@@ -25,6 +25,9 @@ from models.radar_lidar_crossmodal_v1.meta_occupancy import (
     scan_overlap_counts_observed, scan_overlap_rates,
 )
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import (
+    VERSION as RADAR_AUTO_VERSION, load_radar_autoencoder,
+)
 from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
     VERSION as META_VERSION, load_meta_student,
 )
@@ -49,6 +52,9 @@ def _load_checkpoint(path: Path, device: str):
     if version in (META_VERSION, META_VERSION + "_student"):
         model, saved = load_meta_student(path, device)
         model_type = "meta_occupancy"
+    elif version in (RADAR_AUTO_VERSION, RADAR_AUTO_VERSION + "_student"):
+        model, saved = load_radar_autoencoder(path, device)
+        model_type = "radar_autoencoder"
     elif version == "crossmodal_student_v5_multiscale_refined_raw64":
         model, saved = load_student(path, device)
         model_type = "multiloss_student"
@@ -66,7 +72,7 @@ def _load_checkpoint(path: Path, device: str):
 def _check_manifest(path: Path, saved: dict, dataset, split: str,
                     vod_root: Path, model_type: str) -> dict:
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if model_type == "meta_occupancy":
+    if model_type in ("meta_occupancy", "radar_autoencoder"):
         radius_m = saved.get("radius_m", saved.get("meta_config", {}).get("radius_m"))
         radar_hash = saved["radar_sha256"]
     else:

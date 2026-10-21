@@ -21,6 +21,9 @@ from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probabili
 from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
     VERSION as META_VERSION, load_meta_student,
 )
+from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import (
+    VERSION as RADAR_AUTO_VERSION, load_radar_autoencoder,
+)
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 
 
@@ -149,9 +152,11 @@ def main() -> None:
         parser.error("--limit must be positive")
     version = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("version")
     meta = version in (META_VERSION, META_VERSION + "_student")
-    if args.all_candidates and not meta:
-        parser.error("--all-candidates applies to meta-occupancy checkpoints only")
-    loader = load_meta_student if meta else load_student
+    auto = version in (RADAR_AUTO_VERSION, RADAR_AUTO_VERSION + "_student")
+    if args.all_candidates and not (meta or auto):
+        parser.error("--all-candidates applies to meta or radar autoencoder checkpoints")
+    loader = (load_meta_student if meta else load_radar_autoencoder if auto
+              else load_student)
     student, saved = loader(args.checkpoint, args.device)
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
@@ -168,7 +173,7 @@ def main() -> None:
         batch = collate_stage1([row])
         radar_input = batch["radar"].to(args.device)
         radar_valid = batch["radar_valid"].to(args.device)
-        supported_only = meta and not args.all_candidates
+        supported_only = (meta or auto) and not args.all_candidates
         if supported_only:
             output = radar_only_probability_map(
                 student, radar_input, radar_valid, saved["radius_m"])
@@ -193,7 +198,7 @@ def main() -> None:
                     checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
                     support_radius_m=saved["radius_m"] if supported_only else None)
         support_note = (f", radar support {saved['radius_m']:.1f} m"
-                        if supported_only else ", all decoder candidates" if meta else "")
+                        if supported_only else ", all decoder candidates" if meta or auto else "")
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
               f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
               f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"

@@ -1,5 +1,38 @@
 # Native Stage-I sparse encoders, cross-modal teacher, radar-only student
 
+## Radar-only occupancy autoencoder ablation
+
+`train_radar_autoencoder.py` trains a radar encoder directly into the existing
+generative sparse occupancy decoder. It starts from the same pretrained radar
+encoder as the joint model and updates **both the radar encoder and decoder**
+using only the clean-LiDAR occupancy BCE. There is no LiDAR encoder, LPCR
+teacher, cross-attention, cross-modal feature adapter, or distillation loss in
+this run.
+Clean LiDAR supplies the cached occupied and verified-free voxel labels only.
+
+This ablation retains the current **0.2 × 0.2 × 0.25 m** grid, 3.2 m radar
+support, version-3 geometry cache, unweighted map BCE, Known/Full IoU, and
+exact/0.2 m scan IoU and F1. The checkpoint is selected by full-validation
+Full IoU, and scan metrics are calculated every five epochs. Existing complete
+version-3 and fixed-frame caches can be reused without rebuilding them.
+
+```bash
+export PYTHONPATH="$PWD"
+RAW="$(dirname "$ENCODERS")/fixed_frames"
+CACHE="$OUT/meta_geometry_v3"
+"$PY" -u -m models.radar_lidar_crossmodal_v1.train_radar_autoencoder \
+  --vod-root "$VOD" --radar-encoder "$ENCODERS/radar/best_encoder.pth" \
+  --data-cache-root "$RAW" --meta-cache-root "$CACHE" \
+  --output-root "$OUT/radar_autoencoder_20frame" \
+  --epochs 25 --batch-size 8 --num-workers 8 \
+  --scan-metrics-every 5 --device cuda
+```
+
+The saved `best_student.ckpt` runs from radar alone. Both
+`scripts.sweep_meta_occupancy_thresholds` and
+`scripts.visualize_crossmodal_student` accept it for threshold analysis and
+prediction-map inspection.
+
 ## Joint relationship and radar-only occupancy experiment
 
 ### Official five-scan radar ablation
