@@ -36,7 +36,7 @@ The common region is XYZ `[0,32] × [-16,16] × [-2,2]` m with voxels
 `1 × 40 × 40` encoder latent grid. The vertical extent is restricted to
 Stage I's `[-2,2]` m output. Each Stage-II latent cell interpolates up to four
 nearby Stage-I radar feature sites within 3.2 m. The gate threshold defaults
-to `0.3`; it determines a strict recall ceiling. Report `gate_coverage`
+to `0.25`; it determines a strict recall ceiling. Report `gate_coverage`
 alongside Known/Full IoU. Those IoUs are measured on the Stage-II gate and
 region, so they are not directly comparable with Stage-I full-grid IoU. The
 output `.ply` contains reconstructed allowed
@@ -70,14 +70,14 @@ DIFF="$OUT5/stage2_sparse_diffusion"
 "$PY" -u -m scripts.cache_stage2_sparse \
   --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
   --stage1-checkpoint "$S1" --cache-root "$CACHE" \
-  --radar-variant radar_5frames --gate-threshold 0.3 \
+  --radar-variant radar_5frames --gate-threshold 0.25 \
   --split both --num-workers 8 --device cuda
 
 "$PY" -u -m scripts.train_stage2_sparse \
   --phase lpcr --vod-root "$VOD" \
   --data-cache-root "$OUT5/fixed_frames" --stage2-cache-root "$CACHE" \
   --stage1-checkpoint "$S1" --output-root "$LPCR" \
-  --radar-variant radar_5frames --gate-threshold 0.3 \
+  --radar-variant radar_5frames --gate-threshold 0.25 \
   --epochs 30 --lr 0.001 --num-workers 8 --device cuda
 
 "$PY" -u -m scripts.train_stage2_sparse \
@@ -85,7 +85,7 @@ DIFF="$OUT5/stage2_sparse_diffusion"
   --data-cache-root "$OUT5/fixed_frames" --stage2-cache-root "$CACHE" \
   --stage1-checkpoint "$S1" --lpcr-checkpoint "$LPCR/best.ckpt" \
   --output-root "$DIFF" --radar-variant radar_5frames \
-  --gate-threshold 0.3 --epochs 50 --lr 0.0002 \
+  --gate-threshold 0.25 --epochs 50 --lr 0.0002 \
   --num-workers 8 --device cuda
 
 "$PY" -u -m scripts.predict_stage2_sparse \

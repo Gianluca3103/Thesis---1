@@ -128,7 +128,7 @@ def main() -> None:
                         help="Required for diffusion; best LPCR checkpoint")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_5frames")
-    parser.add_argument("--gate-threshold", type=float, default=0.3)
+    parser.add_argument("--gate-threshold", type=float, default=0.25)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float)

@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_5frames")
     parser.add_argument("--split", choices=("train", "val", "both"), default="both")
-    parser.add_argument("--gate-threshold", type=float, default=0.3)
+    parser.add_argument("--gate-threshold", type=float, default=0.25)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", default="cuda")
