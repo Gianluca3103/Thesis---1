@@ -2,6 +2,29 @@
 
 ## Joint relationship and radar-only occupancy experiment
 
+### Official five-scan radar ablation
+
+Run `bash scripts/run_meta_occupancy_official5_ablation.sh` on the professor
+machine to repeat the joint occupancy experiment with VoD's supplied
+`radar_5frames` point clouds. The script builds a separate fixed-frame cache,
+pretrains a new radar encoder for 30 epochs, checks and fills a separate
+lossless geometry cache, trains the joint teacher/student for 25 epochs, and
+sweeps the best radar-only student on the full validation split. It then runs a
+paired five-versus-20-scan threshold sweep on the intersection of their 3.2 m
+radar support and the union of their decoder candidate voxels. Both models are
+scored against the same clean-LiDAR labels and observed voxels in that paired
+comparison. The experiment reuses the 20-scan run's pretrained LiDAR encoder
+because the clean LiDAR input, field of view, and split are unchanged. It does
+not initialize the five-scan radar path
+from the 20-scan checkpoint. The same grid, 3.2 m support radius, losses,
+architecture, and validation schedule are retained.
+
+The official five-scan input and the existing 20-scan Doppler-processed variant
+differ in both stack length and radar preprocessing. Their native-support Known
+and Full IoU values also refer to different supported voxels. Use the paired
+common-support sweep for a direct prediction comparison and report native
+candidate coverage separately to show the effect of the larger radar stack.
+
 `train_meta_occupancy.py` implements the proposed bilevel experiment without
 changing the older teacher/student training scripts. Start with independently
 pretrained radar and clean-LiDAR encoders:
