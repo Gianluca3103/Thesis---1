@@ -11,7 +11,7 @@ from models.radar_lidar_stage2.sparse_geometry import (
     GRID, reconstruction_targets, voxelize_means,
 )
 from models.radar_lidar_stage2.sparse_residual import (
-    SparseResidualStage2, cosine_alpha_bars,
+    MAX_POINTS_PER_VOXEL, SparseResidualStage2, cosine_alpha_bars,
 )
 from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
@@ -57,6 +57,7 @@ def main() -> None:
     first = model.lpcr_loss(latent, conditions, clean)
     first["loss"].backward()
     for name, layer in (("occupancy", model.lpcr.occupancy),
+                        ("count", model.lpcr.count),
                         ("offset", model.lpcr.offset)):
         grad = layer.weight.grad
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
@@ -76,9 +77,11 @@ def main() -> None:
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
-    if (sampled["predicted_points"] != sampled["predicted_cells"]
-            or sampled["predicted_points"] != len(sampled["points_xyz"])):
-        raise AssertionError("LPCR must emit one point per selected voxel")
+    if (sampled["predicted_points"] != len(sampled["points_xyz"])
+            or sampled["predicted_points"] != int(sampled["point_counts"].sum())
+            or sampled["predicted_points"] < sampled["predicted_cells"]
+            or sampled["predicted_points"] > MAX_POINTS_PER_VOXEL * sampled["predicted_cells"]):
+        raise AssertionError("LPCR must emit one to five points per selected voxel")
     if len(sampled["points_xyz"]):
         minimum = sampled["points_xyz"].new_tensor(GRID.minimum_xyz)
         size = sampled["points_xyz"].new_tensor(GRID.voxel_xyz)

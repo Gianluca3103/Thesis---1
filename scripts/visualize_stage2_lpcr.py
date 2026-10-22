@@ -148,10 +148,10 @@ def main() -> None:
             print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
             continue
         latent, _ = model.encode_lidar(clean, conditions)
-        logits, offsets = model.lpcr(
+        logits, count_logits, offsets = model.lpcr(
             latent, conditions.hierarchy, conditions.fine_probabilities)
         generated = model.lpcr.emit_points(
-            conditions.hierarchy[0], logits, offsets, 0.0)
+            conditions.hierarchy[0], logits, count_logits, offsets, 0.0)
         scores = generated["probabilities"].cpu().numpy().astype(np.float32)
         coords = conditions.hierarchy[0][:, [3, 2, 1]].cpu().numpy()
         reconstructed = generated["points_xyz"].cpu().numpy().astype(np.float32)

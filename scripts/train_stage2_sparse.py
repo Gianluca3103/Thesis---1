@@ -19,7 +19,8 @@ from models.radar_lidar_stage2.fault_data import (
 )
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    MODEL_REVISION, VERSION, SparseResidualStage2, Stage2Conditions,
+    MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
+    SparseResidualStage2, Stage2Conditions,
     cosine_alpha_bars,
 )
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
@@ -134,9 +135,10 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             if args.phase == "lpcr":
                 latent, _ = model.encode_lidar(clean, conditions, clean_batch_ids)
                 result = model.lpcr_loss(latent, conditions, clean,
-                                         batch_size=batch_size)
+                                         batch_size=batch_size,
+                                         clean_batch_ids=clean_batch_ids)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "offset", "iou_known",
+                          ("loss", "occupancy", "count", "offset", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
             else:
@@ -173,6 +175,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                           "residual": result["residual"],
                           "reconstruction": reconstruction["loss"],
                           "occupancy": reconstruction["occupancy"],
+                          "count": reconstruction["count"],
                           "offset": reconstruction["offset"],
                           "iou_known": reconstruction["iou_known"],
                           "iou_full": reconstruction["iou_full"],
@@ -258,6 +261,8 @@ def main() -> None:
     model = SparseResidualStage2().to(args.device)
     identity = {"version": VERSION, "model_revision": MODEL_REVISION,
                 "phase": args.phase, "grid": asdict(GRID),
+                "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
+                "count_weight": 0.1, "offset_weight": 0.1,
                 "stage1_sha256": sha256(args.stage1_checkpoint),
                 "radar_variant": args.radar_variant, "gate_threshold": args.gate_threshold,
                 "radius_m": radius_m,
@@ -370,6 +375,7 @@ def main() -> None:
             _atomic_save(args.output_root / "best.ckpt", payload)
         print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
               f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
+              f"count CE={val['count']:.5f}, "
               f"offset L1={val['offset']:.5f}, "
               f"gate coverage={val['gate_coverage']:.4f}, "
               f"train faults={train['fault_counts']}", flush=True)
