@@ -49,7 +49,12 @@ severe fault plan over three epochs: `total_loss:1` (zero returns),
 `fov_filter:5` (the narrowest retained FOV from 3D_Corruptions_AD), and
 `fog_sim:5` (the original fog simulator with alpha 0.06 and noise 10).
 Fog is applied to the full raw scan before the calibrated forward crop and
-cached once. The FOV filter is an exact implementation of the original
+cached once. Fog cache files use reversible float32 byte shuffling before
+lossless ZIP compression. Existing fog files are compacted in place when the
+builder is rerun. An eight-frame VoD sample projects about 1.9 GiB for the
+complete train and validation fog cache; the builder checks against a 5 GiB
+default projected-size limit. It uses two CPU workers by default. The FOV
+filter is an exact implementation of the original
 severity-5 selection; total loss and FOV are computed without a data cache.
 For real faulty LiDAR, supply
 pre-aligned `float32` `.bin` files with four columns at
@@ -93,7 +98,7 @@ DIFF="$OUT5/stage2_sparse_diffusion_severe_v1"
 
 "$PY" -u -m scripts.cache_stage2_severe_fog \
   --vod-root "$VOD" --fog-simulator-root "$FOG_SIM" \
-  --cache-root "$FOG_CACHE" --split both --num-workers 8
+  --cache-root "$FOG_CACHE" --split both --num-workers 2
 
 "$PY" -m scripts.smoke_stage2_severe_faults \
   --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \

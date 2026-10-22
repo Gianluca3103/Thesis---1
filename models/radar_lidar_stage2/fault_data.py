@@ -20,6 +20,23 @@ FAULT_PLAN = (("total_loss", 1), ("fov_filter", 5), ("fog_sim", 5))
 FAULT_NAMES = tuple(name for name, _ in FAULT_PLAN)
 FOG_ALPHA = 0.06
 FOG_NOISE = 10
+FOG_CACHE_ENCODING = "float32_byte_shuffle_v1"
+
+
+def encode_fog_points(points: np.ndarray) -> np.ndarray:
+    """Rearrange float32 bytes for lossless, fast ZIP compression."""
+    values = np.ascontiguousarray(points, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != 4:
+        raise ValueError("Fog cache expects XYZ and reflectivity [N,4]")
+    return np.frombuffer(values.tobytes(), dtype=np.uint8).reshape(-1, 4).T.copy()
+
+
+def decode_fog_points(encoded: np.ndarray, count: int) -> np.ndarray:
+    if (encoded.dtype != np.uint8 or encoded.shape != (4, count * 4)
+            or count < 0):
+        raise ValueError("Invalid byte-shuffled fog scan")
+    return np.ascontiguousarray(encoded.T).reshape(-1).view(np.float32).reshape(
+        count, 4).copy()
 
 
 def selected_fault(frame_id: str, epoch: int, seed: int = 3103) -> str:
@@ -71,8 +88,16 @@ class SevereFogCache:
 
     def load(self, frame_id: str) -> torch.Tensor:
         with np.load(self.path(frame_id), allow_pickle=False) as archive:
-            points = np.asarray(archive["points"], dtype=np.float32)
             metadata = json.loads(str(archive["metadata_json"].item()))
+            if metadata.get("encoding") == FOG_CACHE_ENCODING:
+                points = decode_fog_points(
+                    archive["points_bytes"], int(metadata["cropped_points"]))
+            elif metadata.get("encoding") is None:
+                # Read caches made before byte shuffling so the builder can
+                # compact them in place without regenerating fog.
+                points = np.asarray(archive["points"], dtype=np.float32)
+            else:
+                raise ValueError(f"Unknown severe fog encoding: {self.path(frame_id)}")
         if (metadata.get("version") != FAULT_POLICY_VERSION
                 or metadata.get("frame_id") != frame_id
                 or metadata.get("fault") != "fog_sim"
@@ -81,6 +106,7 @@ class SevereFogCache:
                 or metadata.get("alpha") != FOG_ALPHA
                 or metadata.get("noise") != FOG_NOISE
                 or points.ndim != 2 or points.shape[1] != 4
+                or len(points) != metadata.get("cropped_points")
                 or not np.isfinite(points).all()):
             raise ValueError(f"Invalid severe fog cache entry: {self.path(frame_id)}")
         return torch.from_numpy(points.copy())

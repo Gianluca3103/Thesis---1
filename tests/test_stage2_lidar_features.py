@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage2.sparse_batch import voxelize_lidar_features
+from models.radar_lidar_stage2.fault_data import decode_fog_points, encode_fog_points
 from scripts.predict_stage2_sparse import _present_in_faulty
 
 
@@ -34,6 +35,13 @@ class TestStage2LidarFeatures(unittest.TestCase):
         self.assertTrue(_present_in_faulty(clean[:, :3], fog[:, :3]).item())
         self.assertFalse(_present_in_faulty(clean, fog).item())
         self.assertFalse(_present_in_faulty(clean, fog[:0]).item())
+
+    def test_fog_cache_shuffle_preserves_float32_bits(self):
+        points = np.array([[1.125, -0.0, 3.5, 28.0],
+                           [-7.25, 8.0, -0.125, 120.75]], dtype=np.float32)
+        restored = decode_fog_points(encode_fog_points(points), len(points))
+        np.testing.assert_array_equal(restored.view(np.uint32),
+                                      points.view(np.uint32))
 
 
 if __name__ == "__main__":
