@@ -48,14 +48,6 @@ def _roi(points: np.ndarray) -> np.ndarray:
     return points[((xyz >= minimum) & (xyz < maximum)).all(axis=1)]
 
 
-def _display_subset(points: np.ndarray, limit: int, seed: int) -> np.ndarray:
-    if len(points) <= limit:
-        return points
-    indices = np.sort(np.random.default_rng(seed).choice(len(points), limit,
-                                                         replace=False))
-    return points[indices]
-
-
 def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
     """Match exact point rows, including reflectivity when present."""
     if not len(clean):
@@ -79,7 +71,6 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 changed_reflectivity: int | None,
                 median_intensity: tuple[float | None, float | None],
                 shared_subset: bool,
-                display_limit: int,
                 metrics: dict | None) -> None:
     clouds = [faulty, clean, predicted]
     nonempty = [cloud for cloud in clouds if len(cloud)]
@@ -101,7 +92,6 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "changed_reflectivity": changed_reflectivity,
         "median_intensity": median_intensity,
         "shared_subset": shared_subset,
-        "display_limit": display_limit,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
@@ -129,8 +119,8 @@ const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'The established fog simulator at severity 5 changes ranges and intensities on the full raw scan before the forward crop.',real:'Pre-aligned real faulty LiDAR was loaded.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels share the same sampled clean points.':'Fog and clean panels are sampled separately to include shifted fog returns.'}`;
-if(d.metrics){const p=document.createElement('p');p.textContent=`Sampled reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels show the complete clean-point set.':'Fog and clean panels show their complete respective clouds, including shifted fog returns.'}`;
+if(d.metrics){const p=document.createElement('p');p.textContent=`Reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
 const names=['Faulty LiDAR input',d.changed_geometry===null?'Clean LiDAR reference':'Clean LiDAR reference + changed points','Stage II reconstruction','Clean + reconstruction'];if(d.changed_geometry!==null)names.push('Faulty input + changed clean points');const panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
@@ -169,16 +159,12 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--sampling-steps", type=int, default=64)
     parser.add_argument("--occupancy-threshold", type=float, default=0.5)
-    parser.add_argument("--max-points-per-voxel", type=int, default=512,
-                        help="Inference safety cap; multiple points are emitted per voxel")
     parser.add_argument("--html", action="store_true",
                         help="Write an interactive faulty/clean/reconstruction comparison")
-    parser.add_argument("--display-limit", type=int, default=40000)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available() or
-            args.limit < 1 or args.sampling_steps < 1 or args.display_limit < 1 or
-            args.max_points_per_voxel < 1 or
+            args.limit < 1 or args.sampling_steps < 1 or
             not 0 < args.occupancy_threshold < 1 or
             (args.split == "test" and args.faulty_root is None) or
             (args.faulty_root is None and args.fault_cache_root is None) or
@@ -249,8 +235,7 @@ def main() -> None:
         torch.manual_seed(seed)
         predicted = model.sample(faulty, conditions, alpha_bars,
                                  steps=args.sampling_steps,
-                                 occupancy_threshold=args.occupancy_threshold,
-                                 max_points_per_voxel=args.max_points_per_voxel)
+                                 occupancy_threshold=args.occupancy_threshold)
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())
@@ -264,14 +249,13 @@ def main() -> None:
             xyz_kept = _present_in_faulty(clean_roi[:, :3], faulty_roi[:, :3])
             changed_geometry = int((~xyz_kept).sum())
             changed_reflectivity = int((xyz_kept & ~kept).sum())
-        clean_display = _display_subset(clean_roi, args.display_limit, seed + 2)
+        clean_display = clean_roi
         if shared_subset:
             display_kept = _present_in_faulty(clean_display, faulty_roi)
             faulty_display = clean_display[display_kept, :3]
             removed_display = clean_display[~display_kept, :3]
         else:
-            faulty_display = _display_subset(faulty_roi, args.display_limit,
-                                             seed + 1)[:, :3]
+            faulty_display = faulty_roi[:, :3]
             removed_display = (clean_display[~_present_in_faulty(
                 clean_display, faulty_roi), :3] if synthetic
                 else np.empty((0, 3), dtype=np.float32))
@@ -332,8 +316,7 @@ def main() -> None:
             _write_html(viewer, frame_id=frame_id, epoch=int(saved2["epoch"]),
                         split=args.split,
                         faulty=faulty_display, clean=clean_display[:, :3],
-                        predicted=_display_subset(xyz, args.display_limit,
-                                                  seed + 3),
+                        predicted=xyz,
                         removed=removed_display,
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
@@ -344,8 +327,7 @@ def main() -> None:
                         changed_geometry=changed_geometry,
                         changed_reflectivity=changed_reflectivity,
                         median_intensity=median_intensity,
-                        shared_subset=shared_subset,
-                        display_limit=args.display_limit, metrics=metrics)
+                        shared_subset=shared_subset, metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)
         print(json.dumps(stats), flush=True)

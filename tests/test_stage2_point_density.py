@@ -40,6 +40,15 @@ class TestStage2PointDensity(unittest.TestCase):
         self.assertTrue(bool((xyz[:, 1] >= 0).all() and (xyz[:, 1] < 0.2).all()))
         self.assertTrue(bool((xyz[:, 2] >= 0).all() and (xyz[:, 2] < 0.25).all()))
 
+    def test_point_count_is_not_capped_at_512(self):
+        torch.manual_seed(3103)
+        head = self._head()
+        output = head.emit_points(
+            torch.randn((1, 16)), torch.tensor([[0, 8, 80, 5]]),
+            torch.tensor([2.0]), torch.tensor([math.log1p(600)]), 0.5)
+        self.assertEqual(output["point_counts"].tolist(), [600])
+        self.assertEqual(output["predicted_points"], 600)
+
     def test_point_likelihood_has_gradient(self):
         torch.manual_seed(3103)
         head = self._head()

@@ -37,10 +37,10 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
    and radar adapter.
 6. Inference reads only radar and faulty LiDAR. DDIM-style sampling estimates
    the residual, `Z_clean_hat = Z_faulty + R_hat`, then LPCR predicts occupancy
-   and a variable number of points **only at selected cells**. A configurable
-   inference safety cap defaults to 512 points per occupied voxel; it is not
-   an architectural one-point limit. Clean LiDAR is never used
-   to choose coordinates or at inference.
+   and a variable number of points **only at selected cells**. The predicted
+   point count has no fixed per-voxel cap, and preview HTML includes all
+   reconstructed points. Clean LiDAR is never used to choose coordinates or
+   at inference.
 
 The common region is XYZ `[0,32] × [-16,16] × [-2,2]` m with voxels
 `0.2 × 0.2 × 0.25` m, giving `16 × 160 × 160` fine cells and a

@@ -33,7 +33,6 @@ VERSION = "stage2_sparse_residual_v1"
 MODEL_REVISION = "stage2_variable_point_density_centroid_v4"
 LATENT_CHANNELS = 32
 POINT_MIXTURES = 8
-MAX_INFERENCE_POINTS_PER_VOXEL = 512
 
 
 def _require_me() -> None:
@@ -255,17 +254,16 @@ class AllowedSiteLPCR(nn.Module):
     @torch.no_grad()
     def emit_points(self, hidden: torch.Tensor, coords: torch.Tensor,
                     occupancy_logits: torch.Tensor, log_count: torch.Tensor,
-                    occupancy_threshold: float,
-                    max_points_per_voxel: int = MAX_INFERENCE_POINTS_PER_VOXEL
+                    occupancy_threshold: float
                     ) -> dict:
-        if max_points_per_voxel < 1:
-            raise ValueError("Maximum inference points per voxel must be positive")
         probabilities = occupancy_logits.sigmoid()
         selected = probabilities >= occupancy_threshold
         chosen = torch.where(selected)[0]
-        counts = torch.expm1(log_count[chosen].clamp(
-            min=0, max=math.log1p(max_points_per_voxel))).round().long()
-        counts = counts.clamp(min=1, max=max_points_per_voxel)
+        predicted_counts = torch.expm1(log_count[chosen].double().clamp_min(0))
+        if not bool(torch.isfinite(predicted_counts).all()) or bool((
+                predicted_counts >= torch.iinfo(torch.int64).max).any()):
+            raise RuntimeError("Predicted point count cannot be represented as int64")
+        counts = predicted_counts.round().long().clamp_min(1)
         if not len(chosen):
             return {"points_xyz": hidden.new_empty((0, 3)),
                     "coordinates": coords.new_empty((0, 4)),
@@ -489,8 +487,8 @@ class SparseResidualStage2(nn.Module):
                         for mask in (intersection, known_union, full_union)]
                 iou_known = float((sums[0] / sums[1].clamp_min(1)).float().mean())
                 iou_full = float((sums[0] / sums[2].clamp_min(1)).float().mean())
-            predicted_count = torch.expm1(log_count[occupied].clamp(
-                min=0, max=math.log1p(MAX_INFERENCE_POINTS_PER_VOXEL))).round()
+            predicted_count = torch.expm1(
+                log_count[occupied].double().clamp_min(0)).round()
             count_mae = (float((predicted_count - counts[occupied]).abs().float().mean())
                          if bool(occupied.any()) else 0.0)
         return {"loss": (occ + count_weight * count + point_weight * point_nll
@@ -544,8 +542,7 @@ class SparseResidualStage2(nn.Module):
     @torch.no_grad()
     def sample(self, faulty_lidar: torch.Tensor, conditions: Stage2Conditions,
                alpha_bars: torch.Tensor, *, steps: int = 64,
-               occupancy_threshold: float = 0.5,
-               max_points_per_voxel: int = MAX_INFERENCE_POINTS_PER_VOXEL) -> dict:
+               occupancy_threshold: float = 0.5) -> dict:
         if steps < 1 or steps > len(alpha_bars):
             raise ValueError("Sampling steps must fit the diffusion schedule")
         faulty, present = self.encode_lidar(faulty_lidar, conditions)
@@ -567,7 +564,7 @@ class SparseResidualStage2(nn.Module):
             faulty + residual, conditions.hierarchy, conditions.fine_probabilities)
         return self.lpcr.emit_points(
             hidden, conditions.hierarchy[0], logits, log_count,
-            occupancy_threshold, max_points_per_voxel)
+            occupancy_threshold)
 
 
 def cosine_alpha_bars(steps: int = 1000, *, device: torch.device | str = "cpu"
