@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
+from models.radar_lidar_stage1.sparse import encode_keys
 
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
@@ -461,32 +462,56 @@ class SparseResidualStage2(nn.Module):
     @torch.no_grad()
     def sample(self, faulty_xyz: torch.Tensor, conditions: Stage2Conditions,
                alpha_bars: torch.Tensor, *, steps: int = 64,
-               occupancy_threshold: float = 0.5) -> dict:
+               occupancy_threshold: float = 0.5,
+               missing_only: bool = True,
+               use_residual: bool = True) -> dict:
         if steps < 1 or steps > len(alpha_bars):
             raise ValueError("Sampling steps must fit the diffusion schedule")
         faulty, present = self.encode_lidar(faulty_xyz, conditions)
-        residual = torch.randn_like(faulty)
-        schedule = torch.linspace(len(alpha_bars) - 1, 0, steps,
-                                  device=faulty.device).round().long()
-        for index, timestep in enumerate(schedule):
-            residual_hat = self.diffusion(
-                residual, faulty, conditions.radar_features,
-                conditions.latent_probabilities, present, timestep,
-                conditions.hierarchy[-1])
-            if index + 1 == len(schedule):
-                residual = residual_hat
-            else:
-                alpha = alpha_bars[timestep]
-                next_alpha = alpha_bars[schedule[index + 1]]
-                noise_hat = ((residual - alpha.sqrt() * residual_hat) /
-                             (1 - alpha).sqrt().clamp_min(1e-6))
-                residual = (next_alpha.sqrt() * residual_hat
-                            + (1 - next_alpha).sqrt() * noise_hat)
+        residual = torch.zeros_like(faulty)
+        if use_residual:
+            residual = torch.randn_like(faulty)
+            schedule = torch.linspace(len(alpha_bars) - 1, 0, steps,
+                                      device=faulty.device).round().long()
+            for index, timestep in enumerate(schedule):
+                residual_hat = self.diffusion(
+                    residual, faulty, conditions.radar_features,
+                    conditions.latent_probabilities, present, timestep,
+                    conditions.hierarchy[-1])
+                if index + 1 == len(schedule):
+                    residual = residual_hat
+                else:
+                    alpha = alpha_bars[timestep]
+                    next_alpha = alpha_bars[schedule[index + 1]]
+                    noise_hat = ((residual - alpha.sqrt() * residual_hat) /
+                                 (1 - alpha).sqrt().clamp_min(1e-6))
+                    residual = (next_alpha.sqrt() * residual_hat
+                                + (1 - next_alpha).sqrt() * noise_hat)
         logits, offsets = self.lpcr(
             faulty + residual, conditions.hierarchy,
             torch.ones_like(conditions.fine_probabilities))
-        return self.lpcr.emit_points(conditions.hierarchy[0], logits,
-                                     offsets, occupancy_threshold)
+        emitted = self.lpcr.emit_points(conditions.hierarchy[0], logits,
+                                        offsets, occupancy_threshold)
+        emitted["full_estimate_cells"] = emitted["predicted_cells"]
+        emitted["residual_abs_present_latent"] = (
+            float(residual[present].abs().mean()) if bool(present.any()) else None)
+        emitted["residual_abs_absent_latent"] = (
+            float(residual[~present].abs().mean()) if bool((~present).any()) else None)
+        observed_coords, _ = voxelize_means(faulty_xyz, grid=self.grid)
+        predicted_keys = encode_keys(emitted["coordinates"], self.grid.shape_zyx)
+        observed_keys = encode_keys(observed_coords, self.grid.shape_zyx)
+        overlap = torch.isin(predicted_keys, observed_keys)
+        emitted["overlap_observed_cells"] = int(overlap.sum())
+        if missing_only:
+            # LPCR estimates the complete clean cloud. Expose only new voxels
+            # as additions; surviving faulty returns are preserved separately.
+            keep = ~overlap
+            for key in ("points_xyz", "coordinates", "occupied_coordinates",
+                        "probabilities", "point_counts"):
+                emitted[key] = emitted[key][keep]
+            emitted["predicted_cells"] = int(keep.sum())
+            emitted["predicted_points"] = int(keep.sum())
+        return emitted
 
 
 def cosine_alpha_bars(steps: int = 1000, *, device: torch.device | str = "cpu"

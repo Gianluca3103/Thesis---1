@@ -37,6 +37,9 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
 6. Inference reads only radar and faulty LiDAR. DDIM-style sampling estimates
    the residual, `Z_clean_hat = Z_faulty + R_hat`, then LPCR predicts occupancy
    and one centroid point per predicted occupied voxel **only at selected cells**.
+   By default, exported reconstruction contains only predicted voxels not
+   already occupied by faulty LiDAR. Surviving faulty returns remain in the
+   completed cloud instead of being duplicated as new points.
    Clean LiDAR is never used to choose coordinates or at inference. No LiDAR
    intensity is consumed or predicted.
 
@@ -48,9 +51,17 @@ nearby Stage-I radar feature sites within 3.2 m. The gate threshold defaults
 to `0.25`; it determines a strict recall ceiling. Report `gate_coverage`
 alongside Known/Full IoU. Those IoUs are measured on the Stage-II gate and
 region, so they are not directly comparable with Stage-I full-grid IoU. The
-output `.ply` contains reconstructed points within allowed sites; existing
-faulty points outside that set are not merged into it. Known/Full IoU remain
-voxel occupancy metrics. Each predicted occupied voxel emits one point.
+output `.ply` contains new predicted points within allowed sites; the companion
+`_completed.ply` contains faulty LiDAR plus those additions. Known/Full IoU in the prediction
+preview scores that union. The preview also reports precision, recall, and F1
+for missing occupied voxels and how many full-estimate predictions coincided
+with a faulty return. Each new occupied voxel emits one point. This
+preservation rule fits the synthetic deletion faults, whose surviving XYZ
+returns are unchanged. For real faulty LiDAR containing spurious returns,
+review the observed-voxel assumption.
+The filter preserves observed fine voxels at output; it does not force the
+latent residual to zero where any faulty point is present. A coarse latent
+cell can contain both observed and missing fine voxels.
 
 Synthetic diffusion training now cycles each frame through the established
 severe fault plan over three epochs: `total_loss:1` (zero returns),
@@ -147,6 +158,10 @@ reconstructed points down to the generation threshold set with
 `--occupancy-threshold`; regenerating the preview with a lower threshold is
 needed to inspect lower-confidence points. The preview reports how many clean
 returns were removed by each synthetic fault.
+Use `--full-estimate` to inspect the unfiltered decoder output. Use
+`--zero-residual` with the same split, random seed, and occupancy threshold to
+measure whether diffusion improves missing-voxel precision/recall over decoding
+the faulty latent directly. These flags do not require retraining.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new Stage-II geometry cache
 and diffusion run; the full-region LPCR checkpoint can be reused.

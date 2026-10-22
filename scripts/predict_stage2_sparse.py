@@ -18,7 +18,9 @@ from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
     load_faulty, severe_fault,
 )
-from models.radar_lidar_stage2.sparse_geometry import GRID, reconstruction_targets
+from models.radar_lidar_stage2.sparse_geometry import (
+    GRID, reconstruction_targets, voxelize_means,
+)
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
 from models.radar_lidar_stage2.stage2_io import (
@@ -68,6 +70,8 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 sampling_steps: int,
                 fault_type: str, totals: tuple[int, int, int, int],
                 removed_clean_points: int | None,
+                full_estimate_cells: int, overlap_observed_cells: int,
+                missing_only: bool, zero_residual: bool,
                 metrics: dict | None) -> None:
     if len(predicted) != len(probabilities):
         raise ValueError("One confidence value is required per reconstructed point")
@@ -89,6 +93,10 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "predicted_cells": predicted_cells,
         "sampling_steps": sampling_steps, "fault_type": fault_type,
         "totals": totals, "removed_clean_points": removed_clean_points,
+        "full_estimate_cells": full_estimate_cells,
+        "overlap_observed_cells": overlap_observed_cells,
+        "missing_only": missing_only,
+        "zero_residual": zero_residual,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
@@ -117,9 +125,9 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog-response returns are removed; retained input points have original clean XYZ. LiDAR intensity is not a model input.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
-document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
-if(d.metrics){const p=document.createElement('p');p.textContent=`Metrics at the generation threshold: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
+document.getElementById('note').textContent=`${explanations[d.fault_type]} ${d.zero_residual?'Zero-residual ablation: the faulty LiDAR latent goes directly to LPCR; radar still selects the allowed region.':'The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.'} ${d.missing_only?'The reconstructed layer contains additions only; faulty-occupied voxels are preserved from the input.':'The reconstructed layer shows the unfiltered full-cloud estimate.'}`;
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
+if(d.metrics){const p=document.createElement('p');p.textContent=`${d.metrics.metric_scope}: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, missing-voxel precision ${d.metrics.missing_precision.toFixed(4)}, recall ${d.metrics.missing_recall.toFixed(4)}, F1 ${d.metrics.missing_f1.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
 const layers=[{key:'faulty',name:'Faulty LiDAR',color:'#ffb85c'},{key:'clean',name:'Clean LiDAR',color:'#60d796'},{key:'radar',name:'Radar',color:'#67b7ff'},{key:'predicted',name:'Reconstructed',color:'#ff8b6c'}];
 const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
 const panes=document.getElementById('panels'),panels=[];
@@ -162,6 +170,10 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--sampling-steps", type=int, default=64)
     parser.add_argument("--occupancy-threshold", type=float, default=0.5)
+    parser.add_argument("--full-estimate", action="store_true",
+                        help="Show all predicted occupied voxels, including those already observed by faulty LiDAR")
+    parser.add_argument("--zero-residual", action="store_true",
+                        help="Ablation: decode faulty LiDAR latent without diffusion residual")
     parser.add_argument("--html", action="store_true",
                         help="Write an interactive faulty/clean/reconstruction comparison")
     parser.add_argument("--device", default="cuda")
@@ -238,7 +250,9 @@ def main() -> None:
         torch.manual_seed(seed)
         predicted = model.sample(faulty, conditions, alpha_bars,
                                  steps=args.sampling_steps,
-                                 occupancy_threshold=args.occupancy_threshold)
+                                 occupancy_threshold=args.occupancy_threshold,
+                                 missing_only=not args.full_estimate,
+                                 use_residual=not args.zero_residual)
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())
@@ -253,8 +267,18 @@ def main() -> None:
             removed_clean_points = len(clean_roi) - len(faulty_roi)
         stem_name = (f"{frame_id}_{fault_type}_stage2_epoch_{saved2['epoch']:03d}"
                      if args.html else f"{frame_id}_stage2")
+        if args.zero_residual:
+            stem_name += "_zero_residual"
+        if args.full_estimate:
+            stem_name += "_full_estimate"
         stem = args.output_root / stem_name
         _write_ply(stem.with_suffix(".ply"), xyz, scores)
+        if not args.full_estimate:
+            completed_xyz = np.concatenate((faulty_roi[:, :3], xyz))
+            completed_scores = np.concatenate((np.ones(len(faulty_roi), dtype=np.float32),
+                                               scores))
+            _write_ply(stem.with_name(stem.name + "_completed.ply"),
+                       completed_xyz, completed_scores)
         np.savez_compressed(stem.with_suffix(".npz"), xyz=xyz,
                             probability=scores,
                             coordinates=predicted["coordinates"].cpu().numpy(),
@@ -262,12 +286,24 @@ def main() -> None:
                                 "occupied_coordinates"].cpu().numpy(),
                             faulty_xyz=faulty_roi[:, :3], clean_xyz=clean_roi[:, :3],
                             radar_xyz=radar_roi[:, :3],
-                            fault_type=np.asarray(fault_type))
+                            fault_type=np.asarray(fault_type),
+                            residual_mode=np.asarray("zero" if args.zero_residual
+                                                     else "diffusion"),
+                            prediction_mode=np.asarray("full_estimate" if args.full_estimate
+                                                       else "missing_only"))
         stats = {"frame_id": frame_id, "epoch": int(saved2["epoch"]),
                  "fault_type": fault_type,
                  "allowed_cells": predicted["allowed_cells"],
                  "predicted_occupied_cells": predicted["predicted_cells"],
                  "reconstructed_points": predicted["predicted_points"],
+                 "completed_points": (len(faulty_roi) + predicted["predicted_points"]
+                                      if not args.full_estimate else None),
+                 "full_estimate_cells": predicted["full_estimate_cells"],
+                 "overlap_observed_cells": predicted["overlap_observed_cells"],
+                 "prediction_mode": "full_estimate" if args.full_estimate else "missing_only",
+                 "residual_mode": "zero" if args.zero_residual else "diffusion",
+                 "residual_abs_present_latent": predicted["residual_abs_present_latent"],
+                 "residual_abs_absent_latent": predicted["residual_abs_absent_latent"],
                  "faulty_input_points": len(faulty_roi),
                  "radar_input_points": len(radar_roi),
                  "clean_reference_points": len(clean_roi),
@@ -285,12 +321,29 @@ def main() -> None:
             selected = torch.zeros(len(allowed_keys), dtype=torch.bool,
                                    device=args.device)
             selected[chosen_positions] = True
-            intersection = (selected & occupied).sum()
+            faulty_coords, _ = voxelize_means(faulty[:, :3], grid=GRID)
+            faulty_keys = encode_keys(faulty_coords, GRID.shape_zyx)
+            observed = torch.isin(allowed_keys, faulty_keys)
+            additions = selected & ~observed
+            completed = observed | additions
+            scored = selected if args.full_estimate else completed
+            intersection = (scored & occupied).sum()
             known = occupied | known_free
-            known_union = ((selected & known) | occupied).sum().clamp_min(1)
-            full_union = (selected | occupied).sum().clamp_min(1)
+            known_union = ((scored & known) | occupied).sum().clamp_min(1)
+            full_union = (scored | occupied).sum().clamp_min(1)
+            missing_target = occupied & ~observed
+            missing_tp = (additions & missing_target).sum()
+            precision = float(missing_tp / additions.sum().clamp_min(1))
+            recall = float(missing_tp / missing_target.sum().clamp_min(1))
             metrics = {"known_iou": float(intersection / known_union),
                        "full_iou": float(intersection / full_union),
+                       "missing_precision": precision,
+                       "missing_recall": recall,
+                       "missing_f1": (2 * precision * recall /
+                                      (precision + recall + 1e-8)),
+                       "missing_target_cells": int(missing_target.sum()),
+                       "metric_scope": ("Raw full estimate" if args.full_estimate
+                                        else "Faulty plus reconstructed additions"),
                        "gate_coverage": coverage}
             stats.update(metrics)
         if args.html:
@@ -303,11 +356,15 @@ def main() -> None:
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
                         predicted_cells=predicted["predicted_cells"],
-                        sampling_steps=args.sampling_steps,
+                        sampling_steps=0 if args.zero_residual else args.sampling_steps,
                         fault_type=fault_type,
                         totals=(len(faulty_roi), len(clean_roi),
                                 len(radar_roi), len(xyz)),
                         removed_clean_points=removed_clean_points,
+                        full_estimate_cells=predicted["full_estimate_cells"],
+                        overlap_observed_cells=predicted["overlap_observed_cells"],
+                        missing_only=not args.full_estimate,
+                        zero_residual=args.zero_residual,
                         metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)

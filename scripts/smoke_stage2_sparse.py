@@ -6,6 +6,7 @@ import argparse
 
 import torch
 
+from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
 from models.radar_lidar_stage2.lpcr_eval import point_cloud_metrics
 from models.radar_lidar_stage2.sparse_batch import voxelize_means_batched
@@ -97,6 +98,27 @@ def main() -> None:
             or sampled["predicted_points"] != int(sampled["point_counts"].sum())
             or sampled["predicted_points"] != sampled["predicted_cells"]):
         raise AssertionError("LPCR must emit one centroid per selected voxel")
+    torch.manual_seed(3103)
+    raw = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),
+                       steps=4, occupancy_threshold=0.01, missing_only=False)
+    torch.manual_seed(3103)
+    additions = model.sample(faulty, conditions,
+                             cosine_alpha_bars(16, device=device),
+                             steps=4, occupancy_threshold=0.01)
+    if (raw["predicted_cells"] != additions["predicted_cells"]
+            + additions["overlap_observed_cells"]):
+        raise AssertionError("Preserved faulty voxels were not excluded exactly")
+    faulty_voxels, _ = voxelize_means(faulty)
+    if bool(torch.isin(encode_keys(additions["coordinates"], GRID.shape_zyx),
+                       encode_keys(faulty_voxels, GRID.shape_zyx)).any()):
+        raise AssertionError("Additions overlap an observed faulty voxel")
+    baseline = model.sample(faulty, conditions,
+                            cosine_alpha_bars(16, device=device),
+                            steps=4, occupancy_threshold=0.01,
+                            use_residual=False)
+    if (baseline["residual_abs_present_latent"] not in (None, 0.0)
+            or baseline["residual_abs_absent_latent"] not in (None, 0.0)):
+        raise AssertionError("Zero-residual ablation did not disable diffusion")
     if len(sampled["points_xyz"]):
         minimum = sampled["points_xyz"].new_tensor(GRID.minimum_xyz)
         size = sampled["points_xyz"].new_tensor(GRID.voxel_xyz)
@@ -139,6 +161,7 @@ def main() -> None:
            "total_loss_diffusion_loss": float(total_loss["loss"]),
            "allowed": sampled["allowed_cells"],
            "predicted": sampled["predicted_cells"],
+           "overlap_observed_suppressed": additions["overlap_observed_cells"],
            "gradients_finite": True})
 
 
