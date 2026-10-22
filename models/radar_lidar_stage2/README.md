@@ -162,6 +162,9 @@ Use `--full-estimate` to inspect the unfiltered decoder output. Use
 `--zero-residual` with the same split, random seed, and occupancy threshold to
 measure whether diffusion improves missing-voxel precision/recall over decoding
 the faulty latent directly. These flags do not require retraining.
+The prediction script accepts an existing v8 diffusion checkpoint for this
+comparison and retains that checkpoint's original Stage-I probability input
+to LPCR. The v8 checkpoint still cannot resume v9 full-region training.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new Stage-II geometry cache
 and diffusion run; the full-region LPCR checkpoint can be reused.

@@ -489,7 +489,9 @@ class SparseResidualStage2(nn.Module):
                                 + (1 - next_alpha).sqrt() * noise_hat)
         logits, offsets = self.lpcr(
             faulty + residual, conditions.hierarchy,
-            torch.ones_like(conditions.fine_probabilities))
+            (conditions.fine_probabilities
+             if getattr(self, "lpcr_uses_stage1_probabilities", False)
+             else torch.ones_like(conditions.fine_probabilities)))
         emitted = self.lpcr.emit_points(conditions.hierarchy[0], logits,
                                         offsets, occupancy_threshold)
         emitted["full_estimate_cells"] = emitted["predicted_cells"]

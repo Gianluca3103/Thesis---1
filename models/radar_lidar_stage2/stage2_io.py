@@ -46,12 +46,18 @@ def stage1_frame(model, radar: torch.Tensor, radius_m: float) -> dict:
 def load_stage2(path: Path, device: str,
                 *, phase: str = "diffusion") -> tuple[SparseResidualStage2, dict]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
+    previous_diffusion_revision = "stage2_r2ldm_centroid_residual_v8"
+    accepted_revisions = {MODEL_REVISION}
+    if phase == "diffusion":
+        accepted_revisions.add(previous_diffusion_revision)
     if (saved.get("version") != VERSION
-            or saved.get("model_revision") != MODEL_REVISION
+            or saved.get("model_revision") not in accepted_revisions
             or saved.get("phase") != phase):
-        raise ValueError(f"Expected {VERSION}/{MODEL_REVISION} {phase} checkpoint")
+        raise ValueError(f"Expected {VERSION}/{accepted_revisions} {phase} checkpoint")
     if saved.get("grid") != asdict(GRID):
         raise ValueError("Stage-II checkpoint grid differs from current code")
     model = SparseResidualStage2().to(device)
     model.load_state_dict(saved["model"], strict=True)
+    model.lpcr_uses_stage1_probabilities = (
+        saved["model_revision"] == previous_diffusion_revision)
     return model.eval(), saved
