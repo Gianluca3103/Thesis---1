@@ -24,9 +24,10 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         parser.error("MinkowskiEngine smoke test requires CUDA")
-    clean = torch.rand((320, 3), device=device)
-    clean = clean * clean.new_tensor((3.0, 3.0, 1.5)) + clean.new_tensor(
+    xyz = torch.rand((320, 3), device=device)
+    xyz = xyz * xyz.new_tensor((3.0, 3.0, 1.5)) + xyz.new_tensor(
         (8.0, -1.5, -0.75))
+    clean = torch.cat((xyz, torch.rand((320, 1), device=device) * 255), dim=1)
     faulty = clean[::3]
     occupied, _ = voxelize_means(clean)
     neighbors = [occupied]
@@ -50,7 +51,13 @@ def main() -> None:
     model = SparseResidualStage2().to(device)
     conditions = model.conditions(stage1, 0.3)
     latent, _ = model.encode_lidar(clean, conditions)
-    first = model.lpcr_loss(latent, conditions, clean)
+    with torch.no_grad():
+        dimmed = clean.clone()
+        dimmed[:, 3] = 0
+        dimmed_latent, _ = model.encode_lidar(dimmed, conditions)
+        if torch.allclose(latent, dimmed_latent):
+            raise AssertionError("Shared LiDAR encoder ignored reflectivity")
+    first = model.lpcr_loss(latent, conditions, clean[:, :3])
     first["loss"].backward()
     lpcr_grad = model.lpcr.occupancy.weight.grad
     if lpcr_grad is None or not torch.isfinite(lpcr_grad).all():
@@ -70,10 +77,18 @@ def main() -> None:
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
+    total_loss = model.diffusion_loss(
+        clean[:0], clean, conditions, cosine_alpha_bars(16, device=device))
+    if not torch.isfinite(total_loss["loss"]):
+        raise AssertionError("Total-loss LiDAR caused a nonfinite diffusion loss")
+    total_loss_sample = model.sample(
+        clean[:0], conditions, cosine_alpha_bars(16, device=device), steps=4)
+    if total_loss_sample["predicted_cells"] > total_loss_sample["allowed_cells"]:
+        raise AssertionError("Total-loss reconstruction escaped the Stage-I gate")
     model.zero_grad(set_to_none=True)
     twin_conditions = [model.conditions(stage1, 0.3) for _ in range(2)]
     for item in twin_conditions:
-        item.cached_targets = reconstruction_targets(clean, item.hierarchy[0])
+        item.cached_targets = reconstruction_targets(clean[:, :3], item.hierarchy[0])
     joined = _combine_conditions(twin_conditions)
     batched_clean, clean_ids = _combine_points([clean, clean])
     batched_faulty, faulty_ids = _combine_points([faulty, faulty])
@@ -94,6 +109,7 @@ def main() -> None:
     print({"lpcr_loss": float(first["loss"]),
            "diffusion_loss": float(second["loss"]),
            "batched_diffusion_loss": float(batched["loss"]),
+           "total_loss_diffusion_loss": float(total_loss["loss"]),
            "allowed": sampled["allowed_cells"],
            "predicted": sampled["predicted_cells"],
            "gradients_finite": True})

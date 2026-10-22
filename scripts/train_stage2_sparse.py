@@ -14,10 +14,13 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
-from models.radar_lidar_stage2.fault_data import load_faulty, synthetic_fault
+from models.radar_lidar_stage2.fault_data import (
+    FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
+)
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    VERSION, SparseResidualStage2, Stage2Conditions, cosine_alpha_bars,
+    MODEL_REVISION, VERSION, SparseResidualStage2, Stage2Conditions,
+    cosine_alpha_bars,
 )
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
 from models.radar_lidar_stage2.stage2_io import load_stage1, sha256, stage1_frame
@@ -88,13 +91,14 @@ def _atomic_save(path: Path, payload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
+def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch, split,
            alpha_bars, radius_m: float) -> dict:
     training = optimizer is not None
     model.train(training)
     if stage1 is not None:
         stage1.eval()
     totals: dict[str, float] = {}
+    fault_counts = {name: 0 for name, _ in FAULT_PLAN}
     processed = skipped = 0
     context = torch.enable_grad if training else torch.no_grad
     with context():
@@ -102,7 +106,7 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
                          unit="batch", dynamic_ncols=True):
             active_rows, items, clean_clouds = [], [], []
             for row in rows:
-                clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
+                clean = row["clean_lidar"].to(args.device, non_blocking=True)
                 if fixed_cache is not None:
                     output = {key: value.to(args.device, non_blocking=True)
                               for key, value in row["stage2_output"].items()}
@@ -129,7 +133,7 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
             batch_size = len(active_rows)
             if args.phase == "lpcr":
                 latent, _ = model.encode_lidar(clean, conditions, clean_batch_ids)
-                result = model.lpcr_loss(latent, conditions, clean,
+                result = model.lpcr_loss(latent, conditions, clean[:, :3],
                                          batch_size=batch_size)
                 values = {key: result[key] for key in
                           ("loss", "occupancy", "offset", "iou_known",
@@ -138,14 +142,18 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
             else:
                 faulty_clouds = []
                 for row in active_rows:
-                    faulty = (load_faulty(args.faulty_root, split, row["frame_id"])
-                              if args.faulty_root else synthetic_fault(
-                                  row["clean_lidar"], row["frame_id"],
-                                  epoch if training else 0, seed=args.fault_seed,
-                                  dropout=args.fault_dropout,
-                                  sector_deg=args.fault_sector_deg))
-                    faulty_clouds.append(faulty[:, :3].to(args.device,
-                                                            non_blocking=True))
+                    if args.faulty_root:
+                        faulty = load_faulty(args.faulty_root, split,
+                                             row["frame_id"])
+                        fault_name = "real"
+                    else:
+                        faulty, fault_name = severe_fault(
+                            row["clean_lidar"], row["frame_id"],
+                            epoch if training else 0, fog_cache,
+                            seed=args.fault_seed)
+                    fault_counts[fault_name] = fault_counts.get(fault_name, 0) + 1
+                    faulty_clouds.append(faulty.to(args.device,
+                                                   non_blocking=True))
                 faulty, faulty_batch_ids = _combine_points(faulty_clouds)
                 generator = None
                 if not training:
@@ -186,7 +194,8 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
     if not processed:
         raise RuntimeError("Stage I selected zero sites across this split")
     return {key: value / processed for key, value in totals.items()} | {
-        "frames": processed, "skipped_empty_gate": skipped}
+        "frames": processed, "skipped_empty_gate": skipped,
+        "fault_counts": fault_counts if args.phase == "diffusion" else {}}
 
 
 def main() -> None:
@@ -209,9 +218,9 @@ def main() -> None:
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--faulty-root", type=Path)
+    parser.add_argument("--fault-cache-root", type=Path,
+                        help="Required for synthetic severe faults; contains severity-5 fog")
     parser.add_argument("--fault-seed", type=int, default=3103)
-    parser.add_argument("--fault-dropout", type=float, default=0.25)
-    parser.add_argument("--fault-sector-deg", type=float, default=35.0)
     parser.add_argument("--residual-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--resume", type=Path)
@@ -226,10 +235,12 @@ def main() -> None:
             args.batch_size < 1 or args.num_workers < 0 or args.lr <= 0 or
             args.batch_size > 1 and args.stage2_cache_root is None or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
+            (args.phase == "diffusion" and args.faulty_root is None
+             and args.fault_cache_root is None) or
             args.phase == "lpcr" and args.lpcr_checkpoint is not None or
             args.train_limit is not None and args.train_limit < 1 or
             args.val_limit is not None and args.val_limit < 1):
-        parser.error("Stage-II arguments require CUDA, valid limits, and an LPCR checkpoint for diffusion")
+        parser.error("Stage II requires CUDA, valid limits, an LPCR checkpoint, and a severe fog cache for synthetic diffusion faults")
     run_seed = 3407 if args.phase == "lpcr" else 3103
     torch.manual_seed(run_seed)
     if args.stage2_cache_root:
@@ -243,22 +254,28 @@ def main() -> None:
                                             args.radar_variant)
     radius_m = float(stage1_saved.get("radius_m", 3.2))
     model = SparseResidualStage2().to(args.device)
-    identity = {"version": VERSION, "phase": args.phase, "grid": asdict(GRID),
+    identity = {"version": VERSION, "model_revision": MODEL_REVISION,
+                "phase": args.phase, "grid": asdict(GRID),
                 "stage1_sha256": sha256(args.stage1_checkpoint),
                 "radar_variant": args.radar_variant, "gate_threshold": args.gate_threshold,
                 "radius_m": radius_m,
                 "lpcr_sha256": (sha256(args.lpcr_checkpoint)
                                 if args.lpcr_checkpoint else None),
                 "faulty_root": str(args.faulty_root.resolve()) if args.faulty_root else None,
-                "fault_seed": args.fault_seed, "fault_dropout": args.fault_dropout,
-                "fault_sector_deg": args.fault_sector_deg,
+                "fault_seed": args.fault_seed,
+                "fault_policy_version": FAULT_POLICY_VERSION,
+                "fault_plan": FAULT_PLAN,
+                "fault_cache_root": (str(args.fault_cache_root.resolve())
+                                     if args.fault_cache_root else None),
                 "run_seed": run_seed,
                 "initial_lr": args.lr,
                 "residual_weight": args.residual_weight,
                 "reconstruction_weight": args.reconstruction_weight}
     if args.phase == "diffusion":
         saved_lpcr = torch.load(args.lpcr_checkpoint, map_location="cpu", weights_only=False)
-        if (saved_lpcr.get("version") != VERSION or saved_lpcr.get("phase") != "lpcr"
+        if (saved_lpcr.get("version") != VERSION
+                or saved_lpcr.get("model_revision") != MODEL_REVISION
+                or saved_lpcr.get("phase") != "lpcr"
                 or saved_lpcr.get("stage1_sha256") != identity["stage1_sha256"]
                 or saved_lpcr.get("gate_threshold") != args.gate_threshold):
             raise ValueError("LPCR checkpoint differs from this Stage-I checkpoint or gate")
@@ -282,6 +299,7 @@ def main() -> None:
                                            data_cache_root=args.data_cache_root)
                      for split in ("train", "val")}
     fixed_caches = {}
+    fog_caches = {}
     for split, dataset in full_datasets.items():
         if args.stage2_cache_root:
             expected = cache_identity(
@@ -293,6 +311,11 @@ def main() -> None:
             fixed_caches[split].check_complete()
         else:
             fixed_caches[split] = None
+        fog_caches[split] = (SevereFogCache(
+            args.fault_cache_root, split,
+            [frame.frame_id for frame in dataset.frames], seed=args.fault_seed,
+            check_complete=getattr(args, f"{split}_limit") is None)
+            if args.phase == "diffusion" and args.faulty_root is None else None)
     datasets = {split: (Subset(dataset, range(min(limit, len(dataset))))
                         if limit is not None else dataset)
                 for split, dataset in full_datasets.items()
@@ -320,10 +343,10 @@ def main() -> None:
             scheduler.load_state_dict(saved["scheduler"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_val_loss"])
     for epoch in range(start, args.epochs + 1):
-        train = _epoch(model, stage1, fixed_caches["train"], loaders["train"],
+        train = _epoch(model, stage1, fixed_caches["train"], fog_caches["train"], loaders["train"],
                        optimizer, args, epoch,
                        "train", alpha_bars, radius_m)
-        val = _epoch(model, stage1, fixed_caches["val"], loaders["val"],
+        val = _epoch(model, stage1, fixed_caches["val"], fog_caches["val"], loaders["val"],
                      None, args, epoch,
                      "val", alpha_bars, radius_m)
         if scheduler is not None:
@@ -345,7 +368,8 @@ def main() -> None:
             _atomic_save(args.output_root / "best.ckpt", payload)
         print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
               f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
-              f"gate coverage={val['gate_coverage']:.4f}", flush=True)
+              f"gate coverage={val['gate_coverage']:.4f}, "
+              f"train faults={train['fault_counts']}", flush=True)
 
 
 if __name__ == "__main__":

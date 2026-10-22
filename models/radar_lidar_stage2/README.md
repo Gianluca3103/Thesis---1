@@ -14,9 +14,11 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
    support is retained.
 2. The probability threshold selects active cells **before** sparse decoding.
    Only these cells and their parents are allocated at the five LPCR scales.
-3. One shared Minkowski LiDAR encoder processes clean LiDAR during training
-   and faulty LiDAR during training and inference. Both map to the same sparse
-   latent coordinates selected in step 2.
+3. One shared Minkowski LiDAR encoder processes XYZ and reflectivity from
+   clean LiDAR during training and faulty LiDAR during training and inference.
+   Both map to the same sparse latent coordinates selected in step 2. The
+   reflectivity channel matters for fog, which attenuates many otherwise
+   unchanged XYZ returns.
 4. Pretrain the LiDAR encoder and sparse LPCR decoder on clean LiDAR, on the
    Stage-I-selected sites. Measured occupied cells and observed free cells
    supervise occupancy; no-return cells with unknown visibility are ignored.
@@ -42,8 +44,14 @@ region, so they are not directly comparable with Stage-I full-grid IoU. The
 output `.ply` contains reconstructed allowed
 sites; existing faulty points outside that set are not merged into it.
 
-Synthetic faults remove one deterministic 35° azimuth sector and randomly
-drop 25% of the remaining clean returns. For real faulty LiDAR, supply
+Synthetic diffusion training now cycles each frame through the established
+severe fault plan over three epochs: `total_loss:1` (zero returns),
+`fov_filter:5` (the narrowest retained FOV from 3D_Corruptions_AD), and
+`fog_sim:5` (the original fog simulator with alpha 0.06 and noise 10).
+Fog is applied to the full raw scan before the calibrated forward crop and
+cached once. The FOV filter is an exact implementation of the original
+severity-5 selection; total loss and FOV are computed without a data cache.
+For real faulty LiDAR, supply
 pre-aligned `float32` `.bin` files with four columns at
 `FAULTY_ROOT/{train,val,test}/FRAME.bin` (or `FAULTY_ROOT/FRAME.bin`).
 
@@ -61,12 +69,15 @@ PY=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/.venv_model_v2/bin/python
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 OUT5=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/meta_occupancy_official5_20261021
 S1="$OUT5/radar_autoencoder/best_student.ckpt"
-CACHE="$OUT5/stage2_fixed_v1"
-LPCR="$OUT5/stage2_sparse_lpcr"
-DIFF="$OUT5/stage2_sparse_diffusion"
+CACHE="$OUT5/stage2_fixed_gate025_v1"
+FOG_CACHE="$OUT5/stage2_severe_fog_s5_v1"
+FOG_SIM=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim
+LPCR="$OUT5/stage2_sparse_lpcr_intensity_v2"
+DIFF="$OUT5/stage2_sparse_diffusion_severe_v1"
 
 "$PY" -m scripts.smoke_stage2_sparse --device cuda
 
+# Run this block only if the fixed Stage-II geometry cache is absent.
 "$PY" -u -m scripts.cache_stage2_sparse \
   --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
   --stage1-checkpoint "$S1" --cache-root "$CACHE" \
@@ -78,35 +89,54 @@ DIFF="$OUT5/stage2_sparse_diffusion"
   --data-cache-root "$OUT5/fixed_frames" --stage2-cache-root "$CACHE" \
   --stage1-checkpoint "$S1" --output-root "$LPCR" \
   --radar-variant radar_5frames --gate-threshold 0.25 \
-  --epochs 30 --lr 0.001 --num-workers 8 --device cuda
+  --epochs 30 --lr 0.001 --batch-size 8 --num-workers 8 --device cuda
+
+"$PY" -u -m scripts.cache_stage2_severe_fog \
+  --vod-root "$VOD" --fog-simulator-root "$FOG_SIM" \
+  --cache-root "$FOG_CACHE" --split both --num-workers 8
+
+"$PY" -m scripts.smoke_stage2_severe_faults \
+  --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
+  --fault-cache-root "$FOG_CACHE" --split val
 
 "$PY" -u -m scripts.train_stage2_sparse \
   --phase diffusion --vod-root "$VOD" \
   --data-cache-root "$OUT5/fixed_frames" --stage2-cache-root "$CACHE" \
+  --fault-cache-root "$FOG_CACHE" \
   --stage1-checkpoint "$S1" --lpcr-checkpoint "$LPCR/best.ckpt" \
   --output-root "$DIFF" --radar-variant radar_5frames \
   --gate-threshold 0.25 --epochs 50 --lr 0.0002 \
-  --batch-size 8 --num-workers 8 --device cuda
+  --batch-size 16 --num-workers 8 --device cuda
 
 "$PY" -u -m scripts.predict_stage2_sparse \
   --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
+  --stage2-cache-root "$CACHE" --fault-cache-root "$FOG_CACHE" \
   --stage1-checkpoint "$S1" --stage2-checkpoint "$DIFF/best.ckpt" \
   --output-root "$DIFF/val_samples" --radar-variant radar_5frames \
-  --split val --limit 10 --device cuda
+  --split val --limit 10 --html --device cuda
 ```
 
-The last command uses synthetic faulty LiDAR for a validation demonstration.
+The last command uses a deterministic mix of the three severe faults for a
+validation demonstration. Add `--fault-type total_loss`, `fov_filter`, or
+`fog_sim` to preview one condition across all selected frames. Open
+`$DIFF/val_samples/index.html` to inspect the results.
+The preview marks clean returns altered in XYZ or reflectivity, and reports
+both counts separately. Fog often changes reflectivity more than XYZ.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new cache and LPCR run.
-Checkpoints record the Stage-I SHA-256 and gate to prevent incompatible runs.
+The existing Stage-I and Stage-II geometry caches can be reused. LPCR and
+diffusion both need new runs: the shared LiDAR encoder now reads reflectivity,
+and old dropout-trained diffusion checkpoints used the wrong fault policy.
+Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
+to prevent incompatible runs.
 The LPCR loss follows the R2LDM stage-0 occupied offset weight `0.04` and its
 30-epoch, `1e-3` AdamW/StepLR starting settings. Diffusion defaults are
 separate; they are proposed settings for this new architecture.
 
 Start with `--train-limit 2 --val-limit 2 --epochs 1 --num-workers 0`
 in a new output directory to check the full Stage-I-to-Stage-II path.
-The diffusion trainer can resume a previous batch-one `last.ckpt` with
-`--resume "$DIFF/last.ckpt"` and `--batch-size 8`. The fixed Stage-II cache is
+The diffusion trainer can resume its own `last.ckpt` with
+`--resume "$DIFF/last.ckpt"`. The fixed Stage-II cache is
 required for physical batches larger than one; its compressed geometry is
 decompressed in the eight data workers. Sparse coordinates carry a frame
 index, so the MinkowskiEngine convolutions process all frames together without

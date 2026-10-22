@@ -12,7 +12,7 @@ from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probabili
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import load_radar_autoencoder
 
 from .sparse_geometry import GRID
-from .sparse_residual import VERSION, SparseResidualStage2
+from .sparse_residual import MODEL_REVISION, VERSION, SparseResidualStage2
 
 
 def sha256(path: Path) -> str:
@@ -46,8 +46,10 @@ def stage1_frame(model, radar: torch.Tensor, radius_m: float) -> dict:
 def load_stage2(path: Path, device: str,
                 *, phase: str = "diffusion") -> tuple[SparseResidualStage2, dict]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved.get("version") != VERSION or saved.get("phase") != phase:
-        raise ValueError(f"Expected {VERSION} {phase} checkpoint")
+    if (saved.get("version") != VERSION
+            or saved.get("model_revision") != MODEL_REVISION
+            or saved.get("phase") != phase):
+        raise ValueError(f"Expected {VERSION}/{MODEL_REVISION} {phase} checkpoint")
     if saved.get("grid") != asdict(GRID):
         raise ValueError("Stage-II checkpoint grid differs from current code")
     model = SparseResidualStage2().to(device)

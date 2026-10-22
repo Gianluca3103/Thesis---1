@@ -16,11 +16,10 @@ from torch.nn import functional as F
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 
-from .sparse_batch import voxelize_means_batched
+from .sparse_batch import voxelize_lidar_features
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
     pool_allowed_probabilities, reconstruction_targets, select_allowed,
-    voxelize_means,
 )
 
 try:
@@ -30,6 +29,7 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
+MODEL_REVISION = "shared_lidar_xyz_reflectivity_v2"
 LATENT_CHANNELS = 32
 
 
@@ -92,7 +92,7 @@ class SharedLidarEncoder(nn.Module):
         super().__init__()
         _require_me()
         self.grid = grid
-        self.stem = SparseConvNorm(3, 16)
+        self.stem = SparseConvNorm(4, 16)
         self.res0 = SparseResidualBlock(16)
         self.down1 = SparseConvNorm(16, 24, stride=(2, 2, 2))
         self.res1 = SparseResidualBlock(24)
@@ -104,18 +104,16 @@ class SharedLidarEncoder(nn.Module):
                                     kernel_size=1)
         self.res4 = SparseResidualBlock(LATENT_CHANNELS)
 
-    def forward(self, points_xyz: torch.Tensor,
+    def forward(self, points: torch.Tensor,
                 latent_coords: torch.Tensor,
                 point_batch_ids: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-        voxel_coords, means = (voxelize_means(points_xyz, grid=self.grid)
-                               if point_batch_ids is None else
-                               voxelize_means_batched(points_xyz, point_batch_ids,
-                                                      grid=self.grid))
+        voxel_coords, means = voxelize_lidar_features(
+            points, point_batch_ids, grid=self.grid)
         if not len(voxel_coords):
-            return (points_xyz.new_zeros((len(latent_coords), LATENT_CHANNELS)),
+            return (points.new_zeros((len(latent_coords), LATENT_CHANNELS)),
                     torch.zeros(len(latent_coords), dtype=torch.bool,
-                                device=points_xyz.device))
+                                device=points.device))
         x = ME.SparseTensor(means.contiguous(), coordinates=voxel_coords.int().contiguous())
         x = self.res0(self.stem(x))
         x = self.res1(self.down1(x))
@@ -323,11 +321,11 @@ class SparseResidualStage2(nn.Module):
         return Stage2Conditions(levels, scores[:, None], pooled,
                                 self.radar_adapter(raw))
 
-    def encode_lidar(self, points_xyz: torch.Tensor,
+    def encode_lidar(self, points: torch.Tensor,
                      conditions: Stage2Conditions,
                      point_batch_ids: torch.Tensor | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.lidar_encoder(points_xyz, conditions.hierarchy[-1],
+        return self.lidar_encoder(points, conditions.hierarchy[-1],
                                   point_batch_ids)
 
     def lpcr_loss(self, latent: torch.Tensor, conditions: Stage2Conditions,
@@ -387,7 +385,7 @@ class SparseResidualStage2(nn.Module):
                 "known_sites": float(known.sum()) / batch_size,
                 "positive_sites": float(occupied.sum()) / batch_size}
 
-    def diffusion_loss(self, faulty_xyz: torch.Tensor, clean_xyz: torch.Tensor,
+    def diffusion_loss(self, faulty_lidar: torch.Tensor, clean_lidar: torch.Tensor,
                        conditions: Stage2Conditions, alpha_bars: torch.Tensor,
                        *, residual_weight: float = 1.0,
                        reconstruction_weight: float = 1.0,
@@ -397,8 +395,8 @@ class SparseResidualStage2(nn.Module):
                        batch_size: int = 1) -> dict:
         with torch.no_grad():
             faulty, faulty_present = self.encode_lidar(
-                faulty_xyz, conditions, faulty_batch_ids)
-            clean, _ = self.encode_lidar(clean_xyz, conditions, clean_batch_ids)
+                faulty_lidar, conditions, faulty_batch_ids)
+            clean, _ = self.encode_lidar(clean_lidar, conditions, clean_batch_ids)
         residual = clean - faulty
         timestep = torch.randint(len(alpha_bars), (batch_size,), device=residual.device,
                                  generator=generator)
@@ -416,19 +414,19 @@ class SparseResidualStage2(nn.Module):
         residual_loss = _frame_mean((residual_hat - residual).square().mean(1),
                                     latent_frame_ids, batch_size)
         reconstruction = self.lpcr_loss(faulty + residual_hat, conditions,
-                                         clean_xyz, batch_size=batch_size)
+                                         clean_lidar[:, :3], batch_size=batch_size)
         total = (noise_loss + residual_weight * residual_loss
                  + reconstruction_weight * reconstruction["loss"])
         return {"loss": total, "noise": noise_loss,
                 "residual": residual_loss, "reconstruction": reconstruction}
 
     @torch.no_grad()
-    def sample(self, faulty_xyz: torch.Tensor, conditions: Stage2Conditions,
+    def sample(self, faulty_lidar: torch.Tensor, conditions: Stage2Conditions,
                alpha_bars: torch.Tensor, *, steps: int = 64,
                occupancy_threshold: float = 0.5) -> dict:
         if steps < 1 or steps > len(alpha_bars):
             raise ValueError("Sampling steps must fit the diffusion schedule")
-        faulty, present = self.encode_lidar(faulty_xyz, conditions)
+        faulty, present = self.encode_lidar(faulty_lidar, conditions)
         residual = torch.randn_like(faulty)
         schedule = torch.linspace(len(alpha_bars) - 1, 0, steps,
                                   device=faulty.device).round().long()
@@ -448,9 +446,9 @@ class SparseResidualStage2(nn.Module):
         probabilities = logits.sigmoid()
         selected = probabilities >= occupancy_threshold
         coords = conditions.hierarchy[0][selected]
-        centers = (faulty_xyz.new_tensor(self.grid.minimum_xyz)
-                   + (coords[:, [3, 2, 1]].to(faulty_xyz.dtype) + 0.5)
-                   * faulty_xyz.new_tensor(self.grid.voxel_xyz))
+        centers = (faulty_lidar.new_tensor(self.grid.minimum_xyz)
+                   + (coords[:, [3, 2, 1]].to(faulty_lidar.dtype) + 0.5)
+                   * faulty_lidar.new_tensor(self.grid.voxel_xyz))
         return {"points_xyz": centers + offsets[selected],
                 "coordinates": coords, "probabilities": probabilities[selected],
                 "allowed_cells": len(conditions.hierarchy[0]),

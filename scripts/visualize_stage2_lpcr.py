@@ -151,7 +151,7 @@ def main() -> None:
     for index in indices:
         row = dataset[index]
         frame_id = row["frame_id"]
-        clean = row["clean_lidar"][:, :3].to(args.device)
+        clean = row["clean_lidar"].to(args.device)
         output, _ = cache.load(frame_id, args.device)
         conditions = model.conditions(output, float(saved["gate_threshold"]))
         if not len(conditions.hierarchy[0]):
@@ -164,7 +164,7 @@ def main() -> None:
         coords = conditions.hierarchy[0][:, [3, 2, 1]].cpu().numpy()
         reconstructed = (minimum + (coords.astype(np.float32) + 0.5) * voxel +
                          offsets.cpu().numpy().astype(np.float32))
-        clean_xyz = clean.cpu().numpy().astype(np.float32)
+        clean_xyz = clean[:, :3].cpu().numpy().astype(np.float32)
         inside = ((clean_xyz >= minimum) & (clean_xyz < maximum)).all(axis=1)
         clean_roi = clean_xyz[inside]
         chosen = scores >= args.occupancy_threshold

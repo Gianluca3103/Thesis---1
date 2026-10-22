@@ -14,7 +14,10 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage1.sparse import encode_keys
-from models.radar_lidar_stage2.fault_data import load_faulty, synthetic_fault
+from models.radar_lidar_stage2.fault_data import (
+    FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
+    load_faulty, severe_fault,
+)
 from models.radar_lidar_stage2.sparse_geometry import GRID, reconstruction_targets
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
@@ -42,7 +45,7 @@ def _roi(points: np.ndarray) -> np.ndarray:
     minimum = np.asarray(GRID.minimum_xyz, dtype=np.float32)
     maximum = np.asarray(GRID.maximum_xyz, dtype=np.float32)
     xyz = points[:, :3].astype(np.float32, copy=False)
-    return xyz[((xyz >= minimum) & (xyz < maximum)).all(axis=1)]
+    return points[((xyz >= minimum) & (xyz < maximum)).all(axis=1)]
 
 
 def _display_subset(points: np.ndarray, limit: int, seed: int) -> np.ndarray:
@@ -54,23 +57,28 @@ def _display_subset(points: np.ndarray, limit: int, seed: int) -> np.ndarray:
 
 
 def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
-    """Match exact XYZ coordinates; synthetic faults retain unmodified points."""
+    """Match exact point rows, including reflectivity when present."""
     if not len(clean):
         return np.empty(0, dtype=bool)
-    clean_xyz = np.ascontiguousarray(clean[:, :3], dtype=np.float32)
-    faulty_xyz = np.ascontiguousarray(faulty[:, :3], dtype=np.float32)
-    point_dtype = np.dtype((np.void, 3 * np.dtype(np.float32).itemsize))
-    return np.isin(clean_xyz.view(point_dtype).reshape(-1),
-                   faulty_xyz.view(point_dtype).reshape(-1))
+    if clean.ndim != 2 or faulty.ndim != 2 or clean.shape[1] != faulty.shape[1]:
+        raise ValueError("Point clouds must have the same feature width")
+    clean_values = np.ascontiguousarray(clean, dtype=np.float32)
+    faulty_values = np.ascontiguousarray(faulty, dtype=np.float32)
+    row_dtype = np.dtype((np.void, clean.shape[1] * np.dtype(np.float32).itemsize))
+    return np.isin(clean_values.view(row_dtype).reshape(-1),
+                   faulty_values.view(row_dtype).reshape(-1))
 
 
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 faulty: np.ndarray, clean: np.ndarray, predicted: np.ndarray,
                 removed: np.ndarray,
                 threshold: float, allowed_cells: int, sampling_steps: int,
-                synthetic: bool, totals: tuple[int, int, int],
-                removed_count: int | None, fault_dropout: float | None,
-                fault_sector_deg: float | None, display_limit: int,
+                fault_type: str, totals: tuple[int, int, int],
+                changed_geometry: int | None,
+                changed_reflectivity: int | None,
+                median_intensity: tuple[float | None, float | None],
+                shared_subset: bool,
+                display_limit: int,
                 metrics: dict | None) -> None:
     clouds = [faulty, clean, predicted]
     nonempty = [cloud for cloud in clouds if len(cloud)]
@@ -86,10 +94,11 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "predicted": np.round(predicted, 3).tolist(),
         "removed": np.round(removed, 3).tolist(),
         "threshold": threshold, "allowed_cells": allowed_cells,
-        "sampling_steps": sampling_steps, "synthetic": synthetic,
-        "totals": totals, "removed_count": removed_count,
-        "fault_dropout": fault_dropout,
-        "fault_sector_deg": fault_sector_deg,
+        "sampling_steps": sampling_steps, "fault_type": fault_type,
+        "totals": totals, "changed_geometry": changed_geometry,
+        "changed_reflectivity": changed_reflectivity,
+        "median_intensity": median_intensity,
+        "shared_subset": shared_subset,
         "display_limit": display_limit,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
@@ -110,16 +119,17 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
 <div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#f450d5">●</span> clean points removed by the synthetic fault &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#f450d5">●</span> clean points changed in XYZ or reflectivity &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent);
-document.getElementById('title').textContent=`${d.split} frame ${d.frame} · diffusion epoch ${d.epoch}`;
-document.getElementById('note').textContent=d.synthetic?`Synthetic fault from the checkpoint: ${(100*d.fault_dropout).toFixed(0)}% random point dropout plus a ${d.fault_sector_deg.toFixed(1)}° missing azimuth sector. The sector is selected around the full circle, so it may fall outside this forward ROI. The model receives faulty LiDAR and radar features; clean LiDAR is the reference.`:'The model receives real faulty LiDAR and radar features. No clean LiDAR reference was loaded.';
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in the Stage II ROI. ${d.removed_count===null?'Removed-point count unavailable for real faulty LiDAR':`${d.removed_count.toLocaleString()} clean points removed by the synthetic fault (${(100*d.removed_count/Math.max(1,d.totals[1])).toFixed(1)}%)`}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.synthetic?'Faulty and clean panels share the same sampled clean points for a direct comparison.':''}`;
+document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
+const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'The established fog simulator at severity 5 changes ranges and intensities on the full raw scan before the forward crop.',real:'Pre-aligned real faulty LiDAR was loaded.'};
+document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in the Stage II ROI. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels share the same sampled clean points.':'Fog and clean panels are sampled separately to include shifted fog returns.'}`;
 if(d.metrics){const p=document.createElement('p');p.textContent=`Sampled reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
-const names=['Faulty LiDAR input',d.synthetic?'Clean LiDAR reference + removed points':'Clean LiDAR reference','Stage II reconstruction','Clean + reconstruction'];if(d.synthetic)names.push('Faulty input + removed points');const panes=document.getElementById('panels'),canvases=[],headings=[];
+const names=['Faulty LiDAR input',d.changed_geometry===null?'Clean LiDAR reference':'Clean LiDAR reference + changed points','Stage II reconstruction','Clean + reconstruction'];if(d.changed_geometry!==null)names.push('Faulty input + changed clean points');const panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
@@ -144,6 +154,10 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path,
                         help="Pre-aligned N×4 float32 .bin files; omit for synthetic faults")
+    parser.add_argument("--fault-cache-root", type=Path,
+                        help="Severe fog cache used by the diffusion training run")
+    parser.add_argument("--fault-type", choices=("auto", *FAULT_NAMES), default="auto",
+                        help="Force one severe fault in every selected preview frame")
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--stage2-cache-root", type=Path,
                         help="Reuse the fixed Stage-I outputs from Stage-II training")
@@ -161,8 +175,10 @@ def main() -> None:
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.limit < 1 or args.sampling_steps < 1 or args.display_limit < 1 or
             not 0 < args.occupancy_threshold < 1 or
-            args.split == "test" and args.faulty_root is None):
-        parser.error("Inference requires CUDA and real faulty LiDAR for the test split")
+            (args.split == "test" and args.faulty_root is None) or
+            (args.faulty_root is None and args.fault_cache_root is None) or
+            (args.faulty_root is not None and args.fault_type != "auto")):
+        parser.error("Inference requires CUDA, a severe fog cache for synthetic faults, and real faulty LiDAR for test")
     if args.stage2_cache_root:
         saved1 = torch.load(args.stage1_checkpoint, map_location="cpu",
                             weights_only=False)
@@ -173,6 +189,10 @@ def main() -> None:
         stage1, saved1 = load_stage1(args.stage1_checkpoint, args.device,
                                       args.radar_variant)
     model, saved2 = load_stage2(args.stage2_checkpoint, args.device)
+    if (saved2.get("fault_policy_version") != FAULT_POLICY_VERSION
+            or tuple(tuple(item) for item in saved2.get("fault_plan", ()))
+            != FAULT_PLAN):
+        raise ValueError("This diffusion checkpoint used the old random-dropout fault policy; retrain diffusion with the severe fault plan")
     if (saved2["stage1_sha256"] != sha256(args.stage1_checkpoint)
             or saved2["radar_variant"] != args.radar_variant):
         raise ValueError("Stage-II checkpoint was trained with a different Stage I")
@@ -180,6 +200,10 @@ def main() -> None:
                              include_clean=args.faulty_root is None,
                              data_cache_root=(args.data_cache_root
                                               if args.faulty_root is None else None))
+    fog_cache = (SevereFogCache(args.fault_cache_root, args.split,
+                                [frame.frame_id for frame in dataset.frames],
+                                seed=int(saved2["fault_seed"]))
+                 if args.faulty_root is None else None)
     cache = None
     if args.stage2_cache_root:
         expected = cache_identity(args.stage1_checkpoint, args.vod_root,
@@ -207,13 +231,14 @@ def main() -> None:
         if not len(conditions.hierarchy[0]):
             print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
             continue
-        faulty = (load_faulty(args.faulty_root, args.split, frame_id)
-                  if args.faulty_root else synthetic_fault(
-                      row["clean_lidar"], frame_id, 0,
-                      seed=int(saved2["fault_seed"]),
-                      dropout=float(saved2["fault_dropout"]),
-                      sector_deg=float(saved2["fault_sector_deg"])))
-        faulty = faulty[:, :3].to(args.device)
+        if args.faulty_root:
+            faulty, fault_type = load_faulty(args.faulty_root, args.split, frame_id), "real"
+        else:
+            faulty, fault_type = severe_fault(
+                row["clean_lidar"], frame_id, 0, fog_cache,
+                seed=int(saved2["fault_seed"]),
+                fault_type=None if args.fault_type == "auto" else args.fault_type)
+        faulty = faulty.to(args.device)
         seed = int.from_bytes(hashlib.sha256(
             f"{args.random_seed}:{frame_id}".encode()).digest()[:8], "little")
         torch.manual_seed(seed)
@@ -226,33 +251,48 @@ def main() -> None:
         clean_roi = (_roi(row["clean_lidar"].numpy())
                      if "clean_lidar" in row else np.empty((0, 3), dtype=np.float32))
         synthetic = args.faulty_root is None
-        removed_count = None
+        shared_subset = fault_type in ("total_loss", "fov_filter")
+        changed_geometry = changed_reflectivity = None
         if synthetic:
             kept = _present_in_faulty(clean_roi, faulty_roi)
-            removed_count = int((~kept).sum())
+            xyz_kept = _present_in_faulty(clean_roi[:, :3], faulty_roi[:, :3])
+            changed_geometry = int((~xyz_kept).sum())
+            changed_reflectivity = int((xyz_kept & ~kept).sum())
         clean_display = _display_subset(clean_roi, args.display_limit, seed + 2)
-        if synthetic:
+        if shared_subset:
             display_kept = _present_in_faulty(clean_display, faulty_roi)
-            faulty_display = clean_display[display_kept]
-            removed_display = clean_display[~display_kept]
+            faulty_display = clean_display[display_kept, :3]
+            removed_display = clean_display[~display_kept, :3]
         else:
             faulty_display = _display_subset(faulty_roi, args.display_limit,
-                                             seed + 1)
-            removed_display = np.empty((0, 3), dtype=np.float32)
-        stem_name = (f"{frame_id}_stage2_epoch_{saved2['epoch']:03d}"
+                                             seed + 1)[:, :3]
+            removed_display = (clean_display[~_present_in_faulty(
+                clean_display, faulty_roi), :3] if synthetic
+                else np.empty((0, 3), dtype=np.float32))
+        median_intensity = (
+            float(np.median(clean_roi[:, 3])) if len(clean_roi) else None,
+            float(np.median(faulty_roi[:, 3])) if len(faulty_roi) else None)
+        stem_name = (f"{frame_id}_{fault_type}_stage2_epoch_{saved2['epoch']:03d}"
                      if args.html else f"{frame_id}_stage2")
         stem = args.output_root / stem_name
         _write_ply(stem.with_suffix(".ply"), xyz, scores)
         np.savez_compressed(stem.with_suffix(".npz"), xyz=xyz,
                             probability=scores,
                             coordinates=predicted["coordinates"].cpu().numpy(),
-                            faulty_xyz=faulty_roi, clean_xyz=clean_roi)
+                            faulty_xyz=faulty_roi[:, :3], clean_xyz=clean_roi[:, :3],
+                            faulty_reflectivity=faulty_roi[:, 3],
+                            clean_reflectivity=clean_roi[:, 3],
+                            fault_type=np.asarray(fault_type))
         stats = {"frame_id": frame_id, "epoch": int(saved2["epoch"]),
+                 "fault_type": fault_type,
                  "allowed_cells": predicted["allowed_cells"],
                  "reconstructed_points": predicted["predicted_cells"],
                  "faulty_input_points": len(faulty_roi),
                  "clean_reference_points": len(clean_roi),
-                 "synthetic_removed_points": removed_count}
+                 "clean_points_absent_or_shifted": changed_geometry,
+                 "clean_points_reflectivity_changed": changed_reflectivity,
+                 "median_clean_reflectivity": median_intensity[0],
+                 "median_faulty_reflectivity": median_intensity[1]}
         metrics = None
         if "clean_lidar" in row:
             if targets is None:
@@ -278,20 +318,19 @@ def main() -> None:
             viewer = stem.with_suffix(".html")
             _write_html(viewer, frame_id=frame_id, epoch=int(saved2["epoch"]),
                         split=args.split,
-                        faulty=faulty_display, clean=clean_display,
+                        faulty=faulty_display, clean=clean_display[:, :3],
                         predicted=_display_subset(xyz, args.display_limit,
                                                   seed + 3),
                         removed=removed_display,
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
                         sampling_steps=args.sampling_steps,
-                        synthetic=synthetic,
+                        fault_type=fault_type,
                         totals=(len(faulty_roi), len(clean_roi), len(xyz)),
-                        removed_count=removed_count,
-                        fault_dropout=(float(saved2["fault_dropout"])
-                                       if synthetic else None),
-                        fault_sector_deg=(float(saved2["fault_sector_deg"])
-                                          if synthetic else None),
+                        changed_geometry=changed_geometry,
+                        changed_reflectivity=changed_reflectivity,
+                        median_intensity=median_intensity,
+                        shared_subset=shared_subset,
                         display_limit=args.display_limit, metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)
@@ -303,10 +342,11 @@ def main() -> None:
     if args.html:
         links = "\n".join(
             f'<li><a target="viewer" href="{html.escape(item["viewer"])}">'
-            f'Frame {html.escape(item["frame_id"])} · epoch {item["epoch"]}</a> · '
+            f'Frame {html.escape(item["frame_id"])} · {html.escape(item["fault_type"])} · epoch {item["epoch"]}</a> · '
             f'{item["reconstructed_points"]:,} reconstructed'
-            + (f'; {item["synthetic_removed_points"]:,} removed'
-               if item["synthetic_removed_points"] is not None else '')
+            + (f'; {item["clean_points_absent_or_shifted"]:,} XYZ changed, '
+               f'{item["clean_points_reflectivity_changed"]:,} reflectivity changed'
+               if item["clean_points_absent_or_shifted"] is not None else '')
             + '</li>'
             for item in summary)
         first = html.escape(summary[0]["viewer"])
