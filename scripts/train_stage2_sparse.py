@@ -134,9 +134,11 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             if args.phase == "lpcr":
                 latent, _ = model.encode_lidar(clean, conditions, clean_batch_ids)
                 result = model.lpcr_loss(latent, conditions, clean[:, :3],
+                                         clean_batch_ids=clean_batch_ids,
                                          batch_size=batch_size)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "offset", "iou_known",
+                          ("loss", "occupancy", "count", "point_nll",
+                           "count_mae", "target_points", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
             else:
@@ -172,6 +174,10 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 values = {"loss": result["loss"], "noise": result["noise"],
                           "residual": result["residual"],
                           "reconstruction": reconstruction["loss"],
+                          "count": reconstruction["count"],
+                          "point_nll": reconstruction["point_nll"],
+                          "count_mae": reconstruction["count_mae"],
+                          "target_points": reconstruction["target_points"],
                           "iou_known": reconstruction["iou_known"],
                           "iou_full": reconstruction["iou_full"],
                           "gate_coverage": reconstruction["gate_coverage"],
@@ -368,6 +374,7 @@ def main() -> None:
             _atomic_save(args.output_root / "best.ckpt", payload)
         print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
               f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
+              f"point-count MAE={val['count_mae']:.2f}, "
               f"gate coverage={val['gate_coverage']:.4f}, "
               f"train faults={train['fault_counts']}", flush=True)
 

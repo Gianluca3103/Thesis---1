@@ -50,7 +50,8 @@ def _display_subset(xyz: np.ndarray, scores: np.ndarray | None, limit: int,
 
 def _write_html(path: Path, frame_id: str, split: str, epoch: int, clean: np.ndarray,
                 reconstructed: np.ndarray, scores: np.ndarray,
-                threshold: float, clean_total: int, candidate_total: int) -> None:
+                threshold: float, clean_total: int, allowed_cells: int,
+                candidate_total: int) -> None:
     all_xyz = np.concatenate((clean, reconstructed), axis=0)
     if len(all_xyz):
         minimum, maximum = all_xyz.min(0).tolist(), all_xyz.max(0).tolist()
@@ -62,7 +63,7 @@ def _write_html(path: Path, frame_id: str, split: str, epoch: int, clean: np.nda
         "reconstructed": np.round(reconstructed, 3).tolist(),
         "scores": np.round(scores, 4).tolist(),
         "threshold": threshold, "clean_total": clean_total,
-        "candidate_total": candidate_total,
+        "allowed_cells": allowed_cells, "candidate_total": candidate_total,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
     markup = r'''<!doctype html>
@@ -91,7 +92,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${data.split} frame ${data.frame} · LPCR epoch ${data.epoch}`;
-document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.candidate_total.toLocaleString()} radar-allowed cells. The browser displays ${data.clean.length.toLocaleString()} clean points and ${data.reconstructed.length.toLocaleString()} candidate reconstructions (sampled if needed).`;
+document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.allowed_cells.toLocaleString()} radar-allowed cells; ${data.candidate_total.toLocaleString()} candidate LPCR points. Multiple points can occupy each allowed voxel. The browser displays ${data.clean.length.toLocaleString()} clean points and ${data.reconstructed.length.toLocaleString()} candidate reconstructions (sampled if needed).`;
 const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.value=data.threshold;value.textContent=Number(slider.value).toFixed(2);
 const names=['Clean LiDAR','LPCR reconstruction','Overlay'],panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -123,10 +124,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--occupancy-threshold", type=float, default=0.5)
+    parser.add_argument("--max-points-per-voxel", type=int, default=512)
     parser.add_argument("--display-limit", type=int, default=40000)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.limit < 1 or args.display_limit < 1 or
+            args.max_points_per_voxel < 1 or
             not 0 < args.occupancy_threshold < 1):
         parser.error("Limit and display limit must be positive; threshold must be in (0,1)")
     model, saved = load_stage2(args.lpcr_checkpoint, args.device, phase="lpcr")
@@ -147,7 +150,6 @@ def main() -> None:
     summary = []
     minimum = np.asarray(GRID.minimum_xyz, dtype=np.float32)
     maximum = np.asarray(GRID.maximum_xyz, dtype=np.float32)
-    voxel = np.asarray(GRID.voxel_xyz, dtype=np.float32)
     for index in indices:
         row = dataset[index]
         frame_id = row["frame_id"]
@@ -158,12 +160,14 @@ def main() -> None:
             print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
             continue
         latent, _ = model.encode_lidar(clean, conditions)
-        logits, offsets = model.lpcr(latent, conditions.hierarchy,
-                                      conditions.fine_probabilities)
-        scores = torch.sigmoid(logits).cpu().numpy().astype(np.float32)
+        logits, log_count, hidden = model.lpcr(
+            latent, conditions.hierarchy, conditions.fine_probabilities)
+        generated = model.lpcr.emit_points(
+            hidden, conditions.hierarchy[0], logits, log_count, 0.0,
+            args.max_points_per_voxel)
+        scores = generated["probabilities"].cpu().numpy().astype(np.float32)
         coords = conditions.hierarchy[0][:, [3, 2, 1]].cpu().numpy()
-        reconstructed = (minimum + (coords.astype(np.float32) + 0.5) * voxel +
-                         offsets.cpu().numpy().astype(np.float32))
+        reconstructed = generated["points_xyz"].cpu().numpy().astype(np.float32)
         clean_xyz = clean[:, :3].cpu().numpy().astype(np.float32)
         inside = ((clean_xyz >= minimum) & (clean_xyz < maximum)).all(axis=1)
         clean_roi = clean_xyz[inside]
@@ -174,7 +178,9 @@ def main() -> None:
                    reconstructed[chosen], scores[chosen])
         np.savez_compressed(stem.with_suffix(".npz"), clean_xyz=clean_roi,
                             candidate_xyz=reconstructed, occupancy_probability=scores,
-                            allowed_coordinates=coords)
+                            allowed_coordinates=coords,
+                            point_counts=generated["point_counts"].cpu().numpy(),
+                            point_coordinates=generated["coordinates"].cpu().numpy())
         clean_display, _ = _display_subset(clean_roi, None, args.display_limit,
                                             args.random_seed + index)
         predicted_display, display_scores = _display_subset(
@@ -182,9 +188,10 @@ def main() -> None:
         viewer = stem.with_suffix(".html")
         _write_html(viewer, frame_id, args.split, int(saved["epoch"]), clean_display,
                     predicted_display, display_scores, args.occupancy_threshold,
-                    len(clean_roi), len(reconstructed))
+                    len(clean_roi), len(coords), len(reconstructed))
         stats = {"frame_id": frame_id, "clean_roi_points": len(clean_roi),
-                 "allowed_cells": len(reconstructed),
+                 "allowed_cells": len(coords),
+                 "predicted_occupied_cells": int((logits.sigmoid() >= args.occupancy_threshold).sum()),
                  "reconstructed_points": int(chosen.sum()),
                  "viewer": viewer.name}
         summary.append(stats)

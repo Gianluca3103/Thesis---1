@@ -27,6 +27,9 @@ def main() -> None:
     xyz = torch.rand((320, 3), device=device)
     xyz = xyz * xyz.new_tensor((3.0, 3.0, 1.5)) + xyz.new_tensor(
         (8.0, -1.5, -0.75))
+    xyz[:3] = xyz.new_tensor([[8.01, -1.49, -0.74],
+                              [8.04, -1.47, -0.72],
+                              [8.08, -1.43, -0.69]])
     clean = torch.cat((xyz, torch.rand((320, 1), device=device) * 255), dim=1)
     faulty = clean[::3]
     occupied, _ = voxelize_means(clean)
@@ -59,9 +62,12 @@ def main() -> None:
             raise AssertionError("Shared LiDAR encoder ignored reflectivity")
     first = model.lpcr_loss(latent, conditions, clean[:, :3])
     first["loss"].backward()
-    lpcr_grad = model.lpcr.occupancy.weight.grad
-    if lpcr_grad is None or not torch.isfinite(lpcr_grad).all():
-        raise AssertionError("LPCR occupancy gradient is missing or invalid")
+    for name, layer in (("occupancy", model.lpcr.occupancy),
+                        ("count", model.lpcr.log_count),
+                        ("point density", model.lpcr.point_density)):
+        grad = layer.weight.grad
+        if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
+            raise AssertionError(f"LPCR {name} gradient is missing or invalid")
     model.zero_grad(set_to_none=True)
     model.lidar_encoder.requires_grad_(False)
     model.lpcr.requires_grad_(False)
@@ -77,6 +83,15 @@ def main() -> None:
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
+    if (sampled["predicted_points"] < sampled["predicted_cells"]
+            or sampled["predicted_points"] != len(sampled["points_xyz"])):
+        raise AssertionError("Variable-cardinality point emission is inconsistent")
+    if len(sampled["points_xyz"]):
+        minimum = sampled["points_xyz"].new_tensor(GRID.minimum_xyz)
+        size = sampled["points_xyz"].new_tensor(GRID.voxel_xyz)
+        ijk = torch.floor((sampled["points_xyz"] - minimum) / size).long()
+        if not torch.equal(ijk[:, [2, 1, 0]], sampled["coordinates"][:, 1:]):
+            raise AssertionError("A generated point escaped its allowed voxel")
     total_loss = model.diffusion_loss(
         clean[:0], clean, conditions, cosine_alpha_bars(16, device=device))
     if not torch.isfinite(total_loss["loss"]):

@@ -72,7 +72,8 @@ def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 faulty: np.ndarray, clean: np.ndarray, predicted: np.ndarray,
                 removed: np.ndarray,
-                threshold: float, allowed_cells: int, sampling_steps: int,
+                threshold: float, allowed_cells: int, predicted_cells: int,
+                sampling_steps: int,
                 fault_type: str, totals: tuple[int, int, int],
                 changed_geometry: int | None,
                 changed_reflectivity: int | None,
@@ -94,6 +95,7 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "predicted": np.round(predicted, 3).tolist(),
         "removed": np.round(removed, 3).tolist(),
         "threshold": threshold, "allowed_cells": allowed_cells,
+        "predicted_cells": predicted_cells,
         "sampling_steps": sampling_steps, "fault_type": fault_type,
         "totals": totals, "changed_geometry": changed_geometry,
         "changed_reflectivity": changed_reflectivity,
@@ -127,7 +129,7 @@ const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'The established fog simulator at severity 5 changes ranges and intensities on the full raw scan before the forward crop.',real:'Pre-aligned real faulty LiDAR was loaded.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in the Stage II ROI. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels share the same sampled clean points.':'Fog and clean panels are sampled separately to include shifted fog returns.'}`;
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels share the same sampled clean points.':'Fog and clean panels are sampled separately to include shifted fog returns.'}`;
 if(d.metrics){const p=document.createElement('p');p.textContent=`Sampled reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
 const names=['Faulty LiDAR input',d.changed_geometry===null?'Clean LiDAR reference':'Clean LiDAR reference + changed points','Stage II reconstruction','Clean + reconstruction'];if(d.changed_geometry!==null)names.push('Faulty input + changed clean points');const panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -167,6 +169,8 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--sampling-steps", type=int, default=64)
     parser.add_argument("--occupancy-threshold", type=float, default=0.5)
+    parser.add_argument("--max-points-per-voxel", type=int, default=512,
+                        help="Inference safety cap; multiple points are emitted per voxel")
     parser.add_argument("--html", action="store_true",
                         help="Write an interactive faulty/clean/reconstruction comparison")
     parser.add_argument("--display-limit", type=int, default=40000)
@@ -174,6 +178,7 @@ def main() -> None:
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.limit < 1 or args.sampling_steps < 1 or args.display_limit < 1 or
+            args.max_points_per_voxel < 1 or
             not 0 < args.occupancy_threshold < 1 or
             (args.split == "test" and args.faulty_root is None) or
             (args.faulty_root is None and args.fault_cache_root is None) or
@@ -244,7 +249,8 @@ def main() -> None:
         torch.manual_seed(seed)
         predicted = model.sample(faulty, conditions, alpha_bars,
                                  steps=args.sampling_steps,
-                                 occupancy_threshold=args.occupancy_threshold)
+                                 occupancy_threshold=args.occupancy_threshold,
+                                 max_points_per_voxel=args.max_points_per_voxel)
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())
@@ -279,6 +285,9 @@ def main() -> None:
         np.savez_compressed(stem.with_suffix(".npz"), xyz=xyz,
                             probability=scores,
                             coordinates=predicted["coordinates"].cpu().numpy(),
+                            occupied_coordinates=predicted[
+                                "occupied_coordinates"].cpu().numpy(),
+                            point_counts=predicted["point_counts"].cpu().numpy(),
                             faulty_xyz=faulty_roi[:, :3], clean_xyz=clean_roi[:, :3],
                             faulty_reflectivity=faulty_roi[:, 3],
                             clean_reflectivity=clean_roi[:, 3],
@@ -286,7 +295,11 @@ def main() -> None:
         stats = {"frame_id": frame_id, "epoch": int(saved2["epoch"]),
                  "fault_type": fault_type,
                  "allowed_cells": predicted["allowed_cells"],
-                 "reconstructed_points": predicted["predicted_cells"],
+                 "predicted_occupied_cells": predicted["predicted_cells"],
+                 "reconstructed_points": predicted["predicted_points"],
+                 "max_points_in_one_predicted_cell": (
+                     int(predicted["point_counts"].max())
+                     if predicted["predicted_cells"] else 0),
                  "faulty_input_points": len(faulty_roi),
                  "clean_reference_points": len(clean_roi),
                  "clean_points_absent_or_shifted": changed_geometry,
@@ -301,7 +314,7 @@ def main() -> None:
                                                  conditions.hierarchy[0])
             occupied, known_free, _, coverage = targets
             allowed_keys = encode_keys(conditions.hierarchy[0], GRID.shape_zyx)
-            chosen_keys = encode_keys(predicted["coordinates"], GRID.shape_zyx)
+            chosen_keys = encode_keys(predicted["occupied_coordinates"], GRID.shape_zyx)
             chosen_positions = torch.searchsorted(allowed_keys, chosen_keys)
             selected = torch.zeros(len(allowed_keys), dtype=torch.bool,
                                    device=args.device)
@@ -324,6 +337,7 @@ def main() -> None:
                         removed=removed_display,
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
+                        predicted_cells=predicted["predicted_cells"],
                         sampling_steps=args.sampling_steps,
                         fault_type=fault_type,
                         totals=(len(faulty_roi), len(clean_roi), len(xyz)),

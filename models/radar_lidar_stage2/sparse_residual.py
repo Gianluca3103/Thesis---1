@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 
+from .point_distribution import points_on_allowed
 from .sparse_batch import voxelize_lidar_features
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
@@ -29,8 +30,10 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "shared_lidar_xyz_reflectivity_v2"
+MODEL_REVISION = "stage2_variable_point_density_v3"
 LATENT_CHANNELS = 32
+POINT_MIXTURES = 8
+MAX_INFERENCE_POINTS_PER_VOXEL = 512
 
 
 def _require_me() -> None:
@@ -92,7 +95,7 @@ class SharedLidarEncoder(nn.Module):
         super().__init__()
         _require_me()
         self.grid = grid
-        self.stem = SparseConvNorm(4, 16)
+        self.stem = SparseConvNorm(8, 16)
         self.res0 = SparseResidualBlock(16)
         self.down1 = SparseConvNorm(16, 24, stride=(2, 2, 2))
         self.res1 = SparseResidualBlock(24)
@@ -165,7 +168,8 @@ class AllowedSiteLPCR(nn.Module):
         self.level1 = _ActiveRefine(32 + 7, 24)
         self.level0 = _ActiveRefine(24 + 7, 16)
         self.occupancy = nn.Linear(16, 1)
-        self.offset = nn.Linear(16, 3)
+        self.log_count = nn.Linear(16, 1)
+        self.point_density = nn.Linear(16, POINT_MIXTURES * 7)
 
     @staticmethod
     def _site_features(coords: torch.Tensor, shape: tuple[int, int, int],
@@ -180,7 +184,7 @@ class AllowedSiteLPCR(nn.Module):
     def forward(self, latent_features: torch.Tensor,
                 hierarchy: tuple[torch.Tensor, ...],
                 fine_probabilities: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(hierarchy) != 5 or len(latent_features) != len(hierarchy[4]):
             raise ValueError("LPCR requires the five R2LDM active coordinate levels")
         if fine_probabilities.shape != (len(hierarchy[0]), 1):
@@ -205,8 +209,79 @@ class AllowedSiteLPCR(nn.Module):
                                         ratio, pooled[level])
             hidden = block(hierarchy[level], torch.cat((hidden, site), 1),
                            self.grid.shape_at(level))
-        half_cell = hidden.new_tensor(self.grid.voxel_xyz) * 0.5
-        return self.occupancy(hidden)[:, 0], torch.tanh(self.offset(hidden)) * half_cell
+        return self.occupancy(hidden)[:, 0], self.log_count(hidden)[:, 0], hidden
+
+    def density_parameters(self, hidden: torch.Tensor
+                           ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw = self.point_density(hidden).reshape(-1, POINT_MIXTURES, 7)
+        return raw[:, :, 0], raw[:, :, 1:4], raw[:, :, 4:7].clamp(-3.0, 1.0)
+
+    def point_nll(self, hidden: torch.Tensor, site_index: torch.Tensor,
+                  local_xyz: torch.Tensor, counts: torch.Tensor,
+                  frame_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Permutation-invariant likelihood for every measured point in A."""
+        if not len(site_index):
+            return hidden.sum() * 0
+        occupied = torch.where(counts > 0)[0]
+        logits, means, log_scales = self.density_parameters(hidden[occupied])
+        local_index = torch.searchsorted(occupied, site_index)
+        target = torch.atanh(local_xyz.clamp(-0.999, 0.999))
+        delta = (target[:, None, :] - means[local_index]) / log_scales[
+            local_index].exp()
+        component = (-0.5 * delta.square().sum(2)
+                     - log_scales[local_index].sum(2)
+                     - 1.5 * math.log(2 * math.pi))
+        nll = -torch.logsumexp(
+            F.log_softmax(logits[local_index], dim=1) + component, dim=1)
+        per_site = hidden.new_zeros(len(hidden))
+        per_site.index_add_(0, site_index, nll)
+        return _frame_mean(per_site[occupied] / counts[occupied],
+                           frame_ids[occupied], batch_size)
+
+    @torch.no_grad()
+    def emit_points(self, hidden: torch.Tensor, coords: torch.Tensor,
+                    occupancy_logits: torch.Tensor, log_count: torch.Tensor,
+                    occupancy_threshold: float,
+                    max_points_per_voxel: int = MAX_INFERENCE_POINTS_PER_VOXEL
+                    ) -> dict:
+        if max_points_per_voxel < 1:
+            raise ValueError("Maximum inference points per voxel must be positive")
+        probabilities = occupancy_logits.sigmoid()
+        selected = probabilities >= occupancy_threshold
+        chosen = torch.where(selected)[0]
+        counts = torch.expm1(log_count[chosen].clamp(
+            min=0, max=math.log1p(max_points_per_voxel))).round().long()
+        counts = counts.clamp(min=1, max=max_points_per_voxel)
+        if not len(chosen):
+            return {"points_xyz": hidden.new_empty((0, 3)),
+                    "coordinates": coords.new_empty((0, 4)),
+                    "occupied_coordinates": coords.new_empty((0, 4)),
+                    "probabilities": hidden.new_empty(0),
+                    "point_counts": counts,
+                    "allowed_cells": len(coords), "predicted_cells": 0,
+                    "predicted_points": 0}
+        logits, means, log_scales = self.density_parameters(hidden[chosen])
+        local_sites = torch.repeat_interleave(
+            torch.arange(len(chosen), device=hidden.device), counts)
+        mixtures = torch.multinomial(
+            F.softmax(logits[local_sites], dim=1), 1)[:, 0]
+        centers = (hidden.new_tensor(self.grid.minimum_xyz)
+                   + (coords[chosen[local_sites]][:, [3, 2, 1]].to(hidden.dtype) + 0.5)
+                   * hidden.new_tensor(self.grid.voxel_xyz))
+        offsets = torch.tanh(
+            means[local_sites, mixtures]
+            + log_scales[local_sites, mixtures].exp()
+            * torch.randn((len(local_sites), 3), device=hidden.device,
+                          dtype=hidden.dtype)).clamp(-0.9999, 0.9999)
+        points = centers + offsets * hidden.new_tensor(self.grid.voxel_xyz) * 0.5
+        return {"points_xyz": points,
+                "coordinates": coords[chosen[local_sites]],
+                "occupied_coordinates": coords[chosen],
+                "probabilities": probabilities[chosen[local_sites]],
+                "point_counts": counts,
+                "allowed_cells": len(coords),
+                "predicted_cells": len(chosen),
+                "predicted_points": len(local_sites)}
 
 
 class SparseResidualUNet(nn.Module):
@@ -330,40 +405,50 @@ class SparseResidualStage2(nn.Module):
 
     def lpcr_loss(self, latent: torch.Tensor, conditions: Stage2Conditions,
                   clean_xyz: torch.Tensor,
-                  offset_weight: float = 0.04,
+                  point_weight: float = 0.04,
+                  count_weight: float = 0.1,
+                  clean_batch_ids: torch.Tensor | None = None,
                   batch_size: int = 1) -> dict[str, torch.Tensor | float]:
-        logits, offsets = self.lpcr(latent, conditions.hierarchy,
-                                    conditions.fine_probabilities)
+        logits, log_count, hidden = self.lpcr(
+            latent, conditions.hierarchy, conditions.fine_probabilities)
         occupied, known_free, target_offsets, coverage = (
             conditions.cached_targets if conditions.cached_targets is not None
             else reconstruction_targets(clean_xyz, conditions.hierarchy[0], grid=self.grid))
         if (occupied.shape != logits.shape or known_free.shape != logits.shape
-                or target_offsets.shape != offsets.shape
+                or target_offsets.shape != (len(logits), 3)
                 or bool((occupied & known_free).any())):
             raise ValueError("LPCR labels differ from the radar-selected active cells")
         if not len(logits):
             zero = latent.sum() * 0
-            return {"loss": zero, "occupancy": zero, "offset": zero,
+            return {"loss": zero, "occupancy": zero, "count": zero,
+                    "point_nll": zero, "count_mae": 0.0, "target_points": 0.0,
                     "iou_known": 0.0, "iou_full": 0.0,
                     "gate_coverage": coverage, "known_sites": 0,
                     "positive_sites": 0}
+        site_index, local_xyz, counts = points_on_allowed(
+            clean_xyz, conditions.hierarchy[0], clean_batch_ids, grid=self.grid)
+        if not torch.equal(counts > 0, occupied):
+            raise ValueError("Clean point multiplicity differs from cached occupancy")
         known = occupied | known_free
+        frame_ids = conditions.hierarchy[0][:, 0].long()
         if batch_size == 1:
             occ = (F.binary_cross_entropy_with_logits(logits[known],
                                                       occupied[known].to(logits.dtype))
                    if bool(known.any()) else logits.sum() * 0)
-            offset = (F.l1_loss(offsets[occupied], target_offsets[occupied])
-                      if bool(occupied.any()) else offsets.sum() * 0)
+            count = (F.smooth_l1_loss(log_count[occupied],
+                                      torch.log1p(counts[occupied].to(log_count.dtype)))
+                     if bool(occupied.any()) else log_count.sum() * 0)
         else:
-            frame_ids = conditions.hierarchy[0][:, 0].long()
             occ = _frame_mean(
                 F.binary_cross_entropy_with_logits(logits[known],
                                                    occupied[known].to(logits.dtype),
                                                    reduction="none"),
                 frame_ids[known], batch_size) + logits.sum() * 0
-            offset = _frame_mean(
-                (offsets[occupied] - target_offsets[occupied]).abs().mean(1),
-                frame_ids[occupied], batch_size) + offsets.sum() * 0
+            count = _frame_mean(F.smooth_l1_loss(
+                log_count[occupied], torch.log1p(counts[occupied].to(log_count.dtype)),
+                reduction="none"), frame_ids[occupied], batch_size) + log_count.sum() * 0
+        point_nll = self.lpcr.point_nll(
+            hidden, site_index, local_xyz, counts, frame_ids, batch_size)
         with torch.no_grad():
             predicted = torch.sigmoid(logits) >= 0.5
             intersection = predicted & occupied
@@ -373,13 +458,18 @@ class SparseResidualStage2(nn.Module):
                 iou_known = float(intersection.sum() / known_union.sum().clamp_min(1))
                 iou_full = float(intersection.sum() / full_union.sum().clamp_min(1))
             else:
-                frame_ids = conditions.hierarchy[0][:, 0].long()
                 sums = [torch.bincount(frame_ids[mask], minlength=batch_size)
                         for mask in (intersection, known_union, full_union)]
                 iou_known = float((sums[0] / sums[1].clamp_min(1)).float().mean())
                 iou_full = float((sums[0] / sums[2].clamp_min(1)).float().mean())
-        return {"loss": occ + offset_weight * offset, "occupancy": occ,
-                "offset": offset,
+            predicted_count = torch.expm1(log_count[occupied].clamp(
+                min=0, max=math.log1p(MAX_INFERENCE_POINTS_PER_VOXEL))).round()
+            count_mae = (float((predicted_count - counts[occupied]).abs().float().mean())
+                         if bool(occupied.any()) else 0.0)
+        return {"loss": occ + count_weight * count + point_weight * point_nll,
+                "occupancy": occ, "count": count, "point_nll": point_nll,
+                "count_mae": count_mae,
+                "target_points": float(len(site_index)) / batch_size,
                 "iou_known": iou_known, "iou_full": iou_full,
                 "gate_coverage": coverage,
                 "known_sites": float(known.sum()) / batch_size,
@@ -414,7 +504,9 @@ class SparseResidualStage2(nn.Module):
         residual_loss = _frame_mean((residual_hat - residual).square().mean(1),
                                     latent_frame_ids, batch_size)
         reconstruction = self.lpcr_loss(faulty + residual_hat, conditions,
-                                         clean_lidar[:, :3], batch_size=batch_size)
+                                         clean_lidar[:, :3],
+                                         clean_batch_ids=clean_batch_ids,
+                                         batch_size=batch_size)
         total = (noise_loss + residual_weight * residual_loss
                  + reconstruction_weight * reconstruction["loss"])
         return {"loss": total, "noise": noise_loss,
@@ -423,7 +515,8 @@ class SparseResidualStage2(nn.Module):
     @torch.no_grad()
     def sample(self, faulty_lidar: torch.Tensor, conditions: Stage2Conditions,
                alpha_bars: torch.Tensor, *, steps: int = 64,
-               occupancy_threshold: float = 0.5) -> dict:
+               occupancy_threshold: float = 0.5,
+               max_points_per_voxel: int = MAX_INFERENCE_POINTS_PER_VOXEL) -> dict:
         if steps < 1 or steps > len(alpha_bars):
             raise ValueError("Sampling steps must fit the diffusion schedule")
         faulty, present = self.encode_lidar(faulty_lidar, conditions)
@@ -441,18 +534,11 @@ class SparseResidualStage2(nn.Module):
                 next_alpha = alpha_bars[schedule[index + 1]]
                 residual = (next_alpha.sqrt() * residual_hat
                             + (1 - next_alpha).sqrt() * noise_hat)
-        logits, offsets = self.lpcr(faulty + residual, conditions.hierarchy,
-                                    conditions.fine_probabilities)
-        probabilities = logits.sigmoid()
-        selected = probabilities >= occupancy_threshold
-        coords = conditions.hierarchy[0][selected]
-        centers = (faulty_lidar.new_tensor(self.grid.minimum_xyz)
-                   + (coords[:, [3, 2, 1]].to(faulty_lidar.dtype) + 0.5)
-                   * faulty_lidar.new_tensor(self.grid.voxel_xyz))
-        return {"points_xyz": centers + offsets[selected],
-                "coordinates": coords, "probabilities": probabilities[selected],
-                "allowed_cells": len(conditions.hierarchy[0]),
-                "predicted_cells": int(selected.sum())}
+        logits, log_count, hidden = self.lpcr(
+            faulty + residual, conditions.hierarchy, conditions.fine_probabilities)
+        return self.lpcr.emit_points(
+            hidden, conditions.hierarchy[0], logits, log_count,
+            occupancy_threshold, max_points_per_voxel)
 
 
 def cosine_alpha_bars(steps: int = 1000, *, device: torch.device | str = "cpu"

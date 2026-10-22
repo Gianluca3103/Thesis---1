@@ -13,7 +13,7 @@ def voxelize_lidar_features(points: torch.Tensor,
                             point_batch_ids: torch.Tensor | None = None,
                             *, grid: Stage2Grid = GRID
                             ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mean XYZ and reflectivity/255 per occupied BZYX LiDAR voxel."""
+    """Mean XYZ/intensity, local spread and count per occupied LiDAR voxel."""
     if points.ndim != 2 or points.shape[1] != 4:
         raise ValueError("Shared LiDAR encoder expects XYZ and reflectivity [N,4]")
     if point_batch_ids is None:
@@ -32,7 +32,7 @@ def voxelize_lidar_features(points: torch.Tensor,
     batch_ids = point_batch_ids[inside].long()
     if not len(xyz):
         return (torch.empty((0, 4), dtype=torch.long, device=points.device),
-                points.new_empty((0, 4)))
+                points.new_empty((0, 8)))
     ijk = torch.floor((xyz - minimum) / size).long()
     coords = torch.cat((batch_ids[:, None], ijk[:, [2, 1, 0]]), dim=1)
     unique, inverse = torch.unique(encode_keys(coords, grid.shape_zyx),
@@ -41,6 +41,15 @@ def voxelize_lidar_features(points: torch.Tensor,
     sums = points.new_zeros((len(unique), 4))
     sums.index_add_(0, inverse, values)
     counts = torch.bincount(inverse, minlength=len(unique)).to(points.dtype)
+    centers = minimum + (ijk.to(points.dtype) + 0.5) * size
+    local = (xyz - centers) / (size * 0.5)
+    local_sum = points.new_zeros((len(unique), 3))
+    local_square_sum = points.new_zeros((len(unique), 3))
+    local_sum.index_add_(0, inverse, local)
+    local_square_sum.index_add_(0, inverse, local.square())
+    local_mean = local_sum / counts[:, None]
+    spread = (local_square_sum / counts[:, None] - local_mean.square()
+              ).clamp_min(0).sqrt()
     z, y, x = grid.shape_zyx
     xx = unique % x
     rest = unique // x
@@ -48,7 +57,9 @@ def voxelize_lidar_features(points: torch.Tensor,
     rest //= y
     zz = rest % z
     batch = rest // z
-    return torch.stack((batch, zz, yy, xx), dim=1), sums / counts[:, None]
+    features = torch.cat((sums / counts[:, None], spread,
+                          torch.log1p(counts)[:, None]), dim=1)
+    return torch.stack((batch, zz, yy, xx), dim=1), features
 
 
 def voxelize_means_batched(points_xyz: torch.Tensor,
