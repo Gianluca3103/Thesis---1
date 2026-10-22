@@ -6,6 +6,8 @@ import argparse
 
 import torch
 
+from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
+from models.radar_lidar_stage2.lpcr_eval import point_cloud_metrics
 from models.radar_lidar_stage2.sparse_batch import voxelize_means_batched
 from models.radar_lidar_stage2.sparse_geometry import (
     GRID, reconstruction_targets, voxelize_means,
@@ -62,6 +64,21 @@ def main() -> None:
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
             raise AssertionError(f"LPCR {name} gradient is missing or invalid")
     model.zero_grad(set_to_none=True)
+    full = full_region_training_conditions(clean, "smoke", 1, 8192)
+    if len(full.hierarchy[0]) < 4096 or not bool(
+            (full.cached_targets[0] | full.cached_targets[1]).any()):
+        raise AssertionError("Full-region LPCR patch is empty")
+    full_latent, _ = model.encode_lidar(clean, full)
+    full_loss = model.lpcr_loss(full_latent, full, clean)
+    full_loss["loss"].backward()
+    if not torch.isfinite(full_loss["loss"]):
+        raise AssertionError("Full-region LPCR loss is nonfinite")
+    identical = point_cloud_metrics(clean[:3].cpu().numpy(),
+                                    clean[:3].cpu().numpy())
+    if (identical["chamfer_squared_l2"] != 0.0
+            or abs(identical["fscore_5cm"] - 1.0) > 1e-6):
+        raise AssertionError("R2LDM-style geometric metrics failed identity")
+    model.zero_grad(set_to_none=True)
     model.lidar_encoder.requires_grad_(False)
     model.lpcr.requires_grad_(False)
     second = model.diffusion_loss(faulty, clean, conditions,
@@ -116,6 +133,7 @@ def main() -> None:
             not torch.isfinite(model.diffusion.residual_head.weight.grad).all()):
         raise AssertionError("Batched diffusion loss or gradient is invalid")
     print({"lpcr_loss": float(first["loss"]),
+           "full_region_lpcr_loss": float(full_loss["loss"]),
            "diffusion_loss": float(second["loss"]),
            "batched_diffusion_loss": float(batched["loss"]),
            "total_loss_diffusion_loss": float(total_loss["loss"]),

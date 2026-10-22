@@ -1,8 +1,4 @@
-"""View clean-input Stage-II LPCR reconstructions on random VoD frames.
-
-The Stage-I radar map selects active sites, but the LPCR encoder reads clean
-LiDAR. This visualizes autoencoder pretraining, not faulty-to-clean inference.
-"""
+"""View full-region clean-input Stage-II LPCR reconstructions on random VoD frames."""
 
 from __future__ import annotations
 
@@ -16,9 +12,9 @@ import numpy as np
 import torch
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+from models.radar_lidar_stage2.lpcr_eval import reconstruct_full_region
 from models.radar_lidar_stage2.sparse_geometry import GRID
-from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
-from models.radar_lidar_stage2.stage2_io import load_stage2, sha256
+from models.radar_lidar_stage2.stage2_io import load_stage2
 
 
 def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None) -> None:
@@ -73,9 +69,9 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 @media(max-width:900px){.panels{display:block}section{margin-bottom:8px}canvas{height:55vh;min-height:300px}}
 </style>
 <h1 id="title"></h1>
-<p>Clean LiDAR is the encoder input for this LPCR autoencoder. Radar determines the allowed cells through the Stage I map. This is not a faulty-LiDAR reconstruction.</p>
+<p>Clean LiDAR is the encoder input. LPCR queries the entire Stage II ROI without radar or a Stage I gate. This is not a faulty-LiDAR reconstruction.</p>
 <p id="counts"></p>
-<div class="controls"><label>LPCR occupancy threshold <input id="threshold" type="range" min="0" max="1" step="0.01"><output id="value"></output></label>
+<div class="controls"><label>Display occupancy threshold <input id="threshold" type="range" max="1" step="0.01"><output id="value"></output></label>
 <button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div>
 <p class="legend"><span style="color:#60d796">●</span> clean LiDAR &nbsp; <span style="color:#ff8b6c">●</span> reconstructed LPCR points. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ files contain the complete data.</p>
@@ -84,15 +80,15 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${data.split} frame ${data.frame} · LPCR epoch ${data.epoch}`;
-document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.allowed_cells.toLocaleString()} radar-allowed cells; ${data.candidate_total.toLocaleString()} candidate LPCR points, one per allowed voxel. The browser displays all ${data.clean.length.toLocaleString()} clean points and ${data.reconstructed.length.toLocaleString()} candidate reconstructions.`;
-const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.value=data.threshold;value.textContent=Number(slider.value).toFixed(2);
+document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.allowed_cells.toLocaleString()} full-region cells evaluated; ${data.candidate_total.toLocaleString()} reconstructed LPCR points at the selected generation threshold.`;
+const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.min=data.threshold;slider.value=data.threshold;value.textContent=Number(slider.value).toFixed(2);
 const names=['Clean LiDAR','LPCR reconstruction','Overlay'],panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
 const mid=data.minimum.map((x,i)=>(x+data.maximum[i])/2),extent=Math.hypot(...data.minimum.map((x,i)=>data.maximum[i]-x))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
 function project(p,w,h,s){const x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);const u=cy*x-sy*y,v=sy*x+cy*y;return [w/2+view.panX+u*s,h/2+view.panY-(cp*z-sp*v)*s];}
 function plot(ctx,points,w,h,s,color,cutoff){let count=0;ctx.fillStyle=color;for(let i=0;i<points.length;i++){if(cutoff!==null&&data.scores[i]<cutoff)continue;count++;const [x,y]=project(points[i],w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-1,y-1,2,2);}return count;}
-function draw(canvas,index){const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent,cutoff=Number(slider.value);let count=0;if(index!==1)plot(ctx,data.clean,w,h,scale,'#60d796',null);if(index!==0)count=plot(ctx,data.reconstructed,w,h,scale,'#ff8b6c',cutoff);headings[index].textContent=names[index]+(index===0?`: ${data.clean.length.toLocaleString()} shown`:`: ${count.toLocaleString()} predicted points`);const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
+function draw(canvas,index){const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;let count=0;if(index!==1)plot(ctx,data.clean,w,h,scale,'#60d796',null);if(index!==0)count=plot(ctx,data.reconstructed,w,h,scale,'#ff8b6c',Number(slider.value));headings[index].textContent=names[index]+(index===0?`: ${data.clean.length.toLocaleString()} shown`:`: ${count.toLocaleString()} predicted points`);const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;canvases.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
 for(const canvas of canvases){let last=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);last=[e.clientX,e.clientY];});canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1];if(e.shiftKey){view.panX+=dx;view.panY+=dy;}else{view.yaw+=dx*.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.008));}redraw();});for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,()=>{last=null;});canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
@@ -107,8 +103,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path, required=True)
-    parser.add_argument("--stage2-cache-root", type=Path, required=True)
-    parser.add_argument("--stage1-checkpoint", type=Path, required=True)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_5frames")
@@ -121,17 +115,10 @@ def main() -> None:
     if args.limit < 1 or not 0 < args.occupancy_threshold < 1:
         parser.error("Limit must be positive; threshold must be in (0,1)")
     model, saved = load_stage2(args.lpcr_checkpoint, args.device, phase="lpcr")
-    if (saved["stage1_sha256"] != sha256(args.stage1_checkpoint) or
-            saved["radar_variant"] != args.radar_variant):
-        raise ValueError("LPCR checkpoint was trained with a different Stage I")
+    if not saved.get("lpcr_full_region"):
+        raise ValueError("Viewer expects a full-region LPCR checkpoint")
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
                              include_clean=True, data_cache_root=args.data_cache_root)
-    expected = cache_identity(args.stage1_checkpoint, args.vod_root,
-                              args.radar_variant, float(saved["radius_m"]),
-                              float(saved["gate_threshold"]), args.split,
-                              [frame.frame_id for frame in dataset.frames])
-    cache = Stage2FixedCache(args.stage2_cache_root / args.split, expected)
-    cache.check_complete()
     indices = random.Random(args.random_seed).sample(
         range(len(dataset)), min(args.limit, len(dataset)))
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -142,44 +129,35 @@ def main() -> None:
         row = dataset[index]
         frame_id = row["frame_id"]
         clean = row["clean_lidar"][:, :3].to(args.device)
-        output, _ = cache.load(frame_id, args.device)
-        conditions = model.conditions(output, float(saved["gate_threshold"]))
-        if not len(conditions.hierarchy[0]):
-            print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
-            continue
-        latent, _ = model.encode_lidar(clean, conditions)
-        logits, offsets = model.lpcr(
-            latent, conditions.hierarchy, conditions.fine_probabilities)
-        generated = model.lpcr.emit_points(
-            conditions.hierarchy[0], logits, offsets, 0.0)
-        scores = generated["probabilities"].cpu().numpy().astype(np.float32)
-        coords = conditions.hierarchy[0][:, [3, 2, 1]].cpu().numpy()
-        reconstructed = generated["points_xyz"].cpu().numpy().astype(np.float32)
+        generated, visited, confidence = reconstruct_full_region(
+            model, clean, threshold=args.occupancy_threshold,
+            tile_size=16, halo=3, return_scores=True)
+        reconstructed = generated.numpy().astype(np.float32)
+        scores = confidence.numpy().astype(np.float32)
         clean_xyz = clean[:, :3].cpu().numpy().astype(np.float32)
         inside = ((clean_xyz >= minimum) & (clean_xyz < maximum)).all(axis=1)
         clean_roi = clean_xyz[inside]
-        chosen = scores >= args.occupancy_threshold
         stem = args.output_root / f"{frame_id}_lpcr_epoch_{saved['epoch']:03d}"
         _write_ply(stem.with_name(stem.name + "_clean.ply"), clean_roi)
         _write_ply(stem.with_name(stem.name + "_reconstruction.ply"),
-                   reconstructed[chosen], scores[chosen])
+                   reconstructed, scores)
         np.savez_compressed(stem.with_suffix(".npz"), clean_xyz=clean_roi,
-                            candidate_xyz=reconstructed, occupancy_probability=scores,
-                            allowed_coordinates=coords,
-                            point_coordinates=generated["coordinates"].cpu().numpy())
+                            reconstructed_xyz=reconstructed,
+                            occupancy_probability=scores,
+                            generation_threshold=args.occupancy_threshold)
         viewer = stem.with_suffix(".html")
         _write_html(viewer, frame_id, args.split, int(saved["epoch"]), clean_roi,
                     reconstructed, scores, args.occupancy_threshold,
-                    len(clean_roi), len(coords), len(reconstructed))
+                    len(clean_roi), visited, len(reconstructed))
         stats = {"frame_id": frame_id, "clean_roi_points": len(clean_roi),
-                 "allowed_cells": len(coords),
-                 "predicted_occupied_cells": int((logits.sigmoid() >= args.occupancy_threshold).sum()),
-                 "reconstructed_points": int(chosen.sum()),
+                 "full_region_cells": visited,
+                 "predicted_occupied_cells": len(reconstructed),
+                 "reconstructed_points": len(reconstructed),
                  "viewer": viewer.name}
         summary.append(stats)
         print(json.dumps(stats), flush=True)
     if not summary:
-        raise RuntimeError("Selected frames had no radar-allowed cells")
+        raise RuntimeError("No frames were selected")
     (args.output_root / "summary.json").write_text(json.dumps(summary, indent=2),
                                                       encoding="utf-8")
     links = "\n".join(

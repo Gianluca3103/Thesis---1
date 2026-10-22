@@ -30,7 +30,7 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "stage2_r2ldm_centroid_residual_v8"
+MODEL_REVISION = "stage2_full_region_lpcr_residual_v9"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 1
 
@@ -159,7 +159,7 @@ class _ActiveRefine(nn.Module):
 
 
 class AllowedSiteLPCR(nn.Module):
-    """Hierarchical point reconstruction only on Stage-I-selected sites."""
+    """Hierarchical reconstruction on caller-supplied sparse query sites."""
 
     def __init__(self, grid: Stage2Grid = GRID):
         super().__init__()
@@ -190,7 +190,7 @@ class AllowedSiteLPCR(nn.Module):
         if len(hierarchy) != 5 or len(latent_features) != len(hierarchy[4]):
             raise ValueError("LPCR requires the five R2LDM active coordinate levels")
         if fine_probabilities.shape != (len(hierarchy[0]), 1):
-            raise ValueError("LPCR needs one Stage-I probability per allowed voxel")
+            raise ValueError("LPCR needs one site feature per query voxel")
         pooled = [pool_allowed_probabilities(
             hierarchy[0], fine_probabilities[:, 0], hierarchy[level],
             self.grid.downsampling_zyx[level], self.grid.shape_at(level))
@@ -360,17 +360,18 @@ class SparseResidualStage2(nn.Module):
                   occupancy_weight: float = 0.9,
                   offset_weight: float = 0.1,
                   batch_size: int = 1,
-                  clean_batch_ids: torch.Tensor | None = None
+                  clean_batch_ids: torch.Tensor | None = None,
                   ) -> dict[str, torch.Tensor | float]:
         logits, offsets = self.lpcr(
-            latent, conditions.hierarchy, conditions.fine_probabilities)
+            latent, conditions.hierarchy,
+            torch.ones_like(conditions.fine_probabilities))
         occupied, known_free, target_offsets, coverage = (
             conditions.cached_targets if conditions.cached_targets is not None
             else reconstruction_targets(clean_xyz, conditions.hierarchy[0], grid=self.grid))
         if (occupied.shape != logits.shape or known_free.shape != logits.shape
                 or target_offsets.shape != offsets.shape
                 or bool((occupied & known_free).any())):
-            raise ValueError("LPCR labels differ from the radar-selected active cells")
+            raise ValueError("LPCR labels differ from the active query cells")
         if not len(logits):
             zero = latent.sum() * 0
             return {"loss": zero, "occupancy": zero, "offset": zero,
@@ -383,6 +384,7 @@ class SparseResidualStage2(nn.Module):
             occ = (F.binary_cross_entropy_with_logits(logits[known],
                                                       occupied[known].to(logits.dtype))
                    if bool(known.any()) else logits.sum() * 0)
+        if batch_size == 1:
             offset = (F.l1_loss(offsets[occupied], target_offsets[occupied])
                       if bool(occupied.any()) else offsets.sum() * 0)
         else:
@@ -482,7 +484,7 @@ class SparseResidualStage2(nn.Module):
                             + (1 - next_alpha).sqrt() * noise_hat)
         logits, offsets = self.lpcr(
             faulty + residual, conditions.hierarchy,
-            conditions.fine_probabilities)
+            torch.ones_like(conditions.fine_probabilities))
         return self.lpcr.emit_points(conditions.hierarchy[0], logits,
                                      offsets, occupancy_threshold)
 

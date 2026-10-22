@@ -17,6 +17,8 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.fault_data import (
     FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
 )
+from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
+from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
     MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
@@ -108,19 +110,24 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             active_rows, items, clean_clouds = [], [], []
             for row in rows:
                 clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
-                if fixed_cache is not None:
-                    output = {key: value.to(args.device, non_blocking=True)
-                              for key, value in row["stage2_output"].items()}
-                    stored = row["stage2_targets"]
-                    targets = tuple(value.to(args.device, non_blocking=True)
-                                    for value in stored[:3]) + (stored[3],)
+                if args.phase == "lpcr":
+                    item = full_region_training_conditions(
+                        clean, row["frame_id"], epoch if training else 1,
+                        args.lpcr_sites_per_frame)
                 else:
-                    radar = row["radar"].to(args.device, non_blocking=True)
-                    with torch.no_grad():
-                        output = stage1_frame(stage1, radar, radius_m)
-                    targets = None
-                item = model.conditions(output, args.gate_threshold)
-                item.cached_targets = targets
+                    if fixed_cache is not None:
+                        output = {key: value.to(args.device, non_blocking=True)
+                                  for key, value in row["stage2_output"].items()}
+                        stored = row["stage2_targets"]
+                        targets = tuple(value.to(args.device, non_blocking=True)
+                                        for value in stored[:3]) + (stored[3],)
+                    else:
+                        radar = row["radar"].to(args.device, non_blocking=True)
+                        with torch.no_grad():
+                            output = stage1_frame(stage1, radar, radius_m)
+                        targets = None
+                    item = model.conditions(output, args.gate_threshold)
+                    item.cached_targets = targets
                 if not len(item.hierarchy[0]):
                     skipped += 1
                     continue
@@ -138,9 +145,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                          batch_size=batch_size,
                                          clean_batch_ids=clean_batch_ids)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "offset", "iou_known",
-                           "iou_full", "gate_coverage", "known_sites",
-                           "positive_sites")}
+                          ("loss", "occupancy", "offset", "positive_sites")}
+                values["sample_iou"] = result["iou_known"]
             else:
                 faulty_clouds = []
                 for row in active_rows:
@@ -197,10 +203,38 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 conditions.hierarchy[0])
             processed += batch_size
     if not processed:
-        raise RuntimeError("Stage I selected zero sites across this split")
+        raise RuntimeError("Stage II found no usable frames across this split")
     return {key: value / processed for key, value in totals.items()} | {
-        "frames": processed, "skipped_empty_gate": skipped,
+        "frames": processed,
+        "skipped_empty_gate": skipped if args.phase == "diffusion" else None,
         "fault_counts": fault_counts if args.phase == "diffusion" else {}}
+
+
+@torch.no_grad()
+def _paper_metrics(model, dataset, args) -> dict:
+    """Evaluate complete LiDAR ROI, independently of radar and target sites."""
+    model.eval()
+    count = min(args.paper_metrics_frames, len(dataset))
+    indices = [round((i + 0.5) * len(dataset) / count - 0.5)
+               for i in range(count)]
+    frames = []
+    for index in tqdm(indices, desc="LPCR full-region point metrics", unit="frame"):
+        row = dataset[index]
+        clean = row["clean_lidar"][:, :3].to(args.device)
+        frames.append(evaluate_full_region(
+            model, clean, threshold=args.paper_metrics_threshold,
+            tile_size=16, halo=3))
+    fields = ("chamfer_squared_l2", "hausdorff_squared_l2", "precision",
+              "recall", "fscore_5cm", "predicted_points", "target_points")
+    means = {field: (sum(values) / len(values) if values else None)
+             for field in fields
+             for values in ([frame[field] for frame in frames
+                             if frame[field] is not None],)}
+    return {"frames": count, "empty_predictions": sum(
+        frame["predicted_points"] == 0 for frame in frames),
+        "candidate_cells_per_frame": frames[0]["candidate_cells"],
+        "occupancy_threshold": args.paper_metrics_threshold,
+        "fscore_radius_m": 0.05, **means}
 
 
 def main() -> None:
@@ -210,12 +244,18 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--stage2-cache-root", type=Path,
                         help="Compressed frozen Stage-I and LiDAR-label cache")
-    parser.add_argument("--stage1-checkpoint", type=Path, required=True)
+    parser.add_argument("--stage1-checkpoint", type=Path,
+                        help="Required only for radar-conditioned diffusion")
     parser.add_argument("--lpcr-checkpoint", type=Path,
                         help="Required for diffusion; best LPCR checkpoint")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_5frames")
     parser.add_argument("--gate-threshold", type=float, default=0.25)
+    parser.add_argument("--lpcr-sites-per-frame", type=int, default=8192,
+                        help="Minimum 7744; LPCR uses a 16x16 core and 3-cell halo")
+    parser.add_argument("--paper-metrics-every", type=int, default=5)
+    parser.add_argument("--paper-metrics-frames", type=int, default=4)
+    parser.add_argument("--paper-metrics-threshold", type=float, default=0.5)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -238,35 +278,50 @@ def main() -> None:
     if (args.device != "cuda" or not torch.cuda.is_available() or
             not 0 < args.gate_threshold < 1 or args.epochs < 1 or
             args.batch_size < 1 or args.num_workers < 0 or args.lr <= 0 or
-            args.batch_size > 1 and args.stage2_cache_root is None or
+            args.lpcr_sites_per_frame < 7744 or
+            args.paper_metrics_every < 1 or args.paper_metrics_frames < 1 or
+            not 0 < args.paper_metrics_threshold < 1 or
+            args.phase == "diffusion" and args.stage1_checkpoint is None or
+            args.phase == "diffusion" and args.batch_size > 1
+            and args.stage2_cache_root is None or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
             (args.phase == "diffusion" and args.faulty_root is None
              and args.fault_cache_root is None) or
             args.phase == "lpcr" and args.lpcr_checkpoint is not None or
             args.train_limit is not None and args.train_limit < 1 or
             args.val_limit is not None and args.val_limit < 1):
-        parser.error("Stage II requires CUDA, valid limits, an LPCR checkpoint, and a severe fog cache for synthetic diffusion faults")
+        parser.error("Stage II requires CUDA and valid phase-specific paths and limits")
     run_seed = 3407 if args.phase == "lpcr" else 3103
     torch.manual_seed(run_seed)
-    if args.stage2_cache_root:
+    if args.phase == "lpcr":
+        stage1 = None
+        radius_m = None
+    elif args.stage2_cache_root:
         stage1_saved = torch.load(args.stage1_checkpoint, map_location="cpu",
                                   weights_only=False)
         if stage1_saved.get("radar_variant") != args.radar_variant:
             raise ValueError("Radar variant differs from Stage-I checkpoint")
         stage1 = None
+        radius_m = float(stage1_saved.get("radius_m", 3.2))
     else:
         stage1, stage1_saved = load_stage1(args.stage1_checkpoint, args.device,
                                             args.radar_variant)
-    radius_m = float(stage1_saved.get("radius_m", 3.2))
+        radius_m = float(stage1_saved.get("radius_m", 3.2))
     model = SparseResidualStage2().to(args.device)
     identity = {"version": VERSION, "model_revision": MODEL_REVISION,
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
                 "occupancy_weight": 0.9, "offset_weight": 0.1,
                 "diffusion_objective": "clean_latent_mse_residual_l1_lpcr",
-                "stage1_sha256": sha256(args.stage1_checkpoint),
-                "radar_variant": args.radar_variant, "gate_threshold": args.gate_threshold,
+                "stage1_sha256": (sha256(args.stage1_checkpoint)
+                                  if args.phase == "diffusion" else None),
+                "radar_variant": (args.radar_variant if args.phase == "diffusion" else None),
+                "gate_threshold": (args.gate_threshold if args.phase == "diffusion" else None),
                 "radius_m": radius_m,
+                "lpcr_sites_per_frame": (args.lpcr_sites_per_frame
+                                          if args.phase == "lpcr" else None),
+                "lpcr_full_region": True,
+                "lpcr_query_patch": "16x16_xy_core_3cell_halo_all_z",
                 "lpcr_sha256": (sha256(args.lpcr_checkpoint)
                                 if args.lpcr_checkpoint else None),
                 "faulty_root": str(args.faulty_root.resolve()) if args.faulty_root else None,
@@ -284,9 +339,8 @@ def main() -> None:
         if (saved_lpcr.get("version") != VERSION
                 or saved_lpcr.get("model_revision") != MODEL_REVISION
                 or saved_lpcr.get("phase") != "lpcr"
-                or saved_lpcr.get("stage1_sha256") != identity["stage1_sha256"]
-                or saved_lpcr.get("gate_threshold") != args.gate_threshold):
-            raise ValueError("LPCR checkpoint differs from this Stage-I checkpoint or gate")
+                or not saved_lpcr.get("lpcr_full_region")):
+            raise ValueError("Diffusion requires a full-region LPCR checkpoint")
         model.load_state_dict(saved_lpcr["model"], strict=True)
         model.lidar_encoder.requires_grad_(False)
         model.lpcr.requires_grad_(False)
@@ -309,7 +363,7 @@ def main() -> None:
     fixed_caches = {}
     fog_caches = {}
     for split, dataset in full_datasets.items():
-        if args.stage2_cache_root:
+        if args.phase == "diffusion" and args.stage2_cache_root:
             expected = cache_identity(
                 args.stage1_checkpoint, args.vod_root, args.radar_variant,
                 radius_m, args.gate_threshold, split,
@@ -357,6 +411,9 @@ def main() -> None:
         val = _epoch(model, stage1, fixed_caches["val"], fog_caches["val"], loaders["val"],
                      None, args, epoch,
                      "val", alpha_bars, radius_m)
+        paper = (_paper_metrics(model, datasets["val"], args)
+                 if args.phase == "lpcr" and epoch % args.paper_metrics_every == 0
+                 else None)
         if scheduler is not None:
             scheduler.step()
         improved = val["loss"] < best
@@ -364,7 +421,7 @@ def main() -> None:
             best = val["loss"]
         record = {"epoch": epoch, "batch_size": args.batch_size,
                   "num_workers": args.num_workers, "train": train, "val": val,
-                  "best_val_loss": best}
+                  "best_val_loss": best, "point_cloud_metrics": paper}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         payload = {**identity, "epoch": epoch, "best_val_loss": best,
@@ -377,12 +434,26 @@ def main() -> None:
         diffusion_terms = (f"clean latent MSE={val['clean_latent']:.5f}, "
                            f"residual L1={val['residual']:.5f}, "
                            if args.phase == "diffusion" else "")
-        print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
-              f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
-              f"{diffusion_terms}occupancy BCE={val['occupancy']:.5f}, "
-              f"offset L1={val['offset']:.5f}, "
-              f"gate coverage={val['gate_coverage']:.4f}, "
-              f"train faults={train['fault_counts']}", flush=True)
+        if args.phase == "lpcr":
+            print(f"Epoch {epoch:03d}: full-region patch val loss={val['loss']:.5f}, "
+                  f"patch IoU={val['sample_iou']:.4f}, "
+                  f"occupancy BCE={val['occupancy']:.5f}, "
+                  f"offset L1={val['offset']:.5f}", flush=True)
+            if paper is not None:
+                print(f"  Full ROI: squared-L2 CD={paper['chamfer_squared_l2']}, "
+                      f"HD={paper['hausdorff_squared_l2']}, "
+                      f"F-score@5cm={paper['fscore_5cm']}, "
+                      f"mean predicted/target points="
+                      f"{paper['predicted_points']:.0f}/{paper['target_points']:.0f}, "
+                      f"empty predictions={paper['empty_predictions']}",
+                      flush=True)
+        else:
+            print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
+                  f"Known/Full gate IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
+                  f"{diffusion_terms}occupancy BCE={val['occupancy']:.5f}, "
+                  f"offset L1={val['offset']:.5f}, "
+                  f"gate coverage={val['gate_coverage']:.4f}, "
+                  f"train faults={train['fault_counts']}", flush=True)
 
 
 if __name__ == "__main__":

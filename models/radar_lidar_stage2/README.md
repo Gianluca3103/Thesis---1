@@ -1,7 +1,8 @@
 # Stage II: radar-gated sparse residual diffusion
 
-This is a new Stage-II model, trained from scratch on the existing radar-only
-Stage-I checkpoint. It adapts the R2LDM LiDAR encoder's **downsampling sequence**
+The LiDAR autoencoder trains from scratch on clean LiDAR. The later diffusion
+phase uses the existing radar-only Stage-I checkpoint. This model adapts the
+R2LDM LiDAR encoder's **downsampling sequence**
 to MinkowskiEngine: `(2,2,2)`, `(2,2,2)`, `(2,1,1)`, `(2,1,1)` in `z,y,x`
 order. The original R2LDM dense decoder and its checkpoints do not fit the
 new grid. This implementation instead uses a sparse decoder and a sparse
@@ -18,12 +19,15 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
    during training and faulty LiDAR during training and inference. Both map
    to the same sparse latent coordinates selected in step 2. The encoder
    accepts three channels and rejects intensity-bearing input.
-4. Pretrain the LiDAR encoder and sparse LPCR decoder on clean LiDAR, on the
-   Stage-I-selected sites. Measured occupied cells and observed free cells
-   supervise occupancy; no-return cells with unknown visibility are ignored.
-   Occupied cells supervise one center-relative XYZ offset to the average
-   measured clean return in that voxel, as in R2LDM. The adapted fine-scale
-   LPCR objective is `0.9 ×` occupancy BCE plus `0.1 ×` centroid offset L1.
+4. Pretrain the LiDAR encoder and sparse LPCR decoder on clean LiDAR across
+   the entire Stage-II ROI, independently of radar and Stage I. The decoder
+   trains on contiguous 16 × 16 XY patches at all 16 heights, with a three-cell
+   context halo. Patches cycle through all 100 XY tiles. Only core sites
+   contribute to loss. All occupied core voxels and a balanced sample of empty
+   core voxels supervise occupancy. Occupied cells supervise a center-relative
+   XYZ offset to the
+   average measured clean return in that voxel. The adapted fine-scale LPCR
+   objective is `0.9 ×` occupancy BCE plus `0.1 ×` centroid offset L1.
 5. Freeze the pretrained LiDAR encoder and decoder. Train a radar spatial
    adapter and sparse latent U-Net on `R = Z_clean - Z_faulty`. The U-Net
    receives a noised residual, faulty latent, aligned radar features, pooled
@@ -82,8 +86,8 @@ S1="$OUT5/radar_autoencoder/best_student.ckpt"
 CACHE="$OUT5/stage2_fixed_gate025_v1"
 FOG_CACHE="$OUT5/stage2_severe_fog_s5_v1"
 FOG_SIM=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim
-LPCR="$OUT5/stage2_sparse_lpcr_r2ldm_centroid_v8"
-DIFF="$OUT5/stage2_sparse_diffusion_r2ldm_centroid_v8"
+LPCR="$OUT5/stage2_sparse_lpcr_fullregion_v9"
+DIFF="$OUT5/stage2_sparse_diffusion_fullregion_v9"
 
 "$PY" -m scripts.smoke_stage2_sparse --device cuda
 
@@ -96,10 +100,16 @@ DIFF="$OUT5/stage2_sparse_diffusion_r2ldm_centroid_v8"
 
 "$PY" -u -m scripts.train_stage2_sparse \
   --phase lpcr --vod-root "$VOD" \
-  --data-cache-root "$OUT5/fixed_frames" --stage2-cache-root "$CACHE" \
-  --stage1-checkpoint "$S1" --output-root "$LPCR" \
-  --radar-variant radar_5frames --gate-threshold 0.25 \
-  --epochs 30 --lr 0.001 --batch-size 8 --num-workers 8 --device cuda
+  --data-cache-root "$OUT5/fixed_frames" --output-root "$LPCR" \
+  --radar-variant radar_5frames --epochs 30 --lr 0.001 \
+  --batch-size 8 --num-workers 8 --device cuda \
+  --paper-metrics-every 5 --paper-metrics-frames 4
+
+"$PY" -u -m scripts.evaluate_stage2_lpcr \
+  --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
+  --lpcr-checkpoint "$LPCR/best.ckpt" \
+  --output-root "$LPCR/paper_metrics_val" \
+  --split val --limit 20 --export-pairs --device cuda
 
 "$PY" -u -m scripts.cache_stage2_severe_fog \
   --vod-root "$VOD" --fog-simulator-root "$FOG_SIM" \
@@ -138,9 +148,11 @@ reconstructed points down to the generation threshold set with
 needed to inspect lower-confidence points. The preview reports how many clean
 returns were removed by each synthetic fault.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
-is then disabled. A new gate threshold requires a new cache and LPCR run.
+is then disabled. A new gate threshold requires a new Stage-II geometry cache
+and diffusion run; the full-region LPCR checkpoint can be reused.
 The existing Stage-I, Stage-II geometry, and severe-fog caches can be reused.
-LPCR and diffusion both need new runs because the decoder and diffusion heads changed.
+LPCR and diffusion both need new v9 runs because LPCR pretraining now covers
+the full ROI independently of radar.
 Existing Stage-II checkpoints cannot be resumed.
 Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
@@ -158,3 +170,31 @@ required for physical batches larger than one; its compressed geometry is
 decompressed in the eight data workers. Sparse coordinates carry a frame
 index, so the MinkowskiEngine convolutions process all frames together without
 mixing their sites. LPCR and diffusion losses retain equal per-frame weighting.
+
+## LPCR point-cloud evaluation
+
+The autoencoder reports full-ROI squared-L2 Chamfer distance, squared-L2
+Hausdorff distance, precision, recall, and F-score at 5 cm every five epochs
+on four fixed validation frames. These use the geometric definitions in
+R2LDM's released evaluator. The trainer still selects `best.ckpt` by validation
+loss; `scripts.evaluate_stage2_lpcr` scores that checkpoint on more frames.
+Its optional `gen/` and `gt/` XYZ files can be passed to R2LDM's evaluator for
+BEV JSD/MMD and optional PointNet FPD. Use this project's ROI
+`0 -16 -2 32 16 2` and metric voxel size `0.125 0.125 0.125` there.
+
+```bash
+cd /path/to/R2LDM
+"$PY" eval_metric_2025.py \
+  --data-root "$LPCR/paper_metrics_val" \
+  --point-cloud-range 0 -16 -2 32 16 2 \
+  --voxel-size 0.125 0.125 0.125 \
+  --fscore-threshold 0.05 --device cuda \
+  --output "$LPCR/paper_metrics_val/r2ldm_summary.json"
+```
+
+Add `--pointnet-fpd` only when the pretrained PointNet extractor is available.
+
+These scores are autoencoder reconstructions from **clean LiDAR input**.
+R2LDM's published tables evaluate the complete radar-to-point-cloud model on
+different preprocessing grids; direct numerical comparison is not valid.
+Known/Full IoU remains a gate-specific metric for the later diffusion phase.
