@@ -25,7 +25,7 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
    XYZ offsets to up to five measured clean returns in that voxel. Voxels with
    more than five returns use five deterministic representatives. Offset loss
    matches the predicted and measured points without depending on point order.
-   The LPCR objective is occupancy BCE plus `0.10 ×` count cross-entropy plus
+   The LPCR objective is occupancy BCE plus `0.04 ×` count cross-entropy plus
    `0.10 ×` matched offset L1.
 5. Freeze the pretrained LiDAR encoder and decoder. Train a radar spatial
    adapter and sparse latent U-Net on `R = Z_clean - Z_faulty`. The U-Net
@@ -85,8 +85,8 @@ S1="$OUT5/radar_autoencoder/best_student.ckpt"
 CACHE="$OUT5/stage2_fixed_gate025_v1"
 FOG_CACHE="$OUT5/stage2_severe_fog_s5_v1"
 FOG_SIM=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim
-LPCR="$OUT5/stage2_sparse_lpcr_multipoint5_v6"
-DIFF="$OUT5/stage2_sparse_diffusion_multipoint5_v6"
+LPCR="$OUT5/stage2_sparse_lpcr_multipoint5_count004_v7"
+DIFF="$OUT5/stage2_sparse_diffusion_multipoint5_count004_v7"
 
 "$PY" -m scripts.smoke_stage2_sparse --device cuda
 
@@ -147,7 +147,7 @@ LPCR and diffusion both need new runs because the decoder point heads changed.
 Existing Stage-II checkpoints cannot be resumed.
 Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
-The LPCR loss is `L_occ + 0.10 L_count + 0.10 L_offset`. The diffusion loss is
+The LPCR loss is `L_occ + 0.04 L_count + 0.10 L_offset`. The diffusion loss is
 `L_noise + L_residual + L_LPCR` with default outer weights of one. The
 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 

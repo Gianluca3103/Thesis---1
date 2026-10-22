@@ -82,7 +82,7 @@ class TestStage2Offset(unittest.TestCase):
         expected_offset = targets[0, :2].abs().mean()
         expected = (F.binary_cross_entropy_with_logits(
             logits, torch.tensor([1., 0.]))
-            + 0.1 * F.cross_entropy(count_logits[:1], torch.tensor([1]))
+            + 0.04 * F.cross_entropy(count_logits[:1], torch.tensor([1]))
             + 0.1 * expected_offset)
         torch.testing.assert_close(result["loss"], expected)
         result["loss"].backward()

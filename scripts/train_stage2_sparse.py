@@ -262,7 +262,7 @@ def main() -> None:
     identity = {"version": VERSION, "model_revision": MODEL_REVISION,
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
-                "count_weight": 0.1, "offset_weight": 0.1,
+                "count_weight": 0.04, "offset_weight": 0.1,
                 "stage1_sha256": sha256(args.stage1_checkpoint),
                 "radar_variant": args.radar_variant, "gate_threshold": args.gate_threshold,
                 "radius_m": radius_m,

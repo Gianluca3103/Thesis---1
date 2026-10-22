@@ -32,7 +32,7 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "stage2_xyz_multipoint5_offset01_v6"
+MODEL_REVISION = "stage2_xyz_multipoint5_count004_offset01_v7"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 5
 
@@ -391,7 +391,7 @@ class SparseResidualStage2(nn.Module):
     def lpcr_loss(self, latent: torch.Tensor, conditions: Stage2Conditions,
                   clean_xyz: torch.Tensor,
                   offset_weight: float = 0.1,
-                  count_weight: float = 0.1,
+                  count_weight: float = 0.04,
                   batch_size: int = 1,
                   clean_batch_ids: torch.Tensor | None = None
                   ) -> dict[str, torch.Tensor | float]:
