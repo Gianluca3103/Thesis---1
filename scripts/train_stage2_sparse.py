@@ -106,7 +106,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                          unit="batch", dynamic_ncols=True):
             active_rows, items, clean_clouds = [], [], []
             for row in rows:
-                clean = row["clean_lidar"].to(args.device, non_blocking=True)
+                clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
                 if fixed_cache is not None:
                     output = {key: value.to(args.device, non_blocking=True)
                               for key, value in row["stage2_output"].items()}
@@ -133,12 +133,10 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             batch_size = len(active_rows)
             if args.phase == "lpcr":
                 latent, _ = model.encode_lidar(clean, conditions, clean_batch_ids)
-                result = model.lpcr_loss(latent, conditions, clean[:, :3],
-                                         clean_batch_ids=clean_batch_ids,
+                result = model.lpcr_loss(latent, conditions, clean,
                                          batch_size=batch_size)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "count", "point_nll", "centroid",
-                           "count_mae", "target_points", "iou_known",
+                          ("loss", "occupancy", "offset", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
             else:
@@ -174,11 +172,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 values = {"loss": result["loss"], "noise": result["noise"],
                           "residual": result["residual"],
                           "reconstruction": reconstruction["loss"],
-                          "count": reconstruction["count"],
-                          "point_nll": reconstruction["point_nll"],
-                          "centroid": reconstruction["centroid"],
-                          "count_mae": reconstruction["count_mae"],
-                          "target_points": reconstruction["target_points"],
+                          "occupancy": reconstruction["occupancy"],
+                          "offset": reconstruction["offset"],
                           "iou_known": reconstruction["iou_known"],
                           "iou_full": reconstruction["iou_full"],
                           "gate_coverage": reconstruction["gate_coverage"],
@@ -375,7 +370,7 @@ def main() -> None:
             _atomic_save(args.output_root / "best.ckpt", payload)
         print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
               f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
-              f"point-count MAE={val['count_mae']:.2f}, "
+              f"offset L1={val['offset']:.5f}, "
               f"gate coverage={val['gate_coverage']:.4f}, "
               f"train faults={train['fault_counts']}", flush=True)
 

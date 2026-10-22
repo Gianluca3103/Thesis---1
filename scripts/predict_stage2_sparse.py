@@ -49,7 +49,7 @@ def _roi(points: np.ndarray) -> np.ndarray:
 
 
 def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
-    """Match exact point rows, including reflectivity when present."""
+    """Match exact XYZ rows."""
     if not len(clean):
         return np.empty(0, dtype=bool)
     if clean.ndim != 2 or faulty.ndim != 2 or clean.shape[1] != faulty.shape[1]:
@@ -67,9 +67,7 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 threshold: float, allowed_cells: int, predicted_cells: int,
                 sampling_steps: int,
                 fault_type: str, totals: tuple[int, int, int, int],
-                changed_geometry: int | None,
-                changed_reflectivity: int | None,
-                median_intensity: tuple[float | None, float | None],
+                removed_clean_points: int | None,
                 metrics: dict | None) -> None:
     if len(predicted) != len(probabilities):
         raise ValueError("One confidence value is required per reconstructed point")
@@ -90,9 +88,7 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "threshold": threshold, "allowed_cells": allowed_cells,
         "predicted_cells": predicted_cells,
         "sampling_steps": sampling_steps, "fault_type": fault_type,
-        "totals": totals, "changed_geometry": changed_geometry,
-        "changed_reflectivity": changed_reflectivity,
-        "median_intensity": median_intensity,
+        "totals": totals, "removed_clean_points": removed_clean_points,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
@@ -120,9 +116,9 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
-const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'The established fog simulator at severity 5 changes ranges and intensities on the full raw scan before the forward crop.',real:'Pre-aligned real faulty LiDAR was loaded.'};
+const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog-response returns are removed; retained input points have original clean XYZ. LiDAR intensity is not a model input.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
 if(d.metrics){const p=document.createElement('p');p.textContent=`Metrics at the generation threshold: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
 const layers=[{key:'faulty',name:'Faulty LiDAR',color:'#ffb85c'},{key:'clean',name:'Clean LiDAR',color:'#60d796'},{key:'radar',name:'Radar',color:'#67b7ff'},{key:'predicted',name:'Reconstructed',color:'#ff8b6c'}];
 const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
@@ -247,18 +243,14 @@ def main() -> None:
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())
         radar_roi = _roi(row["radar"].cpu().numpy())
-        clean_roi = (_roi(row["clean_lidar"].numpy())
+        clean_roi = (_roi(row["clean_lidar"][:, :3].numpy())
                      if "clean_lidar" in row else np.empty((0, 3), dtype=np.float32))
         synthetic = args.faulty_root is None
-        changed_geometry = changed_reflectivity = None
+        removed_clean_points = None
         if synthetic:
-            kept = _present_in_faulty(clean_roi, faulty_roi)
-            xyz_kept = _present_in_faulty(clean_roi[:, :3], faulty_roi[:, :3])
-            changed_geometry = int((~xyz_kept).sum())
-            changed_reflectivity = int((xyz_kept & ~kept).sum())
-        median_intensity = (
-            float(np.median(clean_roi[:, 3])) if len(clean_roi) else None,
-            float(np.median(faulty_roi[:, 3])) if len(faulty_roi) else None)
+            if len(faulty_roi) > len(clean_roi):
+                raise RuntimeError("Synthetic fault added LiDAR returns")
+            removed_clean_points = len(clean_roi) - len(faulty_roi)
         stem_name = (f"{frame_id}_{fault_type}_stage2_epoch_{saved2['epoch']:03d}"
                      if args.html else f"{frame_id}_stage2")
         stem = args.output_root / stem_name
@@ -268,27 +260,18 @@ def main() -> None:
                             coordinates=predicted["coordinates"].cpu().numpy(),
                             occupied_coordinates=predicted[
                                 "occupied_coordinates"].cpu().numpy(),
-                            point_counts=predicted["point_counts"].cpu().numpy(),
                             faulty_xyz=faulty_roi[:, :3], clean_xyz=clean_roi[:, :3],
                             radar_xyz=radar_roi[:, :3],
-                            faulty_reflectivity=faulty_roi[:, 3],
-                            clean_reflectivity=clean_roi[:, 3],
                             fault_type=np.asarray(fault_type))
         stats = {"frame_id": frame_id, "epoch": int(saved2["epoch"]),
                  "fault_type": fault_type,
                  "allowed_cells": predicted["allowed_cells"],
                  "predicted_occupied_cells": predicted["predicted_cells"],
                  "reconstructed_points": predicted["predicted_points"],
-                 "max_points_in_one_predicted_cell": (
-                     int(predicted["point_counts"].max())
-                     if predicted["predicted_cells"] else 0),
                  "faulty_input_points": len(faulty_roi),
                  "radar_input_points": len(radar_roi),
                  "clean_reference_points": len(clean_roi),
-                 "clean_points_absent_or_shifted": changed_geometry,
-                 "clean_points_reflectivity_changed": changed_reflectivity,
-                 "median_clean_reflectivity": median_intensity[0],
-                 "median_faulty_reflectivity": median_intensity[1]}
+                 "clean_points_removed": removed_clean_points}
         metrics = None
         if "clean_lidar" in row:
             if targets is None:
@@ -324,9 +307,8 @@ def main() -> None:
                         fault_type=fault_type,
                         totals=(len(faulty_roi), len(clean_roi),
                                 len(radar_roi), len(xyz)),
-                        changed_geometry=changed_geometry,
-                        changed_reflectivity=changed_reflectivity,
-                        median_intensity=median_intensity, metrics=metrics)
+                        removed_clean_points=removed_clean_points,
+                        metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)
         print(json.dumps(stats), flush=True)
@@ -339,9 +321,8 @@ def main() -> None:
             f'<li><a target="viewer" href="{html.escape(item["viewer"])}">'
             f'Frame {html.escape(item["frame_id"])} · {html.escape(item["fault_type"])} · epoch {item["epoch"]}</a> · '
             f'{item["reconstructed_points"]:,} reconstructed'
-            + (f'; {item["clean_points_absent_or_shifted"]:,} XYZ changed, '
-               f'{item["clean_points_reflectivity_changed"]:,} reflectivity changed'
-               if item["clean_points_absent_or_shifted"] is not None else '')
+            + (f'; {item["clean_points_removed"]:,} clean points removed'
+               if item["clean_points_removed"] is not None else '')
             + '</li>'
             for item in summary)
         first = html.escape(summary[0]["viewer"])

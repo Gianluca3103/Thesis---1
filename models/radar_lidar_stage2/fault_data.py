@@ -3,6 +3,7 @@
 The fault plan matches the established reconstruction injector: total_loss:1,
 fov_filter:5, and fog_sim:5. Fog is generated from the full raw scan once and
 cached after the same calibrated radar-FOV crop used by clean Stage-II data.
+Only original XYZ returns are exposed to the model.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ import numpy as np
 import torch
 
 
-FAULT_POLICY_VERSION = "stage2_severe_faults_v1"
+FAULT_POLICY_VERSION = "stage2_fog_return_dropout_xyz_v2"
+# Raw simulator archives retain their old on-disk format so existing caches work.
+FOG_CACHE_VERSION = "stage2_severe_faults_v1"
 FAULT_PLAN = (("total_loss", 1), ("fov_filter", 5), ("fog_sim", 5))
 FAULT_NAMES = tuple(name for name, _ in FAULT_PLAN)
 FOG_ALPHA = 0.06
@@ -49,8 +52,8 @@ def selected_fault(frame_id: str, epoch: int, seed: int = 3103) -> str:
 def severe_fov_filter(points: np.ndarray) -> np.ndarray:
     """Exact severity-5 filter from 3D_Corruptions_AD/LiDAR_corruptions.py."""
     points = np.asarray(points, dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] < 4:
-        raise ValueError("FOV filter expects LiDAR rows with XYZ and reflectivity")
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError("FOV filter expects LiDAR XYZ rows")
     with np.errstate(divide="ignore", invalid="ignore"):
         angle = (np.arctan(points[:, 0] / points[:, 1])
                  + (points[:, 1] < 0) * np.pi + 2 * np.pi) % (2 * np.pi)
@@ -65,7 +68,7 @@ class SevereFogCache:
         self.root = Path(root) / split
         manifest_path = self.root / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (manifest.get("version") != FAULT_POLICY_VERSION
+        if (manifest.get("version") != FOG_CACHE_VERSION
                 or manifest.get("split") != split
                 or manifest.get("seed") != seed
                 or manifest.get("fault") != "fog_sim"
@@ -98,7 +101,7 @@ class SevereFogCache:
                 points = np.asarray(archive["points"], dtype=np.float32)
             else:
                 raise ValueError(f"Unknown severe fog encoding: {self.path(frame_id)}")
-        if (metadata.get("version") != FAULT_POLICY_VERSION
+        if (metadata.get("version") != FOG_CACHE_VERSION
                 or metadata.get("frame_id") != frame_id
                 or metadata.get("fault") != "fog_sim"
                 or metadata.get("severity") != 5
@@ -109,7 +112,35 @@ class SevereFogCache:
                 or len(points) != metadata.get("cropped_points")
                 or not np.isfinite(points).all()):
             raise ValueError(f"Invalid severe fog cache entry: {self.path(frame_id)}")
-        return torch.from_numpy(points.copy())
+        return torch.from_numpy(points[:, :3].copy())
+
+
+def retain_original_fog_returns(clean_xyz: np.ndarray,
+                                simulated_fog: np.ndarray) -> np.ndarray:
+    """Keep only original XYZ returns, respecting duplicate multiplicity.
+
+    The simulator replaces some original rays with shifted fog echoes. Its
+    cached output preserves no source indices, so exact XYZ matching against
+    the clean scan removes those synthetic returns without regenerating fog.
+    """
+    clean = np.ascontiguousarray(clean_xyz[:, :3], dtype=np.float32)
+    fog = np.ascontiguousarray(simulated_fog[:, :3], dtype=np.float32)
+    if not len(clean) or not len(fog):
+        return fog[:0].copy()
+    row_type = np.dtype((np.void, 3 * np.dtype(np.float32).itemsize))
+    clean_rows = clean.view(row_type).reshape(-1)
+    fog_rows = fog.view(row_type).reshape(-1)
+    unique, clean_counts = np.unique(clean_rows, return_counts=True)
+    positions = np.searchsorted(unique, fog_rows)
+    safe = np.minimum(positions, len(unique) - 1)
+    present = (positions < len(unique)) & (unique[safe] == fog_rows)
+    order = np.argsort(fog_rows, kind="stable")
+    ordered = fog_rows[order]
+    group_start = np.maximum.accumulate(np.where(
+        np.r_[True, ordered[1:] != ordered[:-1]], np.arange(len(fog)), 0))
+    occurrence = np.empty(len(fog), dtype=np.int64)
+    occurrence[order] = np.arange(len(fog)) - group_start
+    return fog[present & (occurrence < clean_counts[safe])].copy()
 
 
 def severe_fault(clean: torch.Tensor, frame_id: str, epoch: int,
@@ -117,17 +148,21 @@ def severe_fault(clean: torch.Tensor, frame_id: str, epoch: int,
                  fault_type: str | None = None) -> tuple[torch.Tensor, str]:
     """Use one established severe fault; clean must be the cropped clean scan."""
     name = fault_type or selected_fault(frame_id, epoch, seed)
+    clean_xyz = clean[:, :3]
     if name == "total_loss":
-        return clean[:0], name
+        return clean_xyz[:0], name
     if name == "fov_filter":
-        filtered = severe_fov_filter(clean.cpu().numpy())
+        filtered = severe_fov_filter(clean_xyz.cpu().numpy())
         return torch.from_numpy(filtered.copy()), name
     if name == "fog_sim":
-        return fog_cache.load(frame_id), name
+        filtered = retain_original_fog_returns(
+            clean_xyz.cpu().numpy(), fog_cache.load(frame_id).numpy())
+        return torch.from_numpy(filtered), name
     raise ValueError(f"Unsupported Stage-II fault: {name}")
 
 
 def load_faulty(root: Path, split: str, frame_id: str) -> torch.Tensor:
+    """Read the legacy four-column file and expose only XYZ to Stage II."""
     paths = (root / split / f"{frame_id}.bin", root / f"{frame_id}.bin")
     matches = [path for path in paths if path.is_file()]
     if len(matches) != 1:
@@ -140,4 +175,4 @@ def load_faulty(root: Path, split: str, frame_id: str) -> torch.Tensor:
     points = torch.from_numpy(raw.reshape(-1, 4).copy())
     if not torch.isfinite(points).all():
         raise ValueError(f"Faulty LiDAR contains NaN or Inf: {matches[0]}")
-    return points
+    return points[:, :3].contiguous()

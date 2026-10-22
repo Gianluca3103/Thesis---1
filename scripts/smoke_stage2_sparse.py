@@ -30,7 +30,7 @@ def main() -> None:
     xyz[:3] = xyz.new_tensor([[8.01, -1.49, -0.74],
                               [8.04, -1.47, -0.72],
                               [8.08, -1.43, -0.69]])
-    clean = torch.cat((xyz, torch.rand((320, 1), device=device) * 255), dim=1)
+    clean = xyz
     faulty = clean[::3]
     occupied, _ = voxelize_means(clean)
     neighbors = [occupied]
@@ -54,19 +54,10 @@ def main() -> None:
     model = SparseResidualStage2().to(device)
     conditions = model.conditions(stage1, 0.3)
     latent, _ = model.encode_lidar(clean, conditions)
-    with torch.no_grad():
-        dimmed = clean.clone()
-        dimmed[:, 3] = 0
-        dimmed_latent, _ = model.encode_lidar(dimmed, conditions)
-        if torch.allclose(latent, dimmed_latent):
-            raise AssertionError("Shared LiDAR encoder ignored reflectivity")
-    first = model.lpcr_loss(latent, conditions, clean[:, :3])
-    if not torch.isfinite(first["centroid"]):
-        raise AssertionError("LPCR distribution-centroid loss is invalid")
+    first = model.lpcr_loss(latent, conditions, clean)
     first["loss"].backward()
     for name, layer in (("occupancy", model.lpcr.occupancy),
-                        ("count", model.lpcr.log_count),
-                        ("point density", model.lpcr.point_density)):
+                        ("offset", model.lpcr.offset)):
         grad = layer.weight.grad
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
             raise AssertionError(f"LPCR {name} gradient is missing or invalid")
@@ -85,9 +76,9 @@ def main() -> None:
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
-    if (sampled["predicted_points"] < sampled["predicted_cells"]
+    if (sampled["predicted_points"] != sampled["predicted_cells"]
             or sampled["predicted_points"] != len(sampled["points_xyz"])):
-        raise AssertionError("Variable-cardinality point emission is inconsistent")
+        raise AssertionError("LPCR must emit one point per selected voxel")
     if len(sampled["points_xyz"]):
         minimum = sampled["points_xyz"].new_tensor(GRID.minimum_xyz)
         size = sampled["points_xyz"].new_tensor(GRID.voxel_xyz)

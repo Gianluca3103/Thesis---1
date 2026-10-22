@@ -49,7 +49,7 @@ def main() -> None:
     for name in FAULT_NAMES:
         faulty, actual = severe_fault(clean, row["frame_id"], 0, cache,
                                       seed=args.seed, fault_type=name)
-        if actual != name or faulty.ndim != 2 or faulty.shape[1] != 4:
+        if actual != name or faulty.ndim != 2 or faulty.shape[1] != 3:
             raise AssertionError(f"Invalid {name} output")
         if not torch.isfinite(faulty).all():
             raise AssertionError(f"Nonfinite {name} output")
@@ -61,16 +61,10 @@ def main() -> None:
     if counts["faults"]["fov_filter"]["points"] >= len(clean):
         raise AssertionError("Severity-5 FOV injector did not narrow this frame")
     fog = faulty_clouds[FAULT_NAMES.index("fog_sim")]
-    if len(fog) == len(clean) and torch.equal(fog, clean):
-        raise AssertionError("Severity-5 fog injector did not change the scan")
-    fog_xyz_kept = _present_in_faulty(clean[:, :3].numpy(), fog[:, :3].numpy())
-    fog_full_kept = _present_in_faulty(clean.numpy(), fog.numpy())
-    counts["faults"]["fog_sim"]["clean_xyz_absent_or_shifted"] = int(
-        (~fog_xyz_kept).sum())
-    counts["faults"]["fog_sim"]["clean_reflectivity_changed"] = int(
-        (fog_xyz_kept & ~fog_full_kept).sum())
-    if not counts["faults"]["fog_sim"]["clean_reflectivity_changed"]:
-        raise AssertionError("Severity-5 fog did not alter reflectivity")
+    fog_from_clean = _present_in_faulty(fog.numpy(), clean[:, :3].numpy())
+    if len(fog) > len(clean) or not fog_from_clean.all():
+        raise AssertionError("Fog input contains a synthetic point or extra return")
+    counts["faults"]["fog_sim"]["clean_points_removed"] = len(clean) - len(fog)
     combined, batch_ids = _combine_points(faulty_clouds)
     if len(combined) != sum(len(cloud) for cloud in faulty_clouds):
         raise AssertionError("Empty total-loss frame broke physical batching")

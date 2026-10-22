@@ -21,7 +21,7 @@ from models.radar_lidar_stage1.radar_fov import (
     RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M, crop_lidar_to_radar_fov,
 )
 from models.radar_lidar_stage2.fault_data import (
-    FAULT_POLICY_VERSION, FOG_ALPHA, FOG_CACHE_ENCODING, FOG_NOISE,
+    FOG_CACHE_VERSION, FOG_ALPHA, FOG_CACHE_ENCODING, FOG_NOISE,
     encode_fog_points,
 )
 
@@ -63,7 +63,7 @@ def _fog_frame(job: tuple) -> tuple[str, str, int, int]:
     if destination.is_file():
         with np.load(destination, allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata_json"].item()))
-            if (metadata.get("version") != FAULT_POLICY_VERSION
+            if (metadata.get("version") != FOG_CACHE_VERSION
                     or metadata.get("frame_id") != frame.frame_id
                     or metadata.get("fault") != "fog_sim"
                     or metadata.get("severity") != 5
@@ -99,7 +99,7 @@ def _fog_frame(job: tuple) -> tuple[str, str, int, int]:
     cropped = crop_lidar_to_radar_fov(
         np.asarray(simulated[:, :4], dtype=np.float32), lidar_from_radar,
         half_fov_deg=RADAR_HALF_FOV_DEG, max_range_m=RADAR_MAX_RANGE_M)
-    metadata = {"version": FAULT_POLICY_VERSION, "frame_id": frame.frame_id,
+    metadata = {"version": FOG_CACHE_VERSION, "frame_id": frame.frame_id,
                 "fault": "fog_sim", "severity": 5, "seed": seed,
                 "injection_seed": injection_seed, "alpha": FOG_ALPHA,
                 "noise": FOG_NOISE, "raw_points": len(clean),
@@ -139,7 +139,7 @@ def main() -> None:
     total_frames = sum(len(frames) for frames in frames_by_split.values())
     processed = total_bytes = 0
     for split, frames in frames_by_split.items():
-        manifest = {"version": FAULT_POLICY_VERSION, "fault": "fog_sim",
+        manifest = {"version": FOG_CACHE_VERSION, "fault": "fog_sim",
                     "severity": 5, "alpha": FOG_ALPHA, "noise": FOG_NOISE,
                     "split": split, "seed": args.seed,
                     "vod_root": str(args.vod_root.resolve()),

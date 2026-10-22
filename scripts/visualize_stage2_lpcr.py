@@ -84,7 +84,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${data.split} frame ${data.frame} · LPCR epoch ${data.epoch}`;
-document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.allowed_cells.toLocaleString()} radar-allowed cells; ${data.candidate_total.toLocaleString()} candidate LPCR points. Multiple points can occupy each allowed voxel. The browser displays all ${data.clean.length.toLocaleString()} clean points and ${data.reconstructed.length.toLocaleString()} candidate reconstructions.`;
+document.getElementById('counts').textContent=`${data.clean_total.toLocaleString()} clean LiDAR points in the Stage II ROI; ${data.allowed_cells.toLocaleString()} radar-allowed cells; ${data.candidate_total.toLocaleString()} candidate LPCR points, one per allowed voxel. The browser displays all ${data.clean.length.toLocaleString()} clean points and ${data.reconstructed.length.toLocaleString()} candidate reconstructions.`;
 const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.value=data.threshold;value.textContent=Number(slider.value).toFixed(2);
 const names=['Clean LiDAR','LPCR reconstruction','Overlay'],panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -141,17 +141,17 @@ def main() -> None:
     for index in indices:
         row = dataset[index]
         frame_id = row["frame_id"]
-        clean = row["clean_lidar"].to(args.device)
+        clean = row["clean_lidar"][:, :3].to(args.device)
         output, _ = cache.load(frame_id, args.device)
         conditions = model.conditions(output, float(saved["gate_threshold"]))
         if not len(conditions.hierarchy[0]):
             print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
             continue
         latent, _ = model.encode_lidar(clean, conditions)
-        logits, log_count, hidden = model.lpcr(
+        logits, offsets = model.lpcr(
             latent, conditions.hierarchy, conditions.fine_probabilities)
         generated = model.lpcr.emit_points(
-            hidden, conditions.hierarchy[0], logits, log_count, 0.0)
+            conditions.hierarchy[0], logits, offsets, 0.0)
         scores = generated["probabilities"].cpu().numpy().astype(np.float32)
         coords = conditions.hierarchy[0][:, [3, 2, 1]].cpu().numpy()
         reconstructed = generated["points_xyz"].cpu().numpy().astype(np.float32)
@@ -166,7 +166,6 @@ def main() -> None:
         np.savez_compressed(stem.with_suffix(".npz"), clean_xyz=clean_roi,
                             candidate_xyz=reconstructed, occupancy_probability=scores,
                             allowed_coordinates=coords,
-                            point_counts=generated["point_counts"].cpu().numpy(),
                             point_coordinates=generated["coordinates"].cpu().numpy())
         viewer = stem.with_suffix(".html")
         _write_html(viewer, frame_id, args.split, int(saved["epoch"]), clean_roi,

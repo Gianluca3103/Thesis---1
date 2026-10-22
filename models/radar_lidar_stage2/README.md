@@ -14,33 +14,26 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
    support is retained.
 2. The probability threshold selects active cells **before** sparse decoding.
    Only these cells and their parents are allocated at the five LPCR scales.
-3. One shared Minkowski LiDAR encoder processes XYZ, reflectivity, local
-   point spread, and point count from clean LiDAR during training and faulty
-   LiDAR during training and inference.
-   Both map to the same sparse latent coordinates selected in step 2. The
-   reflectivity channel matters for fog, which attenuates many otherwise
-   unchanged XYZ returns.
+3. One shared Minkowski LiDAR encoder processes only XYZ from clean LiDAR
+   during training and faulty LiDAR during training and inference. Both map
+   to the same sparse latent coordinates selected in step 2. The encoder
+   accepts three channels and rejects intensity-bearing input.
 4. Pretrain the LiDAR encoder and sparse LPCR decoder on clean LiDAR, on the
    Stage-I-selected sites. Measured occupied cells and observed free cells
    supervise occupancy; no-return cells with unknown visibility are ignored.
-   Occupied cells also supervise their measured point counts and the full
-   within-voxel point distribution. A point density head models eight
-   continuous components; the count head determines how many points to draw.
-   A small auxiliary loss aligns a deterministic approximation of the
-   distribution's expected centroid with the measured clean-point centroid
-   in each occupied voxel.
+   Occupied cells also supervise a center-relative XYZ offset to the clean
+   point centroid in that voxel. The restored LPCR objective is occupancy
+   BCE plus `0.04 ×` offset L1.
 5. Freeze the pretrained LiDAR encoder and decoder. Train a radar spatial
    adapter and sparse latent U-Net on `R = Z_clean - Z_faulty`. The U-Net
    receives a noised residual, faulty latent, aligned radar features, pooled
    Stage-I probabilities and diffusion time. Noise MSE, residual MSE, and
-   decoded occupancy/count/point-density/centroid losses all update the U-Net
-   and radar adapter.
+   decoded occupancy/offset loss all update the U-Net and radar adapter.
 6. Inference reads only radar and faulty LiDAR. DDIM-style sampling estimates
    the residual, `Z_clean_hat = Z_faulty + R_hat`, then LPCR predicts occupancy
-   and a variable number of points **only at selected cells**. The predicted
-   point count has no fixed per-voxel cap, and preview HTML includes all
-   reconstructed points. Clean LiDAR is never used to choose coordinates or
-   at inference.
+   and one point per predicted occupied voxel **only at selected cells**.
+   Clean LiDAR is never used to choose coordinates or at inference. No LiDAR
+   intensity is consumed or predicted.
 
 The common region is XYZ `[0,32] × [-16,16] × [-2,2]` m with voxels
 `0.2 × 0.2 × 0.25` m, giving `16 × 160 × 160` fine cells and a
@@ -51,27 +44,26 @@ to `0.25`; it determines a strict recall ceiling. Report `gate_coverage`
 alongside Known/Full IoU. Those IoUs are measured on the Stage-II gate and
 region, so they are not directly comparable with Stage-I full-grid IoU. The
 output `.ply` contains reconstructed points within allowed sites; existing
-faulty points outside that set are not merged into it.
-Known/Full IoU remain voxel occupancy metrics; the logs also report point
-count MAE and the within-voxel point-density and centroid losses. In a 40-frame VoD
-validation sample, occupied Stage-II voxels held 9.24 clean points on
-average, so a centroid-only decoder could represent only 10.8% of returns.
+faulty points outside that set are not merged into it. Known/Full IoU remain
+voxel occupancy metrics. The one-point decoder is intentionally a sparse
+centroid reconstruction, not a full-density LiDAR scan.
 
 Synthetic diffusion training now cycles each frame through the established
 severe fault plan over three epochs: `total_loss:1` (zero returns),
 `fov_filter:5` (the narrowest retained FOV from 3D_Corruptions_AD), and
 `fog_sim:5` (the original fog simulator with alpha 0.06 and noise 10).
 Fog is applied to the full raw scan before the calibrated forward crop and
-cached once. Fog cache files use reversible float32 byte shuffling before
-lossless ZIP compression. Existing fog files are compacted in place when the
-builder is rerun. An eight-frame VoD sample projects about 1.9 GiB for the
-complete train and validation fog cache; the builder checks against a 5 GiB
-default projected-size limit. It uses two CPU workers by default. The FOV
+cached once. On load, only original clean XYZ returns are retained; the
+simulator's shifted fog responses are dropped. The simulator can use raw
+intensity internally to decide which returns are lost, but Stage II discards
+all intensity before encoding. The existing losslessly compressed fog cache
+can be reused without regeneration. The FOV
 filter is an exact implementation of the original
 severity-5 selection; total loss and FOV are computed without a data cache.
 For real faulty LiDAR, supply
 pre-aligned `float32` `.bin` files with four columns at
-`FAULTY_ROOT/{train,val,test}/FRAME.bin` (or `FAULTY_ROOT/FRAME.bin`).
+`FAULTY_ROOT/{train,val,test}/FRAME.bin` (or `FAULTY_ROOT/FRAME.bin`). The
+fourth column is read for file-format compatibility and then discarded.
 
 ## Run on the professor machine
 
@@ -90,8 +82,8 @@ S1="$OUT5/radar_autoencoder/best_student.ckpt"
 CACHE="$OUT5/stage2_fixed_gate025_v1"
 FOG_CACHE="$OUT5/stage2_severe_fog_s5_v1"
 FOG_SIM=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim
-LPCR="$OUT5/stage2_sparse_lpcr_multipoint_centroid_v4"
-DIFF="$OUT5/stage2_sparse_diffusion_multipoint_centroid_v4"
+LPCR="$OUT5/stage2_sparse_lpcr_xyz_offset_v5"
+DIFF="$OUT5/stage2_sparse_diffusion_xyz_offset_v5"
 
 "$PY" -m scripts.smoke_stage2_sparse --device cuda
 
@@ -143,22 +135,18 @@ with aligned radar, and faulty LiDAR with radar and reconstruction. Each panel
 can toggle any of these four layers independently. The confidence slider filters
 reconstructed points down to the generation threshold set with
 `--occupancy-threshold`; regenerating the preview with a lower threshold is
-needed to inspect lower-confidence points. The preview reports clean returns
-altered in XYZ or reflectivity. Fog often changes reflectivity more than XYZ.
+needed to inspect lower-confidence points. The preview reports how many clean
+returns were removed by each synthetic fault.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new cache and LPCR run.
 The existing Stage-I, Stage-II geometry, and severe-fog caches can be reused.
-LPCR and diffusion both need new runs for the multi-point decoder and its
-centroid objective. Older one-point and pre-centroid checkpoints are rejected.
+LPCR and diffusion both need new runs because the shared encoder input and
+decoder heads changed. Existing Stage-II checkpoints cannot be resumed.
 Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
-The LPCR loss retains occupied/free voxel supervision, adds a `0.1`-weighted
-log-count error, a `0.04`-weighted likelihood over every measured clean
-point inside an allowed voxel, and a `0.04`-weighted centroid error in metres.
-The centroid is approximated from the learned point distribution using
-deterministic three-point Gaussian quadrature; it does not restore a
-one-point-per-voxel output. The 30-epoch, `1e-3` AdamW/StepLR starting
-settings are retained. Diffusion defaults are separate proposed settings.
+The LPCR loss is `L_occ + 0.04 L_offset`. The diffusion loss is
+`L_noise + L_residual + L_LPCR` with default outer weights of one. The
+30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 
 Start with `--train-limit 2 --val-limit 2 --epochs 1 --num-workers 0`
 in a new output directory to check the full Stage-I-to-Stage-II path.
