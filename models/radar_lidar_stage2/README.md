@@ -138,8 +138,13 @@ The last command uses a deterministic mix of the three severe faults for a
 validation demonstration. Add `--fault-type total_loss`, `fov_filter`, or
 `fog_sim` to preview one condition across all selected frames. Open
 `$DIFF/val_samples/index.html` to inspect the results.
-The preview marks clean returns altered in XYZ or reflectivity, and reports
-both counts separately. Fog often changes reflectivity more than XYZ.
+The four default panels show faulty LiDAR, clean LiDAR, reconstructed points
+with aligned radar, and faulty LiDAR with radar and reconstruction. Each panel
+can toggle any of these four layers independently. The confidence slider filters
+reconstructed points down to the generation threshold set with
+`--occupancy-threshold`; regenerating the preview with a lower threshold is
+needed to inspect lower-confidence points. The preview reports clean returns
+altered in XYZ or reflectivity. Fog often changes reflectivity more than XYZ.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new cache and LPCR run.
 The existing Stage-I, Stage-II geometry, and severe-fog caches can be reused.

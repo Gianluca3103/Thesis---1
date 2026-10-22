@@ -62,17 +62,18 @@ def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
 
 
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
-                faulty: np.ndarray, clean: np.ndarray, predicted: np.ndarray,
-                removed: np.ndarray,
+                faulty: np.ndarray, clean: np.ndarray, radar: np.ndarray,
+                predicted: np.ndarray, probabilities: np.ndarray,
                 threshold: float, allowed_cells: int, predicted_cells: int,
                 sampling_steps: int,
-                fault_type: str, totals: tuple[int, int, int],
+                fault_type: str, totals: tuple[int, int, int, int],
                 changed_geometry: int | None,
                 changed_reflectivity: int | None,
                 median_intensity: tuple[float | None, float | None],
-                shared_subset: bool,
                 metrics: dict | None) -> None:
-    clouds = [faulty, clean, predicted]
+    if len(predicted) != len(probabilities):
+        raise ValueError("One confidence value is required per reconstructed point")
+    clouds = [faulty, clean, radar, predicted]
     nonempty = [cloud for cloud in clouds if len(cloud)]
     if nonempty:
         combined = np.concatenate(nonempty)
@@ -83,15 +84,15 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "frame": frame_id, "epoch": epoch, "split": split,
         "faulty": np.round(faulty, 3).tolist(),
         "clean": np.round(clean, 3).tolist(),
+        "radar": np.round(radar, 3).tolist(),
         "predicted": np.round(predicted, 3).tolist(),
-        "removed": np.round(removed, 3).tolist(),
+        "probabilities": np.round(probabilities.astype(np.float64), 4).tolist(),
         "threshold": threshold, "allowed_cells": allowed_cells,
         "predicted_cells": predicted_cells,
         "sampling_steps": sampling_steps, "fault_type": fault_type,
         "totals": totals, "changed_geometry": changed_geometry,
         "changed_reflectivity": changed_reflectivity,
         "median_intensity": median_intensity,
-        "shared_subset": shared_subset,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
@@ -101,17 +102,19 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
 <style>
 body{margin:0;padding:12px;background:#101820;color:#eef5fa;font:14px system-ui,sans-serif}
 h1{font-size:20px;margin:0 0 6px}p{color:#b9c8d6;margin:5px 0 10px}
-.controls{display:flex;gap:10px;margin:12px 0}button{background:#253847;color:inherit;border:1px solid #637b8b;border-radius:4px;padding:5px 9px;cursor:pointer}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}button{background:#253847;color:inherit;border:1px solid #637b8b;border-radius:4px;padding:5px 9px;cursor:pointer}
 .panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 section{min-width:0;background:#182633;border:1px solid #3b5164;border-radius:5px;padding:6px}
 h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;background:#0c1620;touch-action:none;cursor:grab}
+.layers{display:flex;gap:4px 12px;flex-wrap:wrap;margin:5px 0 8px}.layers label{white-space:nowrap;cursor:pointer}.layers input{vertical-align:middle}
+.confidence{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.confidence input{width:220px}
 .legend{color:#b9c8d6;margin-top:8px}
 @media(max-width:750px){.panels{display:block}section{margin-bottom:8px}canvas{height:50vh;min-height:280px}}
 </style>
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
-<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
+<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#f450d5">●</span> clean points changed in XYZ or reflectivity &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Each panel has its own layer switches. The confidence slider filters reconstructed points in every panel; it cannot show points below the generation threshold. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -119,19 +122,23 @@ const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'The established fog simulator at severity 5 changes ranges and intensities on the full raw scan before the forward crop.',real:'Pre-aligned real faulty LiDAR was loaded.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.shared_subset?'Faulty and clean panels show the complete clean-point set.':'Fog and clean panels show their complete respective clouds, including shifted fog returns.'}`;
-if(d.metrics){const p=document.createElement('p');p.textContent=`Reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
-const names=['Faulty LiDAR input',d.changed_geometry===null?'Clean LiDAR reference':'Clean LiDAR reference + changed points','Stage II reconstruction','Clean + reconstruction'];if(d.changed_geometry!==null)names.push('Faulty input + changed clean points');const panes=document.getElementById('panels'),canvases=[],headings=[];
-for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} reconstructed points in ${d.predicted_cells.toLocaleString()} predicted occupied voxels. ${d.changed_geometry===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.changed_geometry.toLocaleString()} clean points absent or shifted in XYZ; ${d.changed_reflectivity.toLocaleString()} additional points changed only in reflectivity.`} Median reflectivity: clean ${d.median_intensity[0]===null?'unavailable':d.median_intensity[0].toFixed(1)}, faulty ${d.median_intensity[1]===null?'unavailable':d.median_intensity[1].toFixed(1)}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
+if(d.metrics){const p=document.createElement('p');p.textContent=`Metrics at the generation threshold: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
+const layers=[{key:'faulty',name:'Faulty LiDAR',color:'#ffb85c'},{key:'clean',name:'Clean LiDAR',color:'#60d796'},{key:'radar',name:'Radar',color:'#67b7ff'},{key:'predicted',name:'Reconstructed',color:'#ff8b6c'}];
+const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
+const panes=document.getElementById('panels'),panels=[];
+for(const preset of presets){const section=document.createElement('section'),h=document.createElement('h2'),switches=document.createElement('div'),canvas=document.createElement('canvas'),inputs={};switches.className='layers';h.textContent=preset.name;for(const layer of layers){const label=document.createElement('label'),input=document.createElement('input'),swatch=document.createElement('span');input.type='checkbox';input.checked=preset.visible.includes(layer.key);input.setAttribute('aria-label',`${preset.name}: ${layer.name}`);input.addEventListener('change',redraw);swatch.textContent='● ';swatch.style.color=layer.color;label.append(input,swatch,document.createTextNode(layer.name));switches.append(label);inputs[layer.key]=input;}section.append(h,switches,canvas);panes.append(section);panels.push({name:preset.name,heading:h,canvas,inputs});}
+const confidence=document.getElementById('confidence'),confidenceValue=document.getElementById('confidence-value');confidence.min=String(d.threshold);confidence.value=String(d.threshold);confidenceValue.textContent=Number(confidence.value).toFixed(2);
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
 function project(p,w,h,s){const x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);const u=cy*x-sy*y,v=sy*x+cy*y;return [w/2+view.panX+u*s,h/2+view.panY-(cp*z-sp*v)*s];}
-function plot(ctx,points,w,h,s,color){ctx.fillStyle=color;for(const p of points){const [x,y]=project(p,w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-1,y-1,2,2);}}
-function draw(canvas,index){const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;if(index===0||index===4)plot(ctx,d.faulty,w,h,scale,'#ffb85c');if(index===1||index===3)plot(ctx,d.clean,w,h,scale,'#60d796');if(index===2||index===3)plot(ctx,d.predicted,w,h,scale,'#ff8b6c');if(index===1||index===4)plot(ctx,d.removed,w,h,scale,'#f450d5');const count=index===0?d.faulty.length:index===1?d.clean.length:index===2?d.predicted.length:index===3?d.clean.length+d.predicted.length:d.faulty.length+d.removed.length;headings[index].textContent=`${names[index]}: ${count.toLocaleString()} shown`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
-let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;canvases.forEach(draw);});}
+function plot(ctx,points,w,h,s,color,scores,cutoff,size){let selected=0;ctx.fillStyle=color;for(let i=0;i<points.length;i++){if(scores&&scores[i]<cutoff)continue;selected++;const [x,y]=project(points[i],w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-size/2,y-size/2,size,size);}return selected;}
+function draw(panel){const canvas=panel.canvas,ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;let count=0;for(const key of ['predicted','faulty','clean','radar']){if(!panel.inputs[key].checked)continue;const layer=layers.find(item=>item.key===key);count+=plot(ctx,d[key],w,h,scale,layer.color,key==='predicted'?d.probabilities:null,Number(confidence.value),key==='radar'?4:2);}panel.heading.textContent=`${panel.name}: ${count.toLocaleString()} layer points selected`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
+let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;panels.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
-for(const canvas of canvases){let last=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);last=[e.clientX,e.clientY];});canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1];if(e.shiftKey){view.panX+=dx;view.panY+=dy;}else{view.yaw+=dx*.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.008));}redraw();});for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,()=>{last=null;});canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
-document.getElementById('zin').onclick=()=>{zoom(1.6,canvases[0].clientWidth/2,canvases[0].clientHeight/2,canvases[0].clientWidth,canvases[0].clientHeight);redraw();};document.getElementById('zout').onclick=()=>{zoom(1/1.6,canvases[0].clientWidth/2,canvases[0].clientHeight/2,canvases[0].clientWidth,canvases[0].clientHeight);redraw();};document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};window.addEventListener('resize',redraw);redraw();
+for(const {canvas} of panels){let last=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);last=[e.clientX,e.clientY];});canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1];if(e.shiftKey){view.panX+=dx;view.panY+=dy;}else{view.yaw+=dx*.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.008));}redraw();});for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,()=>{last=null;});canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
+confidence.addEventListener('input',()=>{confidenceValue.textContent=Number(confidence.value).toFixed(2);redraw();});
+document.getElementById('zin').onclick=()=>{const canvas=panels[0].canvas;zoom(1.6,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('zout').onclick=()=>{const canvas=panels[0].canvas;zoom(1/1.6,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};window.addEventListener('resize',redraw);redraw();
 })();
 </script></html>'''.replace("__DATA__", payload)
     path.write_text(markup, encoding="utf-8")
@@ -239,26 +246,16 @@ def main() -> None:
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())
+        radar_roi = _roi(row["radar"].cpu().numpy())
         clean_roi = (_roi(row["clean_lidar"].numpy())
                      if "clean_lidar" in row else np.empty((0, 3), dtype=np.float32))
         synthetic = args.faulty_root is None
-        shared_subset = fault_type in ("total_loss", "fov_filter")
         changed_geometry = changed_reflectivity = None
         if synthetic:
             kept = _present_in_faulty(clean_roi, faulty_roi)
             xyz_kept = _present_in_faulty(clean_roi[:, :3], faulty_roi[:, :3])
             changed_geometry = int((~xyz_kept).sum())
             changed_reflectivity = int((xyz_kept & ~kept).sum())
-        clean_display = clean_roi
-        if shared_subset:
-            display_kept = _present_in_faulty(clean_display, faulty_roi)
-            faulty_display = clean_display[display_kept, :3]
-            removed_display = clean_display[~display_kept, :3]
-        else:
-            faulty_display = faulty_roi[:, :3]
-            removed_display = (clean_display[~_present_in_faulty(
-                clean_display, faulty_roi), :3] if synthetic
-                else np.empty((0, 3), dtype=np.float32))
         median_intensity = (
             float(np.median(clean_roi[:, 3])) if len(clean_roi) else None,
             float(np.median(faulty_roi[:, 3])) if len(faulty_roi) else None)
@@ -273,6 +270,7 @@ def main() -> None:
                                 "occupied_coordinates"].cpu().numpy(),
                             point_counts=predicted["point_counts"].cpu().numpy(),
                             faulty_xyz=faulty_roi[:, :3], clean_xyz=clean_roi[:, :3],
+                            radar_xyz=radar_roi[:, :3],
                             faulty_reflectivity=faulty_roi[:, 3],
                             clean_reflectivity=clean_roi[:, 3],
                             fault_type=np.asarray(fault_type))
@@ -285,6 +283,7 @@ def main() -> None:
                      int(predicted["point_counts"].max())
                      if predicted["predicted_cells"] else 0),
                  "faulty_input_points": len(faulty_roi),
+                 "radar_input_points": len(radar_roi),
                  "clean_reference_points": len(clean_roi),
                  "clean_points_absent_or_shifted": changed_geometry,
                  "clean_points_reflectivity_changed": changed_reflectivity,
@@ -315,19 +314,19 @@ def main() -> None:
             viewer = stem.with_suffix(".html")
             _write_html(viewer, frame_id=frame_id, epoch=int(saved2["epoch"]),
                         split=args.split,
-                        faulty=faulty_display, clean=clean_display[:, :3],
-                        predicted=xyz,
-                        removed=removed_display,
+                        faulty=faulty_roi[:, :3], clean=clean_roi[:, :3],
+                        radar=radar_roi[:, :3], predicted=xyz,
+                        probabilities=scores,
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
                         predicted_cells=predicted["predicted_cells"],
                         sampling_steps=args.sampling_steps,
                         fault_type=fault_type,
-                        totals=(len(faulty_roi), len(clean_roi), len(xyz)),
+                        totals=(len(faulty_roi), len(clean_roi),
+                                len(radar_roi), len(xyz)),
                         changed_geometry=changed_geometry,
                         changed_reflectivity=changed_reflectivity,
-                        median_intensity=median_intensity,
-                        shared_subset=shared_subset, metrics=metrics)
+                        median_intensity=median_intensity, metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)
         print(json.dumps(stats), flush=True)
