@@ -61,6 +61,8 @@ def main() -> None:
         if torch.allclose(latent, dimmed_latent):
             raise AssertionError("Shared LiDAR encoder ignored reflectivity")
     first = model.lpcr_loss(latent, conditions, clean[:, :3])
+    if not torch.isfinite(first["centroid"]):
+        raise AssertionError("LPCR distribution-centroid loss is invalid")
     first["loss"].backward()
     for name, layer in (("occupancy", model.lpcr.occupancy),
                         ("count", model.lpcr.log_count),

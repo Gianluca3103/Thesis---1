@@ -55,6 +55,19 @@ class TestStage2PointDensity(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(head.point_density.weight.grad).all()))
         self.assertTrue(bool((head.point_density.weight.grad != 0).any()))
 
+    def test_distribution_centroid_has_gradient(self):
+        torch.manual_seed(3103)
+        head = self._head()
+        hidden = torch.randn((2, 16), requires_grad=True)
+        predicted = head.expected_local_centroid(hidden)
+        self.assertEqual(tuple(predicted.shape), (2, 3))
+        self.assertTrue(bool((predicted.abs() <= 1).all()))
+        loss = (predicted - torch.tensor([[0.5, 0.0, -0.5],
+                                          [-0.5, 0.0, 0.5]])).abs().mean()
+        loss.backward()
+        self.assertTrue(bool(torch.isfinite(head.point_density.weight.grad).all()))
+        self.assertTrue(bool((head.point_density.weight.grad != 0).any()))
+
     def test_lpcr_loss_uses_all_points_in_occupied_voxel(self):
         head = self._head()
         allowed = torch.tensor([[0, 8, 80, 5], [0, 8, 80, 6]])
@@ -77,6 +90,9 @@ class TestStage2PointDensity(unittest.TestCase):
         self.assertEqual(result["target_points"], 3.0)
         self.assertEqual(result["positive_sites"], 1.0)
         self.assertLess(result["count_mae"], 0.01)
+        torch.testing.assert_close(
+            result["loss"], result["occupancy"] + 0.1 * result["count"]
+            + 0.04 * result["point_nll"] + 0.04 * result["centroid"])
         self.assertTrue(bool(torch.isfinite(head.point_density.weight.grad).all()))
 
 

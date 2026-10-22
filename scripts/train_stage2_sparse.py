@@ -137,7 +137,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                          clean_batch_ids=clean_batch_ids,
                                          batch_size=batch_size)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "count", "point_nll",
+                          ("loss", "occupancy", "count", "point_nll", "centroid",
                            "count_mae", "target_points", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
@@ -176,6 +176,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                           "reconstruction": reconstruction["loss"],
                           "count": reconstruction["count"],
                           "point_nll": reconstruction["point_nll"],
+                          "centroid": reconstruction["centroid"],
                           "count_mae": reconstruction["count_mae"],
                           "target_points": reconstruction["target_points"],
                           "iou_known": reconstruction["iou_known"],

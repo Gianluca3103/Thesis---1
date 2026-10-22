@@ -30,7 +30,7 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "stage2_variable_point_density_v3"
+MODEL_REVISION = "stage2_variable_point_density_centroid_v4"
 LATENT_CHANNELS = 32
 POINT_MIXTURES = 8
 MAX_INFERENCE_POINTS_PER_VOXEL = 512
@@ -215,6 +215,20 @@ class AllowedSiteLPCR(nn.Module):
                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raw = self.point_density(hidden).reshape(-1, POINT_MIXTURES, 7)
         return raw[:, :, 0], raw[:, :, 1:4], raw[:, :, 4:7].clamp(-3.0, 1.0)
+
+    def expected_local_centroid(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Differentiable mean of the emitted point mixture in local XYZ.
+
+        Three-point Gaussian quadrature approximates E[tanh(mu + sigma Z)]
+        for each component and axis, including the component spread.
+        """
+        logits, means, log_scales = self.density_parameters(hidden)
+        spread = math.sqrt(3.0) * log_scales.exp()
+        component_centroids = (
+            torch.tanh(means - spread) + 4 * torch.tanh(means)
+            + torch.tanh(means + spread)) / 6
+        return (F.softmax(logits, dim=1)[:, :, None]
+                * component_centroids).sum(dim=1)
 
     def point_nll(self, hidden: torch.Tensor, site_index: torch.Tensor,
                   local_xyz: torch.Tensor, counts: torch.Tensor,
@@ -407,6 +421,7 @@ class SparseResidualStage2(nn.Module):
                   clean_xyz: torch.Tensor,
                   point_weight: float = 0.04,
                   count_weight: float = 0.1,
+                  centroid_weight: float = 0.04,
                   clean_batch_ids: torch.Tensor | None = None,
                   batch_size: int = 1) -> dict[str, torch.Tensor | float]:
         logits, log_count, hidden = self.lpcr(
@@ -421,6 +436,7 @@ class SparseResidualStage2(nn.Module):
         if not len(logits):
             zero = latent.sum() * 0
             return {"loss": zero, "occupancy": zero, "count": zero,
+                    "centroid": zero,
                     "point_nll": zero, "count_mae": 0.0, "target_points": 0.0,
                     "iou_known": 0.0, "iou_full": 0.0,
                     "gate_coverage": coverage, "known_sites": 0,
@@ -449,6 +465,17 @@ class SparseResidualStage2(nn.Module):
                 reduction="none"), frame_ids[occupied], batch_size) + log_count.sum() * 0
         point_nll = self.lpcr.point_nll(
             hidden, site_index, local_xyz, counts, frame_ids, batch_size)
+        if bool(occupied.any()):
+            local_sums = hidden.new_zeros((len(hidden), 3))
+            local_sums.index_add_(0, site_index, local_xyz.to(hidden.dtype))
+            target_centroids = local_sums[occupied] / counts[occupied, None]
+            predicted_centroids = self.lpcr.expected_local_centroid(hidden[occupied])
+            half_voxel = hidden.new_tensor(self.grid.voxel_xyz) * 0.5
+            centroid = _frame_mean(
+                ((predicted_centroids - target_centroids) * half_voxel
+                 ).abs().mean(1), frame_ids[occupied], batch_size)
+        else:
+            centroid = hidden.sum() * 0
         with torch.no_grad():
             predicted = torch.sigmoid(logits) >= 0.5
             intersection = predicted & occupied
@@ -466,8 +493,10 @@ class SparseResidualStage2(nn.Module):
                 min=0, max=math.log1p(MAX_INFERENCE_POINTS_PER_VOXEL))).round()
             count_mae = (float((predicted_count - counts[occupied]).abs().float().mean())
                          if bool(occupied.any()) else 0.0)
-        return {"loss": occ + count_weight * count + point_weight * point_nll,
+        return {"loss": (occ + count_weight * count + point_weight * point_nll
+                         + centroid_weight * centroid),
                 "occupancy": occ, "count": count, "point_nll": point_nll,
+                "centroid": centroid,
                 "count_mae": count_mae,
                 "target_points": float(len(site_index)) / batch_size,
                 "iou_known": iou_known, "iou_full": iou_full,
