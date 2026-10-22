@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 
+from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
     pool_allowed_probabilities, reconstruction_targets, select_allowed,
@@ -40,6 +41,15 @@ def _require_me() -> None:
 def _replace(tensor, features):
     return ME.SparseTensor(features, coordinate_map_key=tensor.coordinate_map_key,
                            coordinate_manager=tensor.coordinate_manager)
+
+
+def _frame_mean(values: torch.Tensor, batch_ids: torch.Tensor,
+                batch_size: int) -> torch.Tensor:
+    """Average per-frame site means, preserving the batch-one objective."""
+    sums = values.new_zeros(batch_size).scatter_add_(0, batch_ids, values)
+    counts = values.new_zeros(batch_size).scatter_add_(
+        0, batch_ids, torch.ones_like(values))
+    return (sums / counts.clamp_min(1)).mean()
 
 
 class SparseConvNorm(nn.Module):
@@ -95,8 +105,13 @@ class SharedLidarEncoder(nn.Module):
         self.res4 = SparseResidualBlock(LATENT_CHANNELS)
 
     def forward(self, points_xyz: torch.Tensor,
-                latent_coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        voxel_coords, means = voxelize_means(points_xyz, grid=self.grid)
+                latent_coords: torch.Tensor,
+                point_batch_ids: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        voxel_coords, means = (voxelize_means(points_xyz, grid=self.grid)
+                               if point_batch_ids is None else
+                               voxelize_means_batched(points_xyz, point_batch_ids,
+                                                      grid=self.grid))
         if not len(voxel_coords):
             return (points_xyz.new_zeros((len(latent_coords), LATENT_CHANNELS)),
                     torch.zeros(len(latent_coords), dtype=torch.bool,
@@ -224,7 +239,13 @@ class SparseResidualUNet(nn.Module):
             raise ValueError("Diffusion condition shape differs from active latent sites")
         if not count:
             return noisy, noisy
-        time = self.timestep(timestep.long().reshape(1)).expand(count, -1)
+        steps = timestep.long().reshape(-1)
+        if len(steps) == 1:
+            time = self.timestep(steps).expand(count, -1)
+        else:
+            if int(coords[:, 0].max()) >= len(steps):
+                raise ValueError("Missing diffusion timestep for an active batch frame")
+            time = self.timestep(steps)[coords[:, 0].long()]
         location = ((coords[:, 1:].to(noisy.dtype) + 0.5) /
                     noisy.new_tensor(self.latent_shape) * 2 - 1)
         features = torch.cat((noisy, faulty, radar, probability,
@@ -303,12 +324,16 @@ class SparseResidualStage2(nn.Module):
                                 self.radar_adapter(raw))
 
     def encode_lidar(self, points_xyz: torch.Tensor,
-                     conditions: Stage2Conditions) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.lidar_encoder(points_xyz, conditions.hierarchy[-1])
+                     conditions: Stage2Conditions,
+                     point_batch_ids: torch.Tensor | None = None
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.lidar_encoder(points_xyz, conditions.hierarchy[-1],
+                                  point_batch_ids)
 
     def lpcr_loss(self, latent: torch.Tensor, conditions: Stage2Conditions,
                   clean_xyz: torch.Tensor,
-                  offset_weight: float = 0.04) -> dict[str, torch.Tensor | float]:
+                  offset_weight: float = 0.04,
+                  batch_size: int = 1) -> dict[str, torch.Tensor | float]:
         logits, offsets = self.lpcr(latent, conditions.hierarchy,
                                     conditions.fine_probabilities)
         occupied, known_free, target_offsets, coverage = (
@@ -325,35 +350,60 @@ class SparseResidualStage2(nn.Module):
                     "gate_coverage": coverage, "known_sites": 0,
                     "positive_sites": 0}
         known = occupied | known_free
-        occ = (F.binary_cross_entropy_with_logits(logits[known],
-                                                  occupied[known].to(logits.dtype))
-               if bool(known.any()) else logits.sum() * 0)
-        offset = (F.l1_loss(offsets[occupied], target_offsets[occupied])
-                  if bool(occupied.any()) else offsets.sum() * 0)
+        if batch_size == 1:
+            occ = (F.binary_cross_entropy_with_logits(logits[known],
+                                                      occupied[known].to(logits.dtype))
+                   if bool(known.any()) else logits.sum() * 0)
+            offset = (F.l1_loss(offsets[occupied], target_offsets[occupied])
+                      if bool(occupied.any()) else offsets.sum() * 0)
+        else:
+            frame_ids = conditions.hierarchy[0][:, 0].long()
+            occ = _frame_mean(
+                F.binary_cross_entropy_with_logits(logits[known],
+                                                   occupied[known].to(logits.dtype),
+                                                   reduction="none"),
+                frame_ids[known], batch_size) + logits.sum() * 0
+            offset = _frame_mean(
+                (offsets[occupied] - target_offsets[occupied]).abs().mean(1),
+                frame_ids[occupied], batch_size) + offsets.sum() * 0
         with torch.no_grad():
             predicted = torch.sigmoid(logits) >= 0.5
-            intersection = (predicted & occupied).sum()
-            full_union = (predicted | occupied).sum()
-            known_union = ((predicted & known) | occupied).sum()
+            intersection = predicted & occupied
+            full_union = predicted | occupied
+            known_union = (predicted & known) | occupied
+            if batch_size == 1:
+                iou_known = float(intersection.sum() / known_union.sum().clamp_min(1))
+                iou_full = float(intersection.sum() / full_union.sum().clamp_min(1))
+            else:
+                frame_ids = conditions.hierarchy[0][:, 0].long()
+                sums = [torch.bincount(frame_ids[mask], minlength=batch_size)
+                        for mask in (intersection, known_union, full_union)]
+                iou_known = float((sums[0] / sums[1].clamp_min(1)).float().mean())
+                iou_full = float((sums[0] / sums[2].clamp_min(1)).float().mean())
         return {"loss": occ + offset_weight * offset, "occupancy": occ,
                 "offset": offset,
-                "iou_known": float(intersection / known_union.clamp_min(1)),
-                "iou_full": float(intersection / full_union.clamp_min(1)),
+                "iou_known": iou_known, "iou_full": iou_full,
                 "gate_coverage": coverage,
-                "known_sites": int(known.sum()), "positive_sites": int(occupied.sum())}
+                "known_sites": float(known.sum()) / batch_size,
+                "positive_sites": float(occupied.sum()) / batch_size}
 
     def diffusion_loss(self, faulty_xyz: torch.Tensor, clean_xyz: torch.Tensor,
                        conditions: Stage2Conditions, alpha_bars: torch.Tensor,
                        *, residual_weight: float = 1.0,
                        reconstruction_weight: float = 1.0,
-                       generator: torch.Generator | None = None) -> dict:
+                       generator: torch.Generator | None = None,
+                       faulty_batch_ids: torch.Tensor | None = None,
+                       clean_batch_ids: torch.Tensor | None = None,
+                       batch_size: int = 1) -> dict:
         with torch.no_grad():
-            faulty, faulty_present = self.encode_lidar(faulty_xyz, conditions)
-            clean, _ = self.encode_lidar(clean_xyz, conditions)
+            faulty, faulty_present = self.encode_lidar(
+                faulty_xyz, conditions, faulty_batch_ids)
+            clean, _ = self.encode_lidar(clean_xyz, conditions, clean_batch_ids)
         residual = clean - faulty
-        timestep = torch.randint(len(alpha_bars), (), device=residual.device,
+        timestep = torch.randint(len(alpha_bars), (batch_size,), device=residual.device,
                                  generator=generator)
-        alpha = alpha_bars[timestep]
+        latent_frame_ids = conditions.hierarchy[-1][:, 0].long()
+        alpha = alpha_bars[timestep[latent_frame_ids]][:, None]
         noise = torch.randn(residual.shape, device=residual.device,
                             dtype=residual.dtype, generator=generator)
         noisy = alpha.sqrt() * residual + (1 - alpha).sqrt() * noise
@@ -361,9 +411,12 @@ class SparseResidualStage2(nn.Module):
             noisy, faulty, conditions.radar_features,
             conditions.latent_probabilities, faulty_present,
             timestep, conditions.hierarchy[-1])
-        noise_loss = F.mse_loss(noise_hat, noise)
-        residual_loss = F.mse_loss(residual_hat, residual)
-        reconstruction = self.lpcr_loss(faulty + residual_hat, conditions, clean_xyz)
+        noise_loss = _frame_mean((noise_hat - noise).square().mean(1),
+                                 latent_frame_ids, batch_size)
+        residual_loss = _frame_mean((residual_hat - residual).square().mean(1),
+                                    latent_frame_ids, batch_size)
+        reconstruction = self.lpcr_loss(faulty + residual_hat, conditions,
+                                         clean_xyz, batch_size=batch_size)
         total = (noise_loss + residual_weight * residual_loss
                  + reconstruction_weight * reconstruction["loss"])
         return {"loss": total, "noise": noise_loss,

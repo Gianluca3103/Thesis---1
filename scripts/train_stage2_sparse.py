@@ -17,16 +17,66 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.fault_data import load_faulty, synthetic_fault
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    VERSION, SparseResidualStage2, cosine_alpha_bars,
+    VERSION, SparseResidualStage2, Stage2Conditions, cosine_alpha_bars,
 )
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
 from models.radar_lidar_stage2.stage2_io import load_stage1, sha256, stage1_frame
 
 
-def _one(rows: list[dict]) -> dict:
-    if len(rows) != 1:
-        raise ValueError("Sparse Stage II currently trains one frame per step")
-    return rows[0]
+def _rows(rows: list[dict]) -> list[dict]:
+    return rows
+
+
+def _combine_conditions(items: list[Stage2Conditions]) -> Stage2Conditions:
+    """Join independent frames without allowing sparse kernels to cross frames."""
+    if len(items) == 1:
+        return items[0]
+    levels = []
+    for level in range(5):
+        frames = []
+        for batch_id, item in enumerate(items):
+            coordinates = item.hierarchy[level].clone()
+            coordinates[:, 0] = batch_id
+            frames.append(coordinates)
+        levels.append(torch.cat(frames))
+    if any(item.cached_targets is None for item in items):
+        raise ValueError("Batched Stage II requires fixed cached targets")
+    targets = tuple(torch.cat([item.cached_targets[index] for item in items])
+                    for index in range(3))
+    coverage = sum(item.cached_targets[3] for item in items) / len(items)
+    return Stage2Conditions(tuple(levels),
+                            torch.cat([item.fine_probabilities for item in items]),
+                            torch.cat([item.latent_probabilities for item in items]),
+                            torch.cat([item.radar_features for item in items]),
+                            (*targets, coverage))
+
+
+def _combine_points(clouds: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
+    points = torch.cat(clouds)
+    if len(clouds) == 1:
+        return points, None
+    batch_ids = torch.cat([torch.full((len(cloud),), index, dtype=torch.long,
+                                      device=cloud.device)
+                           for index, cloud in enumerate(clouds)])
+    return points, batch_ids
+
+
+class _CachedRows:
+    """Decompress Stage-II geometry in DataLoader workers, before CUDA transfer."""
+
+    def __init__(self, dataset, cache: Stage2FixedCache):
+        self.dataset = dataset
+        self.cache = cache
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict:
+        row = self.dataset[index]
+        output, targets = self.cache.load(row["frame_id"], "cpu")
+        row["stage2_output"] = output
+        row["stage2_targets"] = targets
+        return row
 
 
 def _atomic_save(path: Path, payload: dict) -> None:
@@ -48,45 +98,68 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
     processed = skipped = 0
     context = torch.enable_grad if training else torch.no_grad
     with context():
-        for row in tqdm(loader, desc=f"Stage II {args.phase} {split} {epoch:03d}",
-                        unit="frame", dynamic_ncols=True):
-            clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
-            if fixed_cache is not None:
-                output, targets = fixed_cache.load(row["frame_id"], args.device)
-            else:
-                radar = row["radar"].to(args.device, non_blocking=True)
-                with torch.no_grad():
-                    output = stage1_frame(stage1, radar, radius_m)
-                targets = None
-            conditions = model.conditions(output, args.gate_threshold)
-            conditions.cached_targets = targets
-            if not len(conditions.hierarchy[0]):
-                skipped += 1
+        for rows in tqdm(loader, desc=f"Stage II {args.phase} {split} {epoch:03d}",
+                         unit="batch", dynamic_ncols=True):
+            active_rows, items, clean_clouds = [], [], []
+            for row in rows:
+                clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
+                if fixed_cache is not None:
+                    output = {key: value.to(args.device, non_blocking=True)
+                              for key, value in row["stage2_output"].items()}
+                    stored = row["stage2_targets"]
+                    targets = tuple(value.to(args.device, non_blocking=True)
+                                    for value in stored[:3]) + (stored[3],)
+                else:
+                    radar = row["radar"].to(args.device, non_blocking=True)
+                    with torch.no_grad():
+                        output = stage1_frame(stage1, radar, radius_m)
+                    targets = None
+                item = model.conditions(output, args.gate_threshold)
+                item.cached_targets = targets
+                if not len(item.hierarchy[0]):
+                    skipped += 1
+                    continue
+                active_rows.append(row)
+                items.append(item)
+                clean_clouds.append(clean)
+            if not active_rows:
                 continue
+            conditions = _combine_conditions(items)
+            clean, clean_batch_ids = _combine_points(clean_clouds)
+            batch_size = len(active_rows)
             if args.phase == "lpcr":
-                latent, _ = model.encode_lidar(clean, conditions)
-                result = model.lpcr_loss(latent, conditions, clean)
+                latent, _ = model.encode_lidar(clean, conditions, clean_batch_ids)
+                result = model.lpcr_loss(latent, conditions, clean,
+                                         batch_size=batch_size)
                 values = {key: result[key] for key in
                           ("loss", "occupancy", "offset", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
             else:
-                faulty = (load_faulty(args.faulty_root, split, row["frame_id"])
-                          if args.faulty_root else synthetic_fault(
-                              row["clean_lidar"], row["frame_id"],
-                              epoch if training else 0, seed=args.fault_seed,
-                              dropout=args.fault_dropout,
-                              sector_deg=args.fault_sector_deg))
-                faulty = faulty[:, :3].to(args.device, non_blocking=True)
+                faulty_clouds = []
+                for row in active_rows:
+                    faulty = (load_faulty(args.faulty_root, split, row["frame_id"])
+                              if args.faulty_root else synthetic_fault(
+                                  row["clean_lidar"], row["frame_id"],
+                                  epoch if training else 0, seed=args.fault_seed,
+                                  dropout=args.fault_dropout,
+                                  sector_deg=args.fault_sector_deg))
+                    faulty_clouds.append(faulty[:, :3].to(args.device,
+                                                            non_blocking=True))
+                faulty, faulty_batch_ids = _combine_points(faulty_clouds)
                 generator = None
                 if not training:
-                    digest = hashlib.sha256(row["frame_id"].encode()).digest()
+                    frame_key = ":".join(row["frame_id"] for row in active_rows)
+                    digest = hashlib.sha256(frame_key.encode()).digest()
                     generator = torch.Generator(device=args.device)
                     generator.manual_seed(int.from_bytes(digest[:8], "little") % (2**63))
                 result = model.diffusion_loss(faulty, clean, conditions, alpha_bars,
                                               residual_weight=args.residual_weight,
                                               reconstruction_weight=args.reconstruction_weight,
-                                              generator=generator)
+                                              generator=generator,
+                                              faulty_batch_ids=faulty_batch_ids,
+                                              clean_batch_ids=clean_batch_ids,
+                                              batch_size=batch_size)
                 reconstruction = result["reconstruction"]
                 values = {"loss": result["loss"], "noise": result["noise"],
                           "residual": result["residual"],
@@ -105,11 +178,11 @@ def _epoch(model, stage1, fixed_cache, loader, optimizer, args, epoch, split,
                                                1.0 if args.phase == "lpcr" else 5.0)
                 optimizer.step()
             for key, value in values.items():
-                totals[key] = totals.get(key, 0.0) + float(value.detach()
-                    if isinstance(value, torch.Tensor) else value)
+                totals[key] = totals.get(key, 0.0) + batch_size * float(
+                    value.detach() if isinstance(value, torch.Tensor) else value)
             totals["allowed_sites"] = totals.get("allowed_sites", 0.0) + len(
                 conditions.hierarchy[0])
-            processed += 1
+            processed += batch_size
     if not processed:
         raise RuntimeError("Stage I selected zero sites across this split")
     return {key: value / processed for key, value in totals.items()} | {
@@ -130,6 +203,7 @@ def main() -> None:
     parser.add_argument("--radar-variant", default="radar_5frames")
     parser.add_argument("--gate-threshold", type=float, default=0.25)
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--train-limit", type=int)
@@ -149,7 +223,8 @@ def main() -> None:
         args.lr = 1e-3 if args.phase == "lpcr" else 2e-4
     if (args.device != "cuda" or not torch.cuda.is_available() or
             not 0 < args.gate_threshold < 1 or args.epochs < 1 or
-            args.num_workers < 0 or args.lr <= 0 or
+            args.batch_size < 1 or args.num_workers < 0 or args.lr <= 0 or
+            args.batch_size > 1 and args.stage2_cache_root is None or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
             args.phase == "lpcr" and args.lpcr_checkpoint is not None or
             args.train_limit is not None and args.train_limit < 1 or
@@ -222,9 +297,12 @@ def main() -> None:
                         if limit is not None else dataset)
                 for split, dataset in full_datasets.items()
                 for limit in (getattr(args, f"{split}_limit"),)}
-    loaders = {split: DataLoader(dataset, batch_size=1,
+    datasets = {split: (_CachedRows(dataset, fixed_caches[split])
+                        if fixed_caches[split] is not None else dataset)
+                for split, dataset in datasets.items()}
+    loaders = {split: DataLoader(dataset, batch_size=args.batch_size,
                                  shuffle=(split == "train"),
-                                 num_workers=args.num_workers, collate_fn=_one,
+                                 num_workers=args.num_workers, collate_fn=_rows,
                                  pin_memory=True, persistent_workers=args.num_workers > 0)
                for split, dataset in datasets.items()}
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -253,7 +331,8 @@ def main() -> None:
         improved = val["loss"] < best
         if improved:
             best = val["loss"]
-        record = {"epoch": epoch, "train": train, "val": val,
+        record = {"epoch": epoch, "batch_size": args.batch_size,
+                  "num_workers": args.num_workers, "train": train, "val": val,
                   "best_val_loss": best}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")

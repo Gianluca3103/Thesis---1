@@ -6,10 +6,14 @@ import argparse
 
 import torch
 
-from models.radar_lidar_stage2.sparse_geometry import GRID, voxelize_means
+from models.radar_lidar_stage2.sparse_batch import voxelize_means_batched
+from models.radar_lidar_stage2.sparse_geometry import (
+    GRID, reconstruction_targets, voxelize_means,
+)
 from models.radar_lidar_stage2.sparse_residual import (
     SparseResidualStage2, cosine_alpha_bars,
 )
+from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
 
 def main() -> None:
@@ -66,8 +70,30 @@ def main() -> None:
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
+    model.zero_grad(set_to_none=True)
+    twin_conditions = [model.conditions(stage1, 0.3) for _ in range(2)]
+    for item in twin_conditions:
+        item.cached_targets = reconstruction_targets(clean, item.hierarchy[0])
+    joined = _combine_conditions(twin_conditions)
+    batched_clean, clean_ids = _combine_points([clean, clean])
+    batched_faulty, faulty_ids = _combine_points([faulty, faulty])
+    single_voxels, _ = voxelize_means(clean)
+    batch_voxels, _ = voxelize_means_batched(batched_clean, clean_ids)
+    if (len(batch_voxels) != 2 * len(single_voxels) or
+            set(batch_voxels[:, 0].tolist()) != {0, 1}):
+        raise AssertionError("Batched LiDAR voxels merged across frames")
+    batched = model.diffusion_loss(
+        batched_faulty, batched_clean, joined,
+        cosine_alpha_bars(16, device=device),
+        faulty_batch_ids=faulty_ids, clean_batch_ids=clean_ids, batch_size=2)
+    batched["loss"].backward()
+    if (not torch.isfinite(batched["loss"]) or
+            model.diffusion.noise_head.weight.grad is None or
+            not torch.isfinite(model.diffusion.noise_head.weight.grad).all()):
+        raise AssertionError("Batched diffusion loss or gradient is invalid")
     print({"lpcr_loss": float(first["loss"]),
            "diffusion_loss": float(second["loss"]),
+           "batched_diffusion_loss": float(batched["loss"]),
            "allowed": sampled["allowed_cells"],
            "predicted": sampled["predicted_cells"],
            "gradients_finite": True})

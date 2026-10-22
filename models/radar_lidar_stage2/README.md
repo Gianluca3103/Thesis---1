@@ -86,7 +86,7 @@ DIFF="$OUT5/stage2_sparse_diffusion"
   --stage1-checkpoint "$S1" --lpcr-checkpoint "$LPCR/best.ckpt" \
   --output-root "$DIFF" --radar-variant radar_5frames \
   --gate-threshold 0.25 --epochs 50 --lr 0.0002 \
-  --num-workers 8 --device cuda
+  --batch-size 8 --num-workers 8 --device cuda
 
 "$PY" -u -m scripts.predict_stage2_sparse \
   --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
@@ -105,3 +105,9 @@ separate; they are proposed settings for this new architecture.
 
 Start with `--train-limit 2 --val-limit 2 --epochs 1 --num-workers 0`
 in a new output directory to check the full Stage-I-to-Stage-II path.
+The diffusion trainer can resume a previous batch-one `last.ckpt` with
+`--resume "$DIFF/last.ckpt"` and `--batch-size 8`. The fixed Stage-II cache is
+required for physical batches larger than one; its compressed geometry is
+decompressed in the eight data workers. Sparse coordinates carry a frame
+index, so the MinkowskiEngine convolutions process all frames together without
+mixing their sites. LPCR and diffusion losses retain equal per-frame weighting.
