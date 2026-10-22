@@ -53,11 +53,25 @@ def _display_subset(points: np.ndarray, limit: int, seed: int) -> np.ndarray:
     return points[indices]
 
 
+def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
+    """Match exact XYZ coordinates; synthetic faults retain unmodified points."""
+    if not len(clean):
+        return np.empty(0, dtype=bool)
+    clean_xyz = np.ascontiguousarray(clean[:, :3], dtype=np.float32)
+    faulty_xyz = np.ascontiguousarray(faulty[:, :3], dtype=np.float32)
+    point_dtype = np.dtype((np.void, 3 * np.dtype(np.float32).itemsize))
+    return np.isin(clean_xyz.view(point_dtype).reshape(-1),
+                   faulty_xyz.view(point_dtype).reshape(-1))
+
+
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 faulty: np.ndarray, clean: np.ndarray, predicted: np.ndarray,
+                removed: np.ndarray,
                 threshold: float, allowed_cells: int, sampling_steps: int,
                 synthetic: bool, totals: tuple[int, int, int],
-                display_limit: int, metrics: dict | None) -> None:
+                removed_count: int | None, fault_dropout: float | None,
+                fault_sector_deg: float | None, display_limit: int,
+                metrics: dict | None) -> None:
     clouds = [faulty, clean, predicted]
     nonempty = [cloud for cloud in clouds if len(cloud)]
     if nonempty:
@@ -70,9 +84,13 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "faulty": np.round(faulty, 3).tolist(),
         "clean": np.round(clean, 3).tolist(),
         "predicted": np.round(predicted, 3).tolist(),
+        "removed": np.round(removed, 3).tolist(),
         "threshold": threshold, "allowed_cells": allowed_cells,
         "sampling_steps": sampling_steps, "synthetic": synthetic,
-        "totals": totals, "display_limit": display_limit,
+        "totals": totals, "removed_count": removed_count,
+        "fault_dropout": fault_dropout,
+        "fault_sector_deg": fault_sector_deg,
+        "display_limit": display_limit,
         "metrics": metrics,
         "minimum": minimum, "maximum": maximum,
     }, separators=(",", ":")).replace("<", "\\u003c")
@@ -92,22 +110,22 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
 <div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#f450d5">●</span> clean points removed by the synthetic fault &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · diffusion epoch ${d.epoch}`;
-document.getElementById('note').textContent=d.synthetic?'Synthetic faulty LiDAR is derived from clean LiDAR for this validation example. The model receives faulty LiDAR and radar features; clean LiDAR is the reference.':'The model receives real faulty LiDAR and radar features. No clean LiDAR reference was loaded.';
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in the Stage II ROI. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. Browser clouds are sampled at ${d.display_limit.toLocaleString()} points each if larger.`;
+document.getElementById('note').textContent=d.synthetic?`Synthetic fault from the checkpoint: ${(100*d.fault_dropout).toFixed(0)}% random point dropout plus a ${d.fault_sector_deg.toFixed(1)}° missing azimuth sector. The sector is selected around the full circle, so it may fall outside this forward ROI. The model receives faulty LiDAR and radar features; clean LiDAR is the reference.`:'The model receives real faulty LiDAR and radar features. No clean LiDAR reference was loaded.';
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} reconstructed points in the Stage II ROI. ${d.removed_count===null?'Removed-point count unavailable for real faulty LiDAR':`${d.removed_count.toLocaleString()} clean points removed by the synthetic fault (${(100*d.removed_count/Math.max(1,d.totals[1])).toFixed(1)}%)`}. ${d.allowed_cells.toLocaleString()} radar-allowed cells; occupancy threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps. ${d.synthetic?'Faulty and clean panels share the same sampled clean points for a direct comparison.':''}`;
 if(d.metrics){const p=document.createElement('p');p.textContent=`Sampled reconstruction: Known IoU ${d.metrics.known_iou.toFixed(4)}, Full IoU ${d.metrics.full_iou.toFixed(4)}, gate coverage ${d.metrics.gate_coverage.toFixed(4)}. Full IoU counts predictions without a measured clean return as errors.`;document.getElementById('counts').after(p);}
-const names=['Faulty LiDAR input','Clean LiDAR reference','Stage II reconstruction','Clean + reconstruction'],panes=document.getElementById('panels'),canvases=[],headings=[];
+const names=['Faulty LiDAR input',d.synthetic?'Clean LiDAR reference + removed points':'Clean LiDAR reference','Stage II reconstruction','Clean + reconstruction'];if(d.synthetic)names.push('Faulty input + removed points');const panes=document.getElementById('panels'),canvases=[],headings=[];
 for(const name of names){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');h.textContent=name;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
 function project(p,w,h,s){const x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);const u=cy*x-sy*y,v=sy*x+cy*y;return [w/2+view.panX+u*s,h/2+view.panY-(cp*z-sp*v)*s];}
 function plot(ctx,points,w,h,s,color){ctx.fillStyle=color;for(const p of points){const [x,y]=project(p,w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-1,y-1,2,2);}}
-function draw(canvas,index){const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;if(index===0)plot(ctx,d.faulty,w,h,scale,'#ffb85c');if(index===1||index===3)plot(ctx,d.clean,w,h,scale,'#60d796');if(index===2||index===3)plot(ctx,d.predicted,w,h,scale,'#ff8b6c');const count=index===0?d.faulty.length:index===1?d.clean.length:index===2?d.predicted.length:d.clean.length+d.predicted.length;headings[index].textContent=`${names[index]}: ${count.toLocaleString()} shown`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
+function draw(canvas,index){const ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;if(index===0||index===4)plot(ctx,d.faulty,w,h,scale,'#ffb85c');if(index===1||index===3)plot(ctx,d.clean,w,h,scale,'#60d796');if(index===2||index===3)plot(ctx,d.predicted,w,h,scale,'#ff8b6c');if(index===1||index===4)plot(ctx,d.removed,w,h,scale,'#f450d5');const count=index===0?d.faulty.length:index===1?d.clean.length:index===2?d.predicted.length:index===3?d.clean.length+d.predicted.length:d.faulty.length+d.removed.length;headings[index].textContent=`${names[index]}: ${count.toLocaleString()} shown`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;canvases.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
 for(const canvas of canvases){let last=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);last=[e.clientX,e.clientY];});canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1];if(e.shiftKey){view.panX+=dx;view.panY+=dy;}else{view.yaw+=dx*.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.008));}redraw();});for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,()=>{last=null;});canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
@@ -207,6 +225,20 @@ def main() -> None:
         faulty_roi = _roi(faulty.cpu().numpy())
         clean_roi = (_roi(row["clean_lidar"].numpy())
                      if "clean_lidar" in row else np.empty((0, 3), dtype=np.float32))
+        synthetic = args.faulty_root is None
+        removed_count = None
+        if synthetic:
+            kept = _present_in_faulty(clean_roi, faulty_roi)
+            removed_count = int((~kept).sum())
+        clean_display = _display_subset(clean_roi, args.display_limit, seed + 2)
+        if synthetic:
+            display_kept = _present_in_faulty(clean_display, faulty_roi)
+            faulty_display = clean_display[display_kept]
+            removed_display = clean_display[~display_kept]
+        else:
+            faulty_display = _display_subset(faulty_roi, args.display_limit,
+                                             seed + 1)
+            removed_display = np.empty((0, 3), dtype=np.float32)
         stem_name = (f"{frame_id}_stage2_epoch_{saved2['epoch']:03d}"
                      if args.html else f"{frame_id}_stage2")
         stem = args.output_root / stem_name
@@ -219,7 +251,8 @@ def main() -> None:
                  "allowed_cells": predicted["allowed_cells"],
                  "reconstructed_points": predicted["predicted_cells"],
                  "faulty_input_points": len(faulty_roi),
-                 "clean_reference_points": len(clean_roi)}
+                 "clean_reference_points": len(clean_roi),
+                 "synthetic_removed_points": removed_count}
         metrics = None
         if "clean_lidar" in row:
             if targets is None:
@@ -245,17 +278,20 @@ def main() -> None:
             viewer = stem.with_suffix(".html")
             _write_html(viewer, frame_id=frame_id, epoch=int(saved2["epoch"]),
                         split=args.split,
-                        faulty=_display_subset(faulty_roi, args.display_limit,
-                                               seed + 1),
-                        clean=_display_subset(clean_roi, args.display_limit,
-                                              seed + 2),
+                        faulty=faulty_display, clean=clean_display,
                         predicted=_display_subset(xyz, args.display_limit,
                                                   seed + 3),
+                        removed=removed_display,
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
                         sampling_steps=args.sampling_steps,
-                        synthetic=args.faulty_root is None,
+                        synthetic=synthetic,
                         totals=(len(faulty_roi), len(clean_roi), len(xyz)),
+                        removed_count=removed_count,
+                        fault_dropout=(float(saved2["fault_dropout"])
+                                       if synthetic else None),
+                        fault_sector_deg=(float(saved2["fault_sector_deg"])
+                                          if synthetic else None),
                         display_limit=args.display_limit, metrics=metrics)
             stats["viewer"] = viewer.name
         summary.append(stats)
@@ -268,7 +304,11 @@ def main() -> None:
         links = "\n".join(
             f'<li><a target="viewer" href="{html.escape(item["viewer"])}">'
             f'Frame {html.escape(item["frame_id"])} · epoch {item["epoch"]}</a> · '
-            f'{item["reconstructed_points"]:,} points</li>' for item in summary)
+            f'{item["reconstructed_points"]:,} reconstructed'
+            + (f'; {item["synthetic_removed_points"]:,} removed'
+               if item["synthetic_removed_points"] is not None else '')
+            + '</li>'
+            for item in summary)
         first = html.escape(summary[0]["viewer"])
         index = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
                  "<title>Stage II diffusion samples</title>"
