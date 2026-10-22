@@ -11,7 +11,7 @@ from models.radar_lidar_stage2.sparse_geometry import (
     GRID, reconstruction_targets, voxelize_means,
 )
 from models.radar_lidar_stage2.sparse_residual import (
-    MAX_POINTS_PER_VOXEL, SparseResidualStage2, cosine_alpha_bars,
+    SparseResidualStage2, cosine_alpha_bars,
 )
 from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
@@ -57,7 +57,6 @@ def main() -> None:
     first = model.lpcr_loss(latent, conditions, clean)
     first["loss"].backward()
     for name, layer in (("occupancy", model.lpcr.occupancy),
-                        ("count", model.lpcr.count),
                         ("offset", model.lpcr.offset)):
         grad = layer.weight.grad
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
@@ -68,7 +67,7 @@ def main() -> None:
     second = model.diffusion_loss(faulty, clean, conditions,
                                   cosine_alpha_bars(16, device=device))
     second["loss"].backward()
-    diffusion_grad = model.diffusion.noise_head.weight.grad
+    diffusion_grad = model.diffusion.residual_head.weight.grad
     adapter_grad = model.radar_adapter.weight.grad
     for name, grad in (("diffusion", diffusion_grad), ("radar adapter", adapter_grad)):
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
@@ -79,9 +78,8 @@ def main() -> None:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
     if (sampled["predicted_points"] != len(sampled["points_xyz"])
             or sampled["predicted_points"] != int(sampled["point_counts"].sum())
-            or sampled["predicted_points"] < sampled["predicted_cells"]
-            or sampled["predicted_points"] > MAX_POINTS_PER_VOXEL * sampled["predicted_cells"]):
-        raise AssertionError("LPCR must emit one to five points per selected voxel")
+            or sampled["predicted_points"] != sampled["predicted_cells"]):
+        raise AssertionError("LPCR must emit one centroid per selected voxel")
     if len(sampled["points_xyz"]):
         minimum = sampled["points_xyz"].new_tensor(GRID.minimum_xyz)
         size = sampled["points_xyz"].new_tensor(GRID.voxel_xyz)
@@ -114,8 +112,8 @@ def main() -> None:
         faulty_batch_ids=faulty_ids, clean_batch_ids=clean_ids, batch_size=2)
     batched["loss"].backward()
     if (not torch.isfinite(batched["loss"]) or
-            model.diffusion.noise_head.weight.grad is None or
-            not torch.isfinite(model.diffusion.noise_head.weight.grad).all()):
+            model.diffusion.residual_head.weight.grad is None or
+            not torch.isfinite(model.diffusion.residual_head.weight.grad).all()):
         raise AssertionError("Batched diffusion loss or gradient is invalid")
     print({"lpcr_loss": float(first["loss"]),
            "diffusion_loss": float(second["loss"]),

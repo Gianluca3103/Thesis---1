@@ -8,7 +8,6 @@ radar-only Stage-I probability map before any Stage-II decoding takes place.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import permutations
 import math
 
 import torch
@@ -17,7 +16,6 @@ from torch.nn import functional as F
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 
-from .point_targets import multipoint_targets
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
@@ -32,9 +30,9 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "stage2_xyz_multipoint5_count004_offset01_v7"
+MODEL_REVISION = "stage2_r2ldm_centroid_residual_v8"
 LATENT_CHANNELS = 32
-MAX_POINTS_PER_VOXEL = 5
+MAX_POINTS_PER_VOXEL = 1
 
 
 def _require_me() -> None:
@@ -54,30 +52,6 @@ def _frame_mean(values: torch.Tensor, batch_ids: torch.Tensor,
     counts = values.new_zeros(batch_size).scatter_add_(
         0, batch_ids, torch.ones_like(values))
     return (sums / counts.clamp_min(1)).mean()
-
-
-def _matched_point_offset_loss(offsets: torch.Tensor,
-                               targets: torch.Tensor, counts: torch.Tensor,
-                               frame_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """Minimum permutation-invariant XYZ L1 for one to five measured points."""
-    occupied = counts > 0
-    if not bool(occupied.any()):
-        return offsets.sum() * 0
-    per_site = offsets.new_zeros(len(counts))
-    for count in range(1, MAX_POINTS_PER_VOXEL + 1):
-        sites = torch.where(counts == count)[0]
-        if not len(sites):
-            continue
-        predicted = offsets.index_select(0, sites)[:, :count]
-        measured = targets.index_select(0, sites)[:, :count]
-        distance = (predicted[:, :, None, :]
-                    - measured[:, None, :, :]).abs().mean(-1)
-        assignments = torch.tensor(list(permutations(range(count))),
-                                   dtype=torch.long, device=offsets.device)
-        columns = assignments[None, :, :, None].expand(len(sites), -1, -1, 1)
-        selected = distance[:, None].expand(-1, len(assignments), -1, -1)
-        per_site[sites] = selected.gather(3, columns).squeeze(-1).mean(-1).min(-1).values
-    return _frame_mean(per_site[occupied], frame_ids[occupied], batch_size)
 
 
 class SparseConvNorm(nn.Module):
@@ -197,8 +171,7 @@ class AllowedSiteLPCR(nn.Module):
         self.level1 = _ActiveRefine(32 + 7, 24)
         self.level0 = _ActiveRefine(24 + 7, 16)
         self.occupancy = nn.Linear(16, 1)
-        self.count = nn.Linear(16, MAX_POINTS_PER_VOXEL)
-        self.offset = nn.Linear(16, MAX_POINTS_PER_VOXEL * 3)
+        self.offset = nn.Linear(16, 3)
 
     @staticmethod
     def _site_features(coords: torch.Tensor, shape: tuple[int, int, int],
@@ -213,7 +186,7 @@ class AllowedSiteLPCR(nn.Module):
     def forward(self, latent_features: torch.Tensor,
                 hierarchy: tuple[torch.Tensor, ...],
                 fine_probabilities: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(hierarchy) != 5 or len(latent_features) != len(hierarchy[4]):
             raise ValueError("LPCR requires the five R2LDM active coordinate levels")
         if fine_probabilities.shape != (len(hierarchy[0]), 1):
@@ -239,38 +212,33 @@ class AllowedSiteLPCR(nn.Module):
             hidden = block(hierarchy[level], torch.cat((hidden, site), 1),
                            self.grid.shape_at(level))
         half_cell = hidden.new_tensor(self.grid.voxel_xyz) * 0.5
-        offsets = torch.tanh(self.offset(hidden).reshape(-1, MAX_POINTS_PER_VOXEL, 3))
-        return self.occupancy(hidden)[:, 0], self.count(hidden), offsets * half_cell
+        offsets = torch.tanh(self.offset(hidden)) * half_cell
+        return self.occupancy(hidden)[:, 0], offsets
 
     @torch.no_grad()
     def emit_points(self, coords: torch.Tensor, occupancy_logits: torch.Tensor,
-                    count_logits: torch.Tensor, offsets: torch.Tensor,
-                    threshold: float) -> dict:
-        """Emit one to five predicted XYZ points per selected occupied voxel."""
-        if (count_logits.shape != (len(coords), MAX_POINTS_PER_VOXEL)
-                or offsets.shape != (len(coords), MAX_POINTS_PER_VOXEL, 3)):
-            raise ValueError("LPCR point heads must match the five-slot decoder")
+                    offsets: torch.Tensor, threshold: float) -> dict:
+        """Emit one predicted centroid per selected occupied voxel."""
+        if offsets.shape != (len(coords), 3):
+            raise ValueError("LPCR offsets must have one XYZ vector per voxel")
         probabilities = occupancy_logits.sigmoid()
         selected = probabilities >= threshold
         chosen = coords[selected]
-        counts = count_logits[selected].argmax(1) + 1
-        slots = torch.arange(MAX_POINTS_PER_VOXEL, device=coords.device)
-        selected_slots = slots[None, :] < counts[:, None]
-        repeated = chosen[:, None, :].expand(-1, MAX_POINTS_PER_VOXEL, -1)[selected_slots]
         centers = (offsets.new_tensor(self.grid.minimum_xyz)
-                   + (repeated[:, [3, 2, 1]].to(offsets.dtype) + 0.5)
+                   + (chosen[:, [3, 2, 1]].to(offsets.dtype) + 0.5)
                    * offsets.new_tensor(self.grid.voxel_xyz))
         count = len(chosen)
-        return {"points_xyz": centers + offsets[selected][selected_slots],
-                "coordinates": repeated, "occupied_coordinates": chosen,
-                "probabilities": probabilities[selected].repeat_interleave(counts),
-                "point_counts": counts,
+        return {"points_xyz": centers + offsets[selected],
+                "coordinates": chosen, "occupied_coordinates": chosen,
+                "probabilities": probabilities[selected],
+                "point_counts": torch.ones(count, dtype=torch.long,
+                                            device=coords.device),
                 "allowed_cells": len(coords), "predicted_cells": count,
-                "predicted_points": len(repeated)}
+                "predicted_points": count}
 
 
 class SparseResidualUNet(nn.Module):
-    """Sparse 3D latent U-Net with a shared site set and dual diffusion heads."""
+    """Sparse 3D latent U-Net predicting the clean-minus-faulty latent."""
 
     def __init__(self, latent_shape: tuple[int, int, int]):
         super().__init__()
@@ -282,13 +250,12 @@ class SparseResidualUNet(nn.Module):
         self.down = SparseConvNorm(64, 96, stride=(1, 2, 2))
         self.low = SparseResidualBlock(96)
         self.merge = _ActiveRefine(64 + 96, 64)
-        self.noise_head = nn.Linear(64, LATENT_CHANNELS)
         self.residual_head = nn.Linear(64, LATENT_CHANNELS)
 
     def forward(self, noisy: torch.Tensor, faulty: torch.Tensor,
                 radar: torch.Tensor, probability: torch.Tensor,
                 faulty_present: torch.Tensor, timestep: torch.Tensor,
-                coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                coords: torch.Tensor) -> torch.Tensor:
         count = len(coords)
         if (noisy.shape != faulty.shape or noisy.shape != radar.shape
                 or noisy.shape != (count, LATENT_CHANNELS)
@@ -296,7 +263,7 @@ class SparseResidualUNet(nn.Module):
                 or faulty_present.shape != (count,)):
             raise ValueError("Diffusion condition shape differs from active latent sites")
         if not count:
-            return noisy, noisy
+            return noisy
         steps = timestep.long().reshape(-1)
         if len(steps) == 1:
             time = self.timestep(steps).expand(count, -1)
@@ -328,7 +295,7 @@ class SparseResidualUNet(nn.Module):
         if not bool(present.all()):
             raise RuntimeError("Sparse diffusion downsampling lost an active parent")
         fused = self.merge(coords, torch.cat((high, up), dim=1), self.latent_shape)
-        return self.noise_head(fused), self.residual_head(fused)
+        return self.residual_head(fused)
 
 
 @dataclass
@@ -390,30 +357,23 @@ class SparseResidualStage2(nn.Module):
 
     def lpcr_loss(self, latent: torch.Tensor, conditions: Stage2Conditions,
                   clean_xyz: torch.Tensor,
+                  occupancy_weight: float = 0.9,
                   offset_weight: float = 0.1,
-                  count_weight: float = 0.04,
                   batch_size: int = 1,
                   clean_batch_ids: torch.Tensor | None = None
                   ) -> dict[str, torch.Tensor | float]:
-        logits, count_logits, offsets = self.lpcr(
+        logits, offsets = self.lpcr(
             latent, conditions.hierarchy, conditions.fine_probabilities)
         occupied, known_free, target_offsets, coverage = (
             conditions.cached_targets if conditions.cached_targets is not None
             else reconstruction_targets(clean_xyz, conditions.hierarchy[0], grid=self.grid))
-        point_counts, point_offsets = multipoint_targets(
-            clean_xyz, conditions.hierarchy[0], clean_batch_ids,
-            max_points=MAX_POINTS_PER_VOXEL, grid=self.grid)
         if (occupied.shape != logits.shape or known_free.shape != logits.shape
-                or target_offsets.shape != (len(logits), 3)
-                or count_logits.shape != (len(logits), MAX_POINTS_PER_VOXEL)
-                or offsets.shape != point_offsets.shape
-                or bool((occupied & known_free).any())
-                or not torch.equal(occupied, point_counts > 0)):
+                or target_offsets.shape != offsets.shape
+                or bool((occupied & known_free).any())):
             raise ValueError("LPCR labels differ from the radar-selected active cells")
         if not len(logits):
             zero = latent.sum() * 0
-            return {"loss": zero, "occupancy": zero, "count": zero,
-                    "offset": zero,
+            return {"loss": zero, "occupancy": zero, "offset": zero,
                     "iou_known": 0.0, "iou_full": 0.0,
                     "gate_coverage": coverage, "known_sites": 0,
                     "positive_sites": 0}
@@ -423,9 +383,8 @@ class SparseResidualStage2(nn.Module):
             occ = (F.binary_cross_entropy_with_logits(logits[known],
                                                       occupied[known].to(logits.dtype))
                    if bool(known.any()) else logits.sum() * 0)
-            count = (F.cross_entropy(count_logits[occupied],
-                                     point_counts[occupied] - 1)
-                     if bool(occupied.any()) else count_logits.sum() * 0)
+            offset = (F.l1_loss(offsets[occupied], target_offsets[occupied])
+                      if bool(occupied.any()) else offsets.sum() * 0)
         else:
             occ = (_frame_mean(
                 F.binary_cross_entropy_with_logits(logits[known],
@@ -433,13 +392,10 @@ class SparseResidualStage2(nn.Module):
                                                    reduction="none"),
                 frame_ids[known], batch_size) if bool(known.any())
                 else logits.sum() * 0)
-            count = (_frame_mean(
-                F.cross_entropy(count_logits[occupied],
-                                point_counts[occupied] - 1, reduction="none"),
+            offset = (_frame_mean(
+                (offsets[occupied] - target_offsets[occupied]).abs().mean(1),
                 frame_ids[occupied], batch_size) if bool(occupied.any())
-                else count_logits.sum() * 0)
-        offset = _matched_point_offset_loss(offsets, point_offsets,
-                                            point_counts, frame_ids, batch_size)
+                else offsets.sum() * 0)
         with torch.no_grad():
             predicted = torch.sigmoid(logits) >= 0.5
             intersection = predicted & occupied
@@ -454,8 +410,8 @@ class SparseResidualStage2(nn.Module):
                         for mask in (intersection, known_union, full_union)]
                 iou_known = float((sums[0] / sums[1].clamp_min(1)).float().mean())
                 iou_full = float((sums[0] / sums[2].clamp_min(1)).float().mean())
-        return {"loss": occ + count_weight * count + offset_weight * offset,
-                "occupancy": occ, "count": count, "offset": offset,
+        return {"loss": occupancy_weight * occ + offset_weight * offset,
+                "occupancy": occ, "offset": offset,
                 "iou_known": iou_known, "iou_full": iou_full,
                 "gate_coverage": coverage,
                 "known_sites": float(known.sum()) / batch_size,
@@ -481,20 +437,23 @@ class SparseResidualStage2(nn.Module):
         noise = torch.randn(residual.shape, device=residual.device,
                             dtype=residual.dtype, generator=generator)
         noisy = alpha.sqrt() * residual + (1 - alpha).sqrt() * noise
-        noise_hat, residual_hat = self.diffusion(
+        residual_hat = self.diffusion(
             noisy, faulty, conditions.radar_features,
             conditions.latent_probabilities, faulty_present,
             timestep, conditions.hierarchy[-1])
-        noise_loss = _frame_mean((noise_hat - noise).square().mean(1),
-                                 latent_frame_ids, batch_size)
-        residual_loss = _frame_mean((residual_hat - residual).square().mean(1),
+        clean_hat = faulty + residual_hat
+        # R2LDM predicts the clean latent (x0); L1 on the residual adds a
+        # distinct faulty-to-clean signal instead of duplicating the x0 MSE.
+        clean_latent_loss = _frame_mean((clean_hat - clean).square().mean(1),
+                                        latent_frame_ids, batch_size)
+        residual_loss = _frame_mean((residual_hat - residual).abs().mean(1),
                                     latent_frame_ids, batch_size)
-        reconstruction = self.lpcr_loss(faulty + residual_hat, conditions,
+        reconstruction = self.lpcr_loss(clean_hat, conditions,
                                          clean_xyz, batch_size=batch_size,
                                          clean_batch_ids=clean_batch_ids)
-        total = (noise_loss + residual_weight * residual_loss
+        total = (clean_latent_loss + residual_weight * residual_loss
                  + reconstruction_weight * reconstruction["loss"])
-        return {"loss": total, "noise": noise_loss,
+        return {"loss": total, "clean_latent": clean_latent_loss,
                 "residual": residual_loss, "reconstruction": reconstruction}
 
     @torch.no_grad()
@@ -508,21 +467,24 @@ class SparseResidualStage2(nn.Module):
         schedule = torch.linspace(len(alpha_bars) - 1, 0, steps,
                                   device=faulty.device).round().long()
         for index, timestep in enumerate(schedule):
-            noise_hat, residual_hat = self.diffusion(
+            residual_hat = self.diffusion(
                 residual, faulty, conditions.radar_features,
                 conditions.latent_probabilities, present, timestep,
                 conditions.hierarchy[-1])
             if index + 1 == len(schedule):
                 residual = residual_hat
             else:
+                alpha = alpha_bars[timestep]
                 next_alpha = alpha_bars[schedule[index + 1]]
+                noise_hat = ((residual - alpha.sqrt() * residual_hat) /
+                             (1 - alpha).sqrt().clamp_min(1e-6))
                 residual = (next_alpha.sqrt() * residual_hat
                             + (1 - next_alpha).sqrt() * noise_hat)
-        logits, count_logits, offsets = self.lpcr(
+        logits, offsets = self.lpcr(
             faulty + residual, conditions.hierarchy,
             conditions.fine_probabilities)
         return self.lpcr.emit_points(conditions.hierarchy[0], logits,
-                                     count_logits, offsets, occupancy_threshold)
+                                     offsets, occupancy_threshold)
 
 
 def cosine_alpha_bars(steps: int = 1000, *, device: torch.device | str = "cpu"

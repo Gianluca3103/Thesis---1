@@ -138,7 +138,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                          batch_size=batch_size,
                                          clean_batch_ids=clean_batch_ids)
                 values = {key: result[key] for key in
-                          ("loss", "occupancy", "count", "offset", "iou_known",
+                          ("loss", "occupancy", "offset", "iou_known",
                            "iou_full", "gate_coverage", "known_sites",
                            "positive_sites")}
             else:
@@ -171,11 +171,11 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                               clean_batch_ids=clean_batch_ids,
                                               batch_size=batch_size)
                 reconstruction = result["reconstruction"]
-                values = {"loss": result["loss"], "noise": result["noise"],
+                values = {"loss": result["loss"],
+                          "clean_latent": result["clean_latent"],
                           "residual": result["residual"],
                           "reconstruction": reconstruction["loss"],
                           "occupancy": reconstruction["occupancy"],
-                          "count": reconstruction["count"],
                           "offset": reconstruction["offset"],
                           "iou_known": reconstruction["iou_known"],
                           "iou_full": reconstruction["iou_full"],
@@ -262,7 +262,8 @@ def main() -> None:
     identity = {"version": VERSION, "model_revision": MODEL_REVISION,
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
-                "count_weight": 0.04, "offset_weight": 0.1,
+                "occupancy_weight": 0.9, "offset_weight": 0.1,
+                "diffusion_objective": "clean_latent_mse_residual_l1_lpcr",
                 "stage1_sha256": sha256(args.stage1_checkpoint),
                 "radar_variant": args.radar_variant, "gate_threshold": args.gate_threshold,
                 "radius_m": radius_m,
@@ -373,9 +374,12 @@ def main() -> None:
         _atomic_save(args.output_root / "last.ckpt", payload)
         if improved:
             _atomic_save(args.output_root / "best.ckpt", payload)
+        diffusion_terms = (f"clean latent MSE={val['clean_latent']:.5f}, "
+                           f"residual L1={val['residual']:.5f}, "
+                           if args.phase == "diffusion" else "")
         print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
               f"Known/Full IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
-              f"count CE={val['count']:.5f}, "
+              f"{diffusion_terms}occupancy BCE={val['occupancy']:.5f}, "
               f"offset L1={val['offset']:.5f}, "
               f"gate coverage={val['gate_coverage']:.4f}, "
               f"train faults={train['fault_counts']}", flush=True)

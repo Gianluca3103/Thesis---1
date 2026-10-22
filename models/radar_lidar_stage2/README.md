@@ -21,20 +21,18 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
 4. Pretrain the LiDAR encoder and sparse LPCR decoder on clean LiDAR, on the
    Stage-I-selected sites. Measured occupied cells and observed free cells
    supervise occupancy; no-return cells with unknown visibility are ignored.
-   Occupied cells supervise a point count from one to five and center-relative
-   XYZ offsets to up to five measured clean returns in that voxel. Voxels with
-   more than five returns use five deterministic representatives. Offset loss
-   matches the predicted and measured points without depending on point order.
-   The LPCR objective is occupancy BCE plus `0.04 ×` count cross-entropy plus
-   `0.10 ×` matched offset L1.
+   Occupied cells supervise one center-relative XYZ offset to the average
+   measured clean return in that voxel, as in R2LDM. The adapted fine-scale
+   LPCR objective is `0.9 ×` occupancy BCE plus `0.1 ×` centroid offset L1.
 5. Freeze the pretrained LiDAR encoder and decoder. Train a radar spatial
    adapter and sparse latent U-Net on `R = Z_clean - Z_faulty`. The U-Net
    receives a noised residual, faulty latent, aligned radar features, pooled
-   Stage-I probabilities and diffusion time. Noise MSE, residual MSE, and
-   decoded occupancy/offset loss all update the U-Net and radar adapter.
+   Stage-I probabilities and diffusion time. Clean-latent MSE (R2LDM's
+   denoising objective), residual L1, and the decoded LPCR loss update the
+   U-Net and radar adapter. The residual L1 is a distinct signal from MSE.
 6. Inference reads only radar and faulty LiDAR. DDIM-style sampling estimates
    the residual, `Z_clean_hat = Z_faulty + R_hat`, then LPCR predicts occupancy
-   and one to five points per predicted occupied voxel **only at selected cells**.
+   and one centroid point per predicted occupied voxel **only at selected cells**.
    Clean LiDAR is never used to choose coordinates or at inference. No LiDAR
    intensity is consumed or predicted.
 
@@ -48,8 +46,7 @@ alongside Known/Full IoU. Those IoUs are measured on the Stage-II gate and
 region, so they are not directly comparable with Stage-I full-grid IoU. The
 output `.ply` contains reconstructed points within allowed sites; existing
 faulty points outside that set are not merged into it. Known/Full IoU remain
-voxel occupancy metrics. The five-point cap prevents any occupied voxel from
-producing an unbounded number of returns.
+voxel occupancy metrics. Each predicted occupied voxel emits one point.
 
 Synthetic diffusion training now cycles each frame through the established
 severe fault plan over three epochs: `total_loss:1` (zero returns),
@@ -85,8 +82,8 @@ S1="$OUT5/radar_autoencoder/best_student.ckpt"
 CACHE="$OUT5/stage2_fixed_gate025_v1"
 FOG_CACHE="$OUT5/stage2_severe_fog_s5_v1"
 FOG_SIM=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim
-LPCR="$OUT5/stage2_sparse_lpcr_multipoint5_count004_v7"
-DIFF="$OUT5/stage2_sparse_diffusion_multipoint5_count004_v7"
+LPCR="$OUT5/stage2_sparse_lpcr_r2ldm_centroid_v8"
+DIFF="$OUT5/stage2_sparse_diffusion_r2ldm_centroid_v8"
 
 "$PY" -m scripts.smoke_stage2_sparse --device cuda
 
@@ -143,12 +140,14 @@ returns were removed by each synthetic fault.
 For real inference, add `--faulty-root "$FAULTY_ROOT"`; the clean data loader
 is then disabled. A new gate threshold requires a new cache and LPCR run.
 The existing Stage-I, Stage-II geometry, and severe-fog caches can be reused.
-LPCR and diffusion both need new runs because the decoder point heads changed.
+LPCR and diffusion both need new runs because the decoder and diffusion heads changed.
 Existing Stage-II checkpoints cannot be resumed.
 Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
-The LPCR loss is `L_occ + 0.04 L_count + 0.10 L_offset`. The diffusion loss is
-`L_noise + L_residual + L_LPCR` with default outer weights of one. The
+The adapted LPCR loss is `0.9 L_occ + 0.1 L_offset` at fine resolution.
+The diffusion loss is `L_clean_latent_MSE + L_residual_L1 + L_LPCR` with default
+outer weights of one. R2LDM itself uses clean-latent MSE during diffusion;
+the residual and decoded LPCR terms are this project's additions. The
 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 
 Start with `--train-limit 2 --val-limit 2 --epochs 1 --num-workers 0`
