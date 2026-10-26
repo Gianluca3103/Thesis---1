@@ -42,7 +42,7 @@ def main() -> None:
     parser.add_argument("--detector-config", type=Path, required=True,
                         help="Exact SVEFusion model YAML used to train the checkpoint")
     parser.add_argument("--detector-data-root", type=Path,
-                        help="Override DATA_PATH only if the training config used a placeholder")
+                        help="Relocated training data root; remaps sensor paths inside the old root")
     parser.add_argument("--export-root", type=Path, required=True)
     args = parser.parse_args()
     sve = args.sve_root.resolve()
@@ -57,9 +57,20 @@ def main() -> None:
             dataset[key] = value
     if dataset.get("SENSOR") != "Fusion" or dataset["DATA_SPLIT"]["test"] != "val":
         raise ValueError("Detector config must be LiDAR+radar fusion on validation")
-    data_root = (args.detector_data_root or Path(dataset["DATA_PATH"])).resolve()
+    original_data_root = Path(dataset["DATA_PATH"])
+    data_root = (args.detector_data_root or original_data_root).resolve()
     if not data_root.is_dir():
         raise FileNotFoundError(f"Detector data root does not exist: {data_root}")
+    if args.detector_data_root:
+        for key in ("LIDAR_POINTS_ROOT", "LIDAR_CALIB_ROOT",
+                    "RADAR_POINTS_ROOT", "RADAR_CALIB_ROOT"):
+            if key not in dataset:
+                continue
+            original = Path(dataset[key])
+            if original.is_relative_to(original_data_root):
+                relocated = str(data_root / original.relative_to(original_data_root))
+                dataset[key] = relocated
+                model["DATA_CONFIG"][key] = relocated
     infos = _validation_infos(data_root, dataset)
     actual_ids = [str(item["point_cloud"]["lidar_idx"]) for item in infos]
     manifest = json.loads((args.export_root / "export_manifest.json").read_text(encoding="utf-8"))
