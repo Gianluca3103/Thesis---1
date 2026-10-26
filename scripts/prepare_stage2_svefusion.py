@@ -20,10 +20,27 @@ import yaml
 from Fault_Localization_Model.vod_dataset.vod_io import (
     load_vod_lidar_to_camera, load_vod_radar_to_lidar,
 )
-from models.radar_lidar_stage2.detector_export import normalize_vod_labels
 
 
 CONDITIONS = ("clean", "faulty", "reconstructed")
+CLASSES = {"Car": "Car", "Pedestrian": "Pedestrian", "Cyclist": "Cyclist",
+           "bicycle": "Cyclist"}
+
+
+def normalize_vod_labels(text: str) -> str:
+    """Match the original clean-detector export's KITTI label conversion."""
+    foreground, ignored = [], []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 15:
+            raise ValueError(f"Malformed VoD label: {line!r}")
+        fields[0] = CLASSES.get(fields[0], "DontCare")
+        (ignored if fields[0] == "DontCare" else foreground).append(
+            " ".join(fields[:15]))
+    rows = foreground + ignored
+    return "\n".join(rows) + ("\n" if rows else "")
 
 
 def _link_directory(source: Path, target: Path) -> None:
