@@ -115,14 +115,14 @@ h1{font-size:20px;margin:0 0 6px}p{color:#b9c8d6;margin:5px 0 10px}
 section{min-width:0;background:#182633;border:1px solid #3b5164;border-radius:5px;padding:6px}
 h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;background:#0c1620;touch-action:none;cursor:grab}
 .layers{display:flex;gap:4px 12px;flex-wrap:wrap;margin:5px 0 8px}.layers label{white-space:nowrap;cursor:pointer}.layers input{vertical-align:middle}
-.confidence,.camera-speed{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.confidence input{width:220px}.camera-speed input{width:130px}
+.confidence,.camera-speed,.pitch-control,.rotation-mode{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.confidence input{width:220px}.camera-speed input,.pitch-control input{width:130px}select{background:#253847;color:inherit;border:1px solid #637b8b;border-radius:4px;padding:4px}
 .legend{color:#b9c8d6;margin-top:8px}
 @media(max-width:750px){.panels{display:block}section{margin-bottom:8px}canvas{height:50vh;min-height:280px}}
 </style>
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
-<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label></div>
+<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="rotation-mode">Drag rotation <select id="rotation-mode"><option value="locked">Axis locked</option><option value="pitch">Pitch only</option><option value="yaw">Yaw only</option><option value="free">Free</option></select></label><output id="yaw-value">Yaw -37°</output><label class="pitch-control">Pitch <output id="pitch-value">20°</output><input id="pitch-angle" type="range" min="-89" max="89" step="1" value="20"></label><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Each panel has its own layer switches. The confidence slider filters reconstructed points in every panel; it cannot show points below the generation threshold. Drag to rotate; Shift-drag to pan; wheel to zoom. Adjust camera speed for finer control. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Each panel has its own layer switches. The confidence slider filters reconstructed points in every panel; it cannot show points below the generation threshold. Vertical drag pitches and horizontal drag yaws; the default drag mode locks to one axis. Choose Pitch only or use the Pitch slider to change elevation without yaw. Shift-drag or right-drag pans; the wheel zooms. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -138,14 +138,41 @@ const panes=document.getElementById('panels'),panels=[];
 for(const preset of presets){const section=document.createElement('section'),h=document.createElement('h2'),switches=document.createElement('div'),canvas=document.createElement('canvas'),inputs={};switches.className='layers';h.textContent=preset.name;for(const layer of layers){const label=document.createElement('label'),input=document.createElement('input'),swatch=document.createElement('span');input.type='checkbox';input.checked=preset.visible.includes(layer.key);input.setAttribute('aria-label',`${preset.name}: ${layer.name}`);input.addEventListener('change',redraw);swatch.textContent='● ';swatch.style.color=layer.color;label.append(input,swatch,document.createTextNode(layer.name));switches.append(label);inputs[layer.key]=input;}section.append(h,switches,canvas);panes.append(section);panels.push({name:preset.name,heading:h,canvas,inputs});}
 const confidence=document.getElementById('confidence'),confidenceValue=document.getElementById('confidence-value');confidence.min=String(d.threshold);confidence.value=String(d.threshold);confidenceValue.textContent=Number(confidence.value).toFixed(2);
 const cameraSpeed=document.getElementById('camera-speed'),cameraSpeedValue=document.getElementById('camera-speed-value');cameraSpeed.addEventListener('input',()=>{cameraSpeedValue.textContent=`${Number(cameraSpeed.value).toFixed(1)}×`;});
+const rotationMode=document.getElementById('rotation-mode'),pitchAngle=document.getElementById('pitch-angle'),pitchValue=document.getElementById('pitch-value'),yawValue=document.getElementById('yaw-value');
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
-const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
+const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial},maxPitch=89*Math.PI/180;
 function project(p,w,h,s){const x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);const u=cy*x-sy*y,v=sy*x+cy*y;return [w/2+view.panX+u*s,h/2+view.panY-(cp*z-sp*v)*s];}
 function plot(ctx,points,w,h,s,color,scores,cutoff,size){let selected=0;ctx.fillStyle=color;for(let i=0;i<points.length;i++){if(scores&&scores[i]<cutoff)continue;selected++;const [x,y]=project(points[i],w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-size/2,y-size/2,size,size);}return selected;}
 function draw(panel){const canvas=panel.canvas,ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;let count=0;for(const key of ['predicted','faulty','clean','radar']){if(!panel.inputs[key].checked)continue;const layer=layers.find(item=>item.key===key);count+=plot(ctx,d[key],w,h,scale,layer.color,key==='predicted'?d.probabilities:null,Number(confidence.value),key==='radar'?4:2);}panel.heading.textContent=`${panel.name}: ${count.toLocaleString()} layer points selected`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
-let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;panels.forEach(draw);});}
+let pending=false;function redraw(){pitchAngle.value=String(Math.round(view.pitch*180/Math.PI));pitchValue.textContent=`${Number(pitchAngle.value)}°`;yawValue.textContent=`Yaw ${Math.round(view.yaw*180/Math.PI)}°`;if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;panels.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
-for(const {canvas} of panels){let last=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);last=[e.clientX,e.clientY];canvas.style.cursor='grabbing';});canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-last[0],dy=e.clientY-last[1],speed=Number(cameraSpeed.value);last=[e.clientX,e.clientY];if(e.shiftKey){view.panX+=dx*speed;view.panY+=dy*speed;}else{view.yaw+=dx*.004*speed;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.004*speed));}redraw();});for(const event of ['pointerup','pointercancel','lostpointercapture'])canvas.addEventListener(event,()=>{last=null;canvas.style.cursor='grab';});canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.0006*Number(cameraSpeed.value)),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
+for(const {canvas} of panels){
+  let drag=null;
+  canvas.addEventListener('contextmenu',e=>e.preventDefault());
+  canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);drag={x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY,axis:null,pan:e.button===2};canvas.style.cursor='grabbing';});
+  canvas.addEventListener('pointermove',e=>{
+    if(!drag)return;
+    let dx=e.clientX-drag.x,dy=e.clientY-drag.y;
+    const speed=Number(cameraSpeed.value),mode=rotationMode.value;
+    if(!e.shiftKey&&!drag.pan&&mode==='locked'&&!drag.axis){
+      const totalX=e.clientX-drag.startX,totalY=e.clientY-drag.startY;
+      if(Math.hypot(totalX,totalY)<10)return;
+      drag.axis=Math.abs(totalY)>=Math.abs(totalX)?'pitch':'yaw';
+      dx=totalX;dy=totalY;
+    }
+    drag.x=e.clientX;drag.y=e.clientY;
+    if(e.shiftKey||drag.pan){drag.startX=e.clientX;drag.startY=e.clientY;view.panX+=dx*speed;view.panY+=dy*speed;}
+    else{
+      const axis=mode==='locked'?drag.axis:mode;
+      if(axis==='yaw'||axis==='free')view.yaw+=dx*.004*speed;
+      if(axis==='pitch'||axis==='free')view.pitch=Math.max(-maxPitch,Math.min(maxPitch,view.pitch+dy*.004*speed));
+    }
+    redraw();
+  });
+  for(const event of ['pointerup','pointercancel','lostpointercapture'])canvas.addEventListener(event,()=>{drag=null;canvas.style.cursor='grab';});
+  canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.0006*Number(cameraSpeed.value)),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});
+}
+pitchAngle.addEventListener('input',()=>{view.pitch=Number(pitchAngle.value)*Math.PI/180;redraw();});
 confidence.addEventListener('input',()=>{confidenceValue.textContent=Number(confidence.value).toFixed(2);redraw();});
 document.getElementById('zin').onclick=()=>{const canvas=panels[0].canvas;zoom(1.25,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('zout').onclick=()=>{const canvas=panels[0].canvas;zoom(1/1.25,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};window.addEventListener('resize',redraw);redraw();
 })();
