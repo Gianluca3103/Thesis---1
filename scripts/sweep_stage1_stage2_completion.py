@@ -14,6 +14,17 @@ import hashlib
 import json
 from pathlib import Path
 
+# Import ME before the model modules. Their optional-import guards otherwise
+# hide the original ImportError and leave the decoder with ME = None.
+if __name__ == "__main__":
+    try:
+        import MinkowskiEngine as _me_preload  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError(
+            "The Stage-II Python environment cannot import MinkowskiEngine; "
+            "the original import error follows"
+        ) from error
+
 import numpy as np
 import torch
 from tqdm import tqdm
