@@ -181,6 +181,7 @@ the full ROI independently of radar.
 Existing Stage-II checkpoints cannot be resumed.
 Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
+
 The adapted LPCR loss is `0.9 L_occ + 0.1 L_offset` at fine resolution.
 The diffusion loss is `L_clean_latent_MSE + L_residual_L1 + L_LPCR` with default
 outer weights of one. R2LDM itself uses clean-latent MSE during diffusion;
@@ -223,3 +224,45 @@ These scores are autoencoder reconstructions from **clean LiDAR input**.
 R2LDM's published tables evaluate the complete radar-to-point-cloud model on
 different preprocessing grids; direct numerical comparison is not valid.
 Known/Full IoU remains a gate-specific metric for the later diffusion phase.
+
+## Frozen SVEFusion detector comparison
+
+`scripts/run_stage2_svefusion_comparison.sh` exports every official VoD
+validation frame and runs **one existing, clean-trained SVEFusion checkpoint**
+three times: original clean LiDAR plus radar, severe faulty LiDAR plus radar,
+and faulty LiDAR with Stage-II additions plus radar. The exporter applies the
+same deterministic severe fault protocol, radar-conditioned Stage-I gate, and
+missing-voxel Stage-II sampler as `predict_stage2_sparse.py`. Its clean scan is
+used to synthesize the fault and label the reference condition; it is never
+passed to the Stage-I or Stage-II prediction call. Original points outside the
+Stage-II radar sector remain in both faulty and completed detector scans.
+Surviving original returns retain their original intensity. Stage II predicts
+XYZ only, so generated points receive intensity zero. The detector's radar
+files, calibration, model weights, voxelization, FoV filtering, labels, and
+validation IDs are identical in every condition. The script refuses incomplete
+exports and mismatched validation frame orders.
+
+On the professor machine, locate the trained **SVEFusion LiDAR+radar**
+checkpoint and its exact training model YAML (both are required). The latter
+must be the YAML used for that checkpoint, not a guessed baseline config.
+Then run from the updated reconstruction repository:
+
+```bash
+cd /mnt/3D10B36523559581/Gianluca/sensor-fusion-fault-localization
+SVE=/absolute/path/to/SVEFusion
+DETECTOR_CONFIG="$SVE/tools/cfgs/VoD_models/YOUR_TRAINED_CONFIG.yaml"
+DETECTOR_CKPT=/absolute/path/to/checkpoint_epoch_N.pth
+SVE_PY=/absolute/path/to/svefusion/environment/bin/python
+STAGE2=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/meta_occupancy_official5_20261021/stage2_sparse_diffusion_fullregion_v9/last.ckpt
+bash scripts/run_stage2_svefusion_comparison.sh \
+  "$SVE" "$DETECTOR_CONFIG" "$DETECTOR_CKPT" "$SVE_PY" "$STAGE2"
+```
+
+If the detector training YAML has a placeholder or moved `DATA_PATH`, set
+`DETECTOR_DATA_ROOT` to its existing SVEFusion VoD data root before running.
+The runner uses the established model-v2 environment for Stage II. It resumes
+an interrupted point export, then writes
+`$OUT5/svefusion_stage2_comparison/svefusion_3d_ap_r40.csv`. The CSV has
+KITTI 3D AP_R40 for Car, Pedestrian, and Cyclist on all validation frames
+and separately for total-loss, severe-FoV, and severe-fog frames. These are
+full detector FoV scores; they include objects outside the Stage-II region.
