@@ -262,6 +262,10 @@ bash scripts/run_stage2_svefusion_comparison.sh \
 
 If the detector training YAML has a placeholder or moved `DATA_PATH`, set
 `DETECTOR_DATA_ROOT` to its existing SVEFusion VoD data root before running.
+When that old data root is unavailable, preparation rebuilds only the clean
+validation reference under the comparison output: symlinks to original VoD
+sensor files, normalized KITTI labels matching the detector's training export,
+and `vod_infos_val.pkl`. It does not retrain the detector or copy point clouds.
 The runner uses the established model-v2 environment for Stage II. It resumes
 an interrupted point export, then writes
 `$OUT5/svefusion_stage2_comparison/svefusion_3d_ap_r40.csv`. The CSV has

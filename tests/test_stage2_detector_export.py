@@ -11,6 +11,7 @@ spec.loader.exec_module(detector_export)
 detector_clouds = detector_export.detector_clouds
 radar_sector_indices = detector_export.radar_sector_indices
 retained_clean_mask = detector_export.retained_clean_mask
+normalize_vod_labels = detector_export.normalize_vod_labels
 
 
 class DetectorExportTests(unittest.TestCase):
@@ -46,6 +47,15 @@ class DetectorExportTests(unittest.TestCase):
                           [2, 1, 0, 0.3]], dtype=np.float32)
         np.testing.assert_array_equal(
             radar_sector_indices(clean, np.eye(4)), [0, 2])
+
+    def test_vod_labels_match_clean_detector_export(self):
+        cyclist = "bicycle " + " ".join(["1"] * 15)
+        ignored = "truck " + " ".join(["2"] * 15)
+        car = "Car " + " ".join(["3"] * 15)
+        lines = normalize_vod_labels("\n".join((ignored, cyclist, car))).splitlines()
+        self.assertEqual([line.split()[0] for line in lines],
+                         ["Cyclist", "Car", "DontCare"])
+        self.assertTrue(all(len(line.split()) == 15 for line in lines))
 
 
 if __name__ == "__main__":

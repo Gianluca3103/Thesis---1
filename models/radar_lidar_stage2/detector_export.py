@@ -7,6 +7,24 @@ import numpy as np
 from models.radar_lidar_stage1.radar_fov import crop_lidar_to_radar_fov
 
 
+def normalize_vod_labels(text: str) -> str:
+    """Match the original clean-detector export's KITTI label conversion."""
+    classes = {"Car": "Car", "Pedestrian": "Pedestrian",
+               "Cyclist": "Cyclist", "bicycle": "Cyclist"}
+    foreground, ignored = [], []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 15:
+            raise ValueError(f"Malformed VoD label: {line!r}")
+        fields[0] = classes.get(fields[0], "DontCare")
+        (ignored if fields[0] == "DontCare" else foreground).append(
+            " ".join(fields[:15]))
+    rows = foreground + ignored
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
 def radar_sector_indices(clean_xyzi: np.ndarray,
                          lidar_from_radar: np.ndarray) -> np.ndarray:
     """Return raw row indices in the exact sector used by Stage I/II."""

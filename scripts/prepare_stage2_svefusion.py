@@ -7,6 +7,7 @@ dataset preprocessing settings are copied from the supplied training config.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import filecmp
 import json
@@ -19,9 +20,83 @@ import yaml
 from Fault_Localization_Model.vod_dataset.vod_io import (
     load_vod_lidar_to_camera, load_vod_radar_to_lidar,
 )
+from models.radar_lidar_stage2.detector_export import normalize_vod_labels
 
 
 CONDITIONS = ("clean", "faulty", "reconstructed")
+
+
+def _link_directory(source: Path, target: Path) -> None:
+    if not source.is_dir():
+        raise FileNotFoundError(source)
+    if target.is_symlink() or target.exists():
+        if target.resolve() != source.resolve():
+            raise FileExistsError(f"Existing detector reference differs: {target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(source.resolve(), target_is_directory=True)
+
+
+def _build_validation_reference(root: Path, manifest: dict, dataset: dict) -> None:
+    """Recreate the missing clean export's validation labels and infos only."""
+    ids = manifest["frame_ids"]
+    raw_lidar = Path(manifest["clean_points_root"])
+    raw_calib = Path(manifest["lidar_calibration_root"])
+    raw_training = raw_calib.parent
+    training = root / "training"
+    for name, source in (("velodyne", raw_lidar), ("calib", raw_calib),
+                         ("lidar_calib", raw_calib),
+                         ("radar_5f", Path(manifest["radar_points_root"])),
+                         ("radar_calib", Path(manifest["radar_calibration_root"])),
+                         ("image_2", raw_training / "image_2")):
+        _link_directory(source, training / name)
+    labels = training / "label_2"
+    labels.mkdir(parents=True, exist_ok=True)
+    for frame_id in ids:
+        source = raw_training / "label_2" / f"{frame_id}.txt"
+        expected = normalize_vod_labels(source.read_text(encoding="utf-8"))
+        target = labels / source.name
+        if target.exists():
+            if target.read_text(encoding="utf-8") != expected:
+                raise FileExistsError(f"Existing normalized label differs: {target}")
+        else:
+            target.write_text(expected, encoding="utf-8")
+    splits = root / "ImageSets"
+    splits.mkdir(parents=True, exist_ok=True)
+    val = splits / "val.txt"
+    expected_ids = "\n".join(ids) + "\n"
+    if val.exists():
+        if val.read_text(encoding="utf-8") != expected_ids:
+            raise FileExistsError(f"Existing validation IDs differ: {val}")
+    else:
+        val.write_text(expected_ids, encoding="utf-8")
+
+    info_path = root / "vod_infos_val.pkl"
+    if not info_path.is_file():
+        from easydict import EasyDict
+        from pcdet.datasets.vod.vod_dataset import VodDataset
+
+        config = copy.deepcopy(dataset)
+        config["DATA_PATH"] = str(root)
+        config["LIDAR_POINTS_ROOT"] = str(training / "velodyne")
+        config["LIDAR_CALIB_ROOT"] = str(training / "calib")
+        if "RADAR_POINTS_ROOT" not in config:
+            config["RADAR_POINTS_ROOT"] = manifest["radar_points_root"]
+        if "RADAR_CALIB_ROOT" not in config:
+            config["RADAR_CALIB_ROOT"] = manifest["radar_calibration_root"]
+        data = VodDataset(EasyDict(config), ["Car", "Pedestrian", "Cyclist"],
+                          training=False, root_path=root)
+        log_path = root / "validation_infos.log"
+        with log_path.open("w", encoding="utf-8") as log, contextlib.redirect_stdout(log):
+            infos = data.get_infos(num_workers=2, has_label=True,
+                                   count_inside_pts=False)
+        if [str(row["point_cloud"]["lidar_idx"]) for row in infos] != ids:
+            raise ValueError("Rebuilt validation info IDs differ from Stage II")
+        temporary = info_path.with_suffix(".pkl.tmp")
+        with temporary.open("wb") as target:
+            pickle.dump(infos, target, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(info_path)
+        print(f"Rebuilt {len(infos)} clean detector validation infos: {info_path}")
 
 
 def _validation_infos(data_root: Path, dataset: dict) -> list[dict]:
@@ -57,11 +132,18 @@ def main() -> None:
             dataset[key] = value
     if dataset.get("SENSOR") != "Fusion" or dataset["DATA_SPLIT"]["test"] != "val":
         raise ValueError("Detector config must be LiDAR+radar fusion on validation")
+    manifest = json.loads((args.export_root / "export_manifest.json").read_text(encoding="utf-8"))
+    ids = manifest["frame_ids"]
+    if not manifest["complete"]:
+        raise ValueError("Stage-II validation export is incomplete")
     original_data_root = Path(dataset["DATA_PATH"])
     data_root = (args.detector_data_root or original_data_root).resolve()
-    if not data_root.is_dir():
-        raise FileNotFoundError(f"Detector data root does not exist: {data_root}")
-    if args.detector_data_root:
+    rebuild_reference = not data_root.is_dir()
+    if rebuild_reference:
+        data_root = (args.export_root / "detector_clean_reference").resolve()
+        print(f"Detector training data root is unavailable; rebuilding validation "
+              f"reference at {data_root}", flush=True)
+    if data_root != original_data_root.resolve():
         for key in ("LIDAR_POINTS_ROOT", "LIDAR_CALIB_ROOT",
                     "RADAR_POINTS_ROOT", "RADAR_CALIB_ROOT"):
             if key not in dataset:
@@ -71,12 +153,15 @@ def main() -> None:
                 relocated = str(data_root / original.relative_to(original_data_root))
                 dataset[key] = relocated
                 model["DATA_CONFIG"][key] = relocated
+    if rebuild_reference:
+        for key, source in (("RADAR_POINTS_ROOT", manifest["radar_points_root"]),
+                            ("RADAR_CALIB_ROOT", manifest["radar_calibration_root"])):
+            if key not in dataset or not Path(dataset[key]).is_dir():
+                dataset[key] = source
+                model["DATA_CONFIG"][key] = source
+        _build_validation_reference(data_root, manifest, dataset)
     infos = _validation_infos(data_root, dataset)
     actual_ids = [str(item["point_cloud"]["lidar_idx"]) for item in infos]
-    manifest = json.loads((args.export_root / "export_manifest.json").read_text(encoding="utf-8"))
-    ids = manifest["frame_ids"]
-    if not manifest["complete"]:
-        raise ValueError("Stage-II validation export is incomplete")
     if len(actual_ids) != len(set(actual_ids)) or not set(actual_ids).issubset(ids):
         vod_info_path = data_root / "vod_infos_val.pkl"
         if not vod_info_path.is_file():
