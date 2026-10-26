@@ -29,6 +29,8 @@ done
 
 export PYTHONPATH="$REPO:$SVE${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+export PATH="$(dirname "$SVE_PY"):$PATH"
+"$SVE_PY" "$REPO/scripts/check_svefusion_detector_env.py" --sve-root "$SVE"
 cd "$REPO"
 "$SVE_PY" -u -m scripts.prepare_new_svefusion_detector \
   --vod-root "$VOD" --sve-root "$SVE" \
