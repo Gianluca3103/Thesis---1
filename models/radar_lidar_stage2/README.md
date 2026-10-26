@@ -158,6 +158,11 @@ reconstructed points down to the generation threshold set with
 `--occupancy-threshold`; regenerating the preview with a lower threshold is
 needed to inspect lower-confidence points. The preview reports how many clean
 returns were removed by each synthetic fault.
+Drag rotates the shared camera; Shift-drag pans and the wheel zooms. The camera
+speed slider defaults to 0.7× and can be reduced to 0.2× for precise movement.
+To update already generated HTML viewers without rerunning diffusion, run
+`"$PY" -m scripts.refresh_stage2_viewer --output-root "$DIFF/val_samples"`
+and reopen the same `index.html`.
 Use `--full-estimate` to inspect the unfiltered decoder output. Use
 `--zero-residual` with the same split, random seed, and occupancy threshold to
 measure whether diffusion improves missing-voxel precision/recall over decoding
