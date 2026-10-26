@@ -27,6 +27,22 @@ def _num(value, digits=3):
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+def _ratio(numerator, denominator):
+    if numerator is None or not denominator:
+        return None
+    return numerator / denominator
+
+
+def _diagnostics(row: dict) -> list[str]:
+    """Precision/recall at 0.2 m and mean occupied-voxel counts per frame."""
+    frames = row.get("frames") or 0
+    tp = row.get("tp_at_0_2m")
+    return [_num(_ratio(tp, row.get("predicted"))),
+            _num(_ratio(tp, row.get("observed"))),
+            _num(_ratio(row.get("predicted"), frames), 0),
+            _num(_ratio(row.get("observed"), frames), 0)]
+
+
 def _pair(faulty, model, digits=3):
     return f"{_num(faulty, digits)} -> {_num(model, digits)}"
 
@@ -52,7 +68,9 @@ def _chamfer(baseline: dict, row: dict) -> str:
 
 def _stage_table(stage_result: dict, threshold: float | None) -> list[str]:
     chosen = threshold if threshold is not None else stage_result["selected_threshold"]
-    header = ["Scope", "Frames", *[label for _, label in METRICS], "Chamfer (paired)"]
+    header = ["Scope", "Frames", *[label for _, label in METRICS],
+              "Prec@0.2m", "Recall@0.2m", "Pred/frame", "Obs/frame",
+              "Chamfer (paired)"]
     lines = [f"Threshold {chosen:.2f} "
              f"({'selected on overall ' + stage_result['selection_metric'] if threshold is None else 'user-specified'}). "
              "Cells read `faulty LiDAR -> model`.", "",
@@ -66,6 +84,7 @@ def _stage_table(stage_result: dict, threshold: float | None) -> list[str]:
         base = scope["faulty_baseline"]
         cells = [label, str(row["frames"])]
         cells += [_pair(base[name], row[name]) for name, _ in METRICS]
+        cells += _diagnostics(row)
         cells.append(_chamfer(base, row))
         lines.append("| " + " | ".join(cells) + " |")
     return lines
@@ -80,11 +99,13 @@ def _full_tables(stage_result: dict) -> list[str]:
         base = scope["faulty_baseline"]
         lines += ["", f"**{label}** - faulty baseline: "
                   + ", ".join(f"{short} {_num(base[name])}" for name, short in METRICS),
-                  "", "| Threshold | " + " | ".join(s for _, s in METRICS) + " | Chamfer |",
-                  "|---|" + "---|" * (len(METRICS) + 1)]
+                  "", "| Threshold | " + " | ".join(s for _, s in METRICS)
+                  + " | Prec@0.2m | Recall@0.2m | Pred/frame | Obs/frame | Chamfer |",
+                  "|---|" + "---|" * (len(METRICS) + 5)]
         for row in scope["rows"]:
             lines.append(f"| {row['threshold']:.2f} | "
                          + " | ".join(_num(row[name]) for name, _ in METRICS)
+                         + " | " + " | ".join(_diagnostics(row))
                          + f" | {_num(row.get('chamfer_squared_l2'), 2)} |")
     return lines
 
