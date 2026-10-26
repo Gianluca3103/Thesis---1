@@ -66,14 +66,14 @@ def main() -> None:
     ids = manifest["frame_ids"]
     if not manifest["complete"]:
         raise ValueError("Stage-II validation export is incomplete")
-    if actual_ids != ids:
+    if len(actual_ids) != len(set(actual_ids)) or not set(actual_ids).issubset(ids):
         vod_info_path = data_root / "vod_infos_val.pkl"
         if not vod_info_path.is_file():
             raise ValueError("Detector validation IDs/order differ from official VoD")
         with vod_info_path.open("rb") as source:
             infos = pickle.load(source)
         actual_ids = [str(item["point_cloud"]["lidar_idx"]) for item in infos]
-        if actual_ids != ids:
+        if len(actual_ids) != len(set(actual_ids)) or not set(actual_ids).issubset(ids):
             raise ValueError("Detector VoD validation IDs/order differ from Stage II")
         # Some training configs list a second dataset's infos as well. Evaluate
         # the official VoD validation split only, with unchanged preprocessing.
@@ -88,7 +88,11 @@ def main() -> None:
     lidar_calib = Path(dataset.get("LIDAR_CALIB_ROOT", data_root / "training" / "lidar_calib"))
     radar_calib = Path(dataset.get("RADAR_CALIB_ROOT", data_root / "training" / "radar_calib"))
     detector_label_calib = data_root / "training" / "calib"
-    for frame_id in ids:
+    point_range = dataset["POINT_CLOUD_RANGE"]
+    if point_range[0] < 0:
+        raise ValueError("This comparison expects SVEFusion's forward-only detector range")
+    clean_policies = set()
+    for frame_id in actual_ids:
         for path in (raw_root / f"{frame_id}.bin",
                      detector_clean_root / f"{frame_id}.bin",
                      args.export_root / "faulty" / f"{frame_id}.bin",
@@ -99,8 +103,21 @@ def main() -> None:
                      detector_label_calib / f"{frame_id}.txt"):
             if not path.is_file():
                 raise FileNotFoundError(path)
+        raw_path = raw_root / f"{frame_id}.bin"
+        detector_path = detector_clean_root / f"{frame_id}.bin"
+        if not filecmp.cmp(raw_path, detector_path, shallow=False):
+            raw = np.fromfile(raw_path, dtype="<f4").reshape(-1, 4)
+            trained = np.fromfile(detector_path, dtype="<f4").reshape(-1, 4)
+            forward = raw[raw[:, 0] >= 0]
+            sentinel = np.array([[0.01, 0.0, -2.9, 0.0]], dtype=np.float32)
+            if not np.array_equal(trained, forward if len(forward) else sentinel):
+                raise ValueError(f"Detector clean scan differs from raw/forward VoD: {frame_id}")
+            clean_policies.add("forward_only")
+        else:
+            raw = np.fromfile(raw_path, dtype="<f4").reshape(-1, 4)
+            if np.any(raw[:, 0] < 0):
+                clean_policies.add("full_scan")
         for source, target, suffix, label in (
-            (raw_root, detector_clean_root, "bin", "clean LiDAR"),
             (stage1_radar_root, radar_root, "bin", "radar"),
         ):
             if not filecmp.cmp(source / f"{frame_id}.{suffix}",
@@ -117,6 +134,8 @@ def main() -> None:
                                    load_vod_radar_to_lidar(target_lidar, target_radar),
                                    rtol=0, atol=1e-6)):
             raise ValueError(f"Detector calibration differs from Stage-II VoD: {frame_id}")
+    if len(clean_policies) > 1:
+        raise ValueError("Detector clean export mixes full and forward-only LiDAR policies")
     paths = {
         "clean": detector_clean_root,
         "faulty": (args.export_root / "faulty").resolve(),
@@ -134,7 +153,8 @@ def main() -> None:
         path = target_dir / f"SVEFusion_stage2_{condition}.yaml"
         path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         print(f"{condition}: {path}")
-    print(f"Validated {len(ids)} common VoD frames and one fixed radar source")
+    print(f"Validated {len(actual_ids)} common VoD frames, one fixed radar source, "
+          f"and clean policy {next(iter(clean_policies), 'ambiguous')}")
 
 
 if __name__ == "__main__":
