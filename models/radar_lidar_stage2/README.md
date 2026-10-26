@@ -272,3 +272,15 @@ an interrupted point export, then writes
 KITTI 3D AP_R40 for Car, Pedestrian, and Cyclist on all validation frames
 and separately for total-loss, severe-FoV, and severe-fog frames. These are
 full detector FoV scores; they include objects outside the Stage-II region.
+
+To train a **new** SVEFusion detector from clean VoD LiDAR plus unmodified
+five-frame radar, then run the same three-condition comparison, use
+`scripts/train_new_svefusion_and_compare.sh SVE_ROOT SVE_PYTHON`. It creates a
+small clean training reference under `$OUT5/svefusion_clean_train_v1` with
+symlinked raw sensor data and normalized labels, and generates only the
+train/validation info pickles. Its model config is based on SVEFusion's own
+architecture and optimizer settings; the runner uses batch size 2, 80 epochs,
+validation every 10 epochs, and selects the saved epoch with the highest clean
+validation moderate 3D mAP_R40. The detector starts from random weights in a
+new output directory and automatically resumes its own checkpoints if the
+training run is interrupted. The existing Stage-II export is reused.
