@@ -53,6 +53,8 @@ DEFAULT_THRESHOLDS = tuple(round(i / 10, 2) for i in range(1, 10))
 METRICS = ("iou_exact", "iou_at_0_2m", "f1_exact", "f1_at_0_2m",
            "chamfer_squared_l2")
 ACTIVE_FLOOR = 1e-30  # keeps every generated cell, unlike the 0.1 gate
+PR_METRICS = ("precision_exact", "recall_exact",
+              "precision_at_0_2m", "recall_at_0_2m")
 COUNT_FIELDS = ("predicted", "observed", "tp_exact", "tp_at_0_2m")
 
 
@@ -366,8 +368,9 @@ def main() -> None:
         ("stage1", "stage1_active") if args.stage1_only
         else ("stage1", "stage1_active", "stage2"))}
     _atomic_json(args.output_root / "threshold_metrics.json", result)
-    fields = ("stage", "fault_type", "threshold", *METRICS,
-              *(f"faulty_{metric}" for metric in METRICS),
+    fields = ("stage", "fault_type", "threshold", *METRICS, *PR_METRICS,
+              "predicted", "observed", "tp_exact", "tp_at_0_2m", "frames",
+              *(f"faulty_{metric}" for metric in (*METRICS, *PR_METRICS)),
               "iou_exact_gain", "iou_at_0_2m_gain", "f1_exact_gain",
               "f1_at_0_2m_gain", "chamfer_squared_l2_reduction",
               "chamfer_paired_frames", "chamfer_faulty_paired_mean",
@@ -382,7 +385,7 @@ def main() -> None:
                 for row in scope["rows"]:
                     values = {"stage": stage, "fault_type": fault,
                               **row, **{f"faulty_{name}": faulty[name]
-                                       for name in METRICS}}
+                                       for name in (*METRICS, *PR_METRICS)}}
                     writer.writerow({name: values.get(name) for name in fields})
     for stage, stage_result in result["stages"].items():
         threshold = stage_result["selected_threshold"]
@@ -394,6 +397,10 @@ def main() -> None:
               f"IoU@0.2m {baseline['iou_at_0_2m']} -> {selected['iou_at_0_2m']}; "
               f"F1 {baseline['f1_exact']} -> {selected['f1_exact']}; "
               f"F1@0.2m {baseline['f1_at_0_2m']} -> {selected['f1_at_0_2m']}; "
+              f"precision {baseline['precision_exact']} -> {selected['precision_exact']}; "
+              f"recall {baseline['recall_exact']} -> {selected['recall_exact']}; "
+              f"precision@0.2m {baseline['precision_at_0_2m']} -> {selected['precision_at_0_2m']}; "
+              f"recall@0.2m {baseline['recall_at_0_2m']} -> {selected['recall_at_0_2m']}; "
               f"Chamfer {baseline['chamfer_squared_l2']} -> "
               f"{selected['chamfer_squared_l2']} "
               f"(paired reduction {selected['chamfer_squared_l2_reduction']} "

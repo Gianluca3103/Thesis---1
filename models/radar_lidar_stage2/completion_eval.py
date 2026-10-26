@@ -106,6 +106,8 @@ def rates(counts: dict[str, int]) -> dict[str, float | None]:
         union = predicted + observed - tp
         result[f"iou_{suffix}"] = tp / union if union else None
         result[f"f1_{suffix}"] = 2 * tp / (predicted + observed) if predicted + observed else None
+        result[f"precision_{suffix}"] = tp / predicted if predicted else None
+        result[f"recall_{suffix}"] = tp / observed if observed else None
     return result
 
 
