@@ -85,6 +85,19 @@ def overlap_counts(predicted_zyx: np.ndarray,
     return result
 
 
+def restrict_to_cells(voxels_zyx: np.ndarray,
+                      cells_zyx: np.ndarray) -> np.ndarray:
+    """Keep the voxels that are also members of the given cell set."""
+    voxels = np.asarray(voxels_zyx, dtype=np.int64).reshape(-1, 3)
+    cells = np.asarray(cells_zyx, dtype=np.int64).reshape(-1, 3)
+    if not len(voxels) or not len(cells):
+        return voxels[:0]
+    shape = GRID.shape_zyx
+    keep = np.isin(np.ravel_multi_index(voxels.T, shape),
+                   np.ravel_multi_index(cells.T, shape))
+    return voxels[keep]
+
+
 def rates(counts: dict[str, int]) -> dict[str, float | None]:
     predicted, observed = counts["predicted"], counts["observed"]
     result: dict[str, float | None] = {}

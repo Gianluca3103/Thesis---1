@@ -2,6 +2,9 @@
 
 Stage I is scored in radar support within the Stage-II ROI. Stage II is scored
 over the full ROI after preserving faulty returns and adding reconstruction.
+"stage1_active" scores Stage I only on its active cells: the radar-supported
+voxels the decoder generated, with no penalty for clean LiDAR voxels it never
+generated. IoU/F1 only; Chamfer is undefined there.
 Diffusion runs once per frame at the lowest occupancy threshold; higher
 thresholds filter the same decoded points. Per-frame records support resume.
 """
@@ -31,7 +34,8 @@ from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.completion_eval import (
-    rates, score, scoped_cloud, voxel_centers,
+    overlap_counts, rates, restrict_to_cells, score, scoped_cloud,
+    voxel_centers,
 )
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, severe_fault,
@@ -44,10 +48,11 @@ from models.radar_lidar_stage2.stage2_io import (
 )
 
 
-VERSION = "stage1_stage2_completion_sweep_v1"
+VERSION = "stage1_stage2_completion_sweep_v2"
 DEFAULT_THRESHOLDS = tuple(round(i / 10, 2) for i in range(1, 10))
 METRICS = ("iou_exact", "iou_at_0_2m", "f1_exact", "f1_at_0_2m",
            "chamfer_squared_l2")
+ACTIVE_FLOOR = 1e-30  # keeps every generated cell, unlike the 0.1 gate
 COUNT_FIELDS = ("predicted", "observed", "tp_exact", "tp_at_0_2m")
 
 
@@ -121,7 +126,7 @@ def _improvement(model: dict, faulty: dict, total: dict) -> dict:
 def _summarize(records: list[dict], thresholds: tuple[float, ...],
                selection_metric: str) -> dict:
     result = {}
-    for stage in ("stage1", "stage2"):
+    for stage in ("stage1", "stage1_active", "stage2"):
         scopes = {}
         for fault in ("overall", *FAULT_NAMES):
             selected = [record for record in records
@@ -140,19 +145,27 @@ def _summarize(records: list[dict], thresholds: tuple[float, ...],
                 rows.append({"threshold": threshold, **metric,
                              **_improvement(metric, baseline, total)})
             scopes[fault] = {"faulty_baseline": baseline, "rows": rows}
+        metric_name = ("iou_exact" if stage == "stage1_active"
+                       and selection_metric == "chamfer_squared_l2"
+                       else selection_metric)
         valid = [row for row in scopes["overall"]["rows"]
-                 if row[selection_metric] is not None
-                 and (selection_metric != "chamfer_squared_l2"
+                 if row[metric_name] is not None
+                 and (metric_name != "chamfer_squared_l2"
                       or row["chamfer_defined_frames"] == row["frames"])]
         if not valid:
-            raise ValueError(f"No valid {stage} values for {selection_metric}")
-        if selection_metric == "chamfer_squared_l2":
-            best = min(valid, key=lambda row: (row[selection_metric], -row["threshold"]))
+            raise ValueError(f"No valid {stage} values for {metric_name}")
+        if metric_name == "chamfer_squared_l2":
+            best = min(valid, key=lambda row: (row[metric_name], -row["threshold"]))
         else:
-            best = max(valid, key=lambda row: (row[selection_metric], row["threshold"]))
+            best = max(valid, key=lambda row: (row[metric_name], row["threshold"]))
         result[stage] = {"selected_threshold": best["threshold"],
-                         "selection_metric": selection_metric, "scopes": scopes}
+                         "selection_metric": metric_name, "scopes": scopes}
     return result
+
+
+def _active_score(predicted_zyx: np.ndarray, observed_zyx: np.ndarray) -> dict:
+    counts = overlap_counts(predicted_zyx, observed_zyx)
+    return {**counts, **rates(counts), "chamfer_squared_l2": None}
 
 
 @torch.no_grad()
@@ -174,6 +187,11 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
         min(thresholds))
     stage1_coords = stage1_coords[:, 1:].cpu().numpy()
     stage1_scores = stage1_scores.cpu().numpy().reshape(-1)
+    active_coords, active_scores = select_allowed(
+        live["confidence_coords"], live["confidence_probabilities"],
+        ACTIVE_FLOOR)
+    active_coords = active_coords[:, 1:].cpu().numpy()
+    active_scores = active_scores.cpu().numpy().reshape(-1)
     clean1_xyz, clean1_zyx = scoped_cloud(clean, radar_xyz=radar_xyz,
                                            radius_m=radius_m)
     faulty1_xyz, faulty1_zyx = scoped_cloud(faulty, radar_xyz=radar_xyz,
@@ -186,6 +204,15 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
         stage1_rows.append({"threshold": threshold,
                             **score(voxel_centers(coords), coords,
                                     clean1_xyz, clean1_zyx)})
+
+    clean_active = restrict_to_cells(clean1_zyx, active_coords)
+    faulty_active = restrict_to_cells(faulty1_zyx, active_coords)
+    active_baseline = _active_score(faulty_active, clean_active)
+    active_rows = []
+    for threshold in thresholds:
+        coords = active_coords[active_scores >= threshold]
+        active_rows.append({"threshold": threshold,
+                            **_active_score(coords, clean_active)})
 
     clean2_xyz, clean2_zyx = scoped_cloud(clean)
     faulty2_xyz, faulty2_zyx = scoped_cloud(faulty)
@@ -217,7 +244,9 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
                                     clean2_xyz, clean2_zyx)})
     return {"frame_id": frame_id, "fault_type": fault_type,
             "stage1": {"faulty": stage1_baseline, "rows": stage1_rows},
+            "stage1_active": {"faulty": active_baseline, "rows": active_rows},
             "stage2": {"faulty": stage2_baseline, "rows": stage2_rows},
+            "stage1_active_cells": len(active_coords),
             "stage2_allowed_cells": len(conditions.hierarchy[0]),
             "stage2_lowest_threshold_additions": len(additions)}
 
