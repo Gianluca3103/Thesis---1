@@ -91,6 +91,12 @@ if [[ ! -x $CUDA_HOME/bin/nvcc ]] || ! "$CUDA_HOME/bin/nvcc" --version | grep -q
   echo "A CUDA 11.8 nvcc compiler is required at $CUDA_HOME/bin/nvcc" >&2
   exit 1
 fi
+if [[ $CUDA_HOME == "$ENV_PREFIX" && -d $CUDA_HOME/targets/x86_64-linux/include ]]; then
+  # NVIDIA's conda toolkit stores headers and libraries under targets/.
+  export CPATH="$CUDA_HOME/targets/x86_64-linux/include${CPATH:+:$CPATH}"
+  export LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 echo "Using CUDA compiler: $CUDA_HOME/bin/nvcc"
 
 echo 'Installing SVEFusion Python dependencies...'
