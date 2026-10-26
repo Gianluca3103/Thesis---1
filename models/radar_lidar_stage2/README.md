@@ -225,6 +225,49 @@ R2LDM's published tables evaluate the complete radar-to-point-cloud model on
 different preprocessing grids; direct numerical comparison is not valid.
 Known/Full IoU remains a gate-specific metric for the later diffusion phase.
 
+## Stage-I and Stage-II completion threshold sweep
+
+`scripts.sweep_stage1_stage2_completion` scores the radar-only Stage-I occupancy
+map and the Stage-II **completed cloud** (surviving faulty LiDAR plus generated
+points) against clean LiDAR. It uses the same deterministic severe fault plan as
+diffusion training and the detector export. Stage I and its faulty baseline are
+restricted to radar support within the Stage-II ROI; Stage II and its faulty
+baseline use the whole Stage-II ROI of the paired, radar-FOV-cropped LiDAR scan. This makes each within-stage improvement
+comparable, while the two stages have explicitly different evaluation scopes.
+
+The sweep reports exact occupied-voxel IoU/F1, 0.2-m-tolerant IoU/F1 using
+one-to-one matching of voxel centers, and symmetric squared-L2 Chamfer after
+0.125-m centroid preprocessing (units m²; lower is better). The faulty-baseline gains are reported for all
+four overlap metrics; Chamfer reduction uses only frames on which both faulty
+and predicted clouds have a defined Chamfer value. In particular, the
+total-loss faulty baseline has undefined Chamfer rather than an invented large
+value. Scores are pooled over voxels for IoU/F1 and averaged per valid frame
+for Chamfer. Results are saved overall, by fault, and per threshold.
+
+Stage I probability and Stage II decoder occupancy thresholds are swept
+independently, with exact IoU as the default selection criterion. The Stage-II
+radar gate remains at the value recorded in its checkpoint (usually 0.25):
+changing the gate would require rebuilding its geometry and retraining the
+diffusion run. Stage-II diffusion is sampled once per frame at the lowest
+decoder threshold, then the same decoded points are filtered for higher
+thresholds. Each frame's metrics are saved for interruption-safe resume.
+Selecting a threshold and reporting scores on the same validation split is a
+validation analysis; an unbiased final estimate needs a separate held-out set.
+
+```bash
+"$PY" -u -m scripts.sweep_stage1_stage2_completion \
+  --vod-root "$VOD" --data-cache-root "$OUT5/fixed_frames" \
+  --stage2-cache-root "$OUT5/stage2_fixed_gate025_v1" \
+  --fault-cache-root "$OUT5/stage2_severe_fog_s5_v1" \
+  --stage1-checkpoint "$OUT5/radar_autoencoder/best_student.ckpt" \
+  --stage2-checkpoint "$OUT5/stage2_sparse_diffusion_r2ldm_centroid_v8/last.ckpt" \
+  --output-root "$OUT5/stage1_stage2_completion_sweep_v1" \
+  --split val --device cuda
+```
+
+Use `--limit 2` and a separate output directory for a quick integration run.
+The full run writes `threshold_metrics.json` and `threshold_metrics.csv`.
+
 ## Frozen SVEFusion detector comparison
 
 `scripts/run_stage2_svefusion_comparison.sh` exports every official VoD
