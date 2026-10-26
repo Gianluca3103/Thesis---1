@@ -124,9 +124,9 @@ def _improvement(model: dict, faulty: dict, total: dict) -> dict:
 
 
 def _summarize(records: list[dict], thresholds: tuple[float, ...],
-               selection_metric: str) -> dict:
+               selection_metric: str, stages: tuple[str, ...]) -> dict:
     result = {}
-    for stage in ("stage1", "stage1_active", "stage2"):
+    for stage in stages:
         scopes = {}
         for fault in ("overall", *FAULT_NAMES):
             selected = [record for record in records
@@ -174,7 +174,7 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
                   alpha_bars: torch.Tensor, radius_m: float, gate_threshold: float,
                   thresholds: tuple[float, ...], sampling_steps: int,
                   random_seed: int, fault_seed: int, forced_fault: str | None,
-                  device: str) -> dict:
+                  device: str, stage1_only: bool = False) -> dict:
     clean = frame["clean_lidar"][:, :3].numpy()
     faulty_tensor, fault_type = severe_fault(
         frame["clean_lidar"], frame_id, 0, fog_cache,
@@ -213,6 +213,12 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
         coords = active_coords[active_scores >= threshold]
         active_rows.append({"threshold": threshold,
                             **_active_score(coords, clean_active)})
+
+    if stage1_only:
+        return {"frame_id": frame_id, "fault_type": fault_type,
+                "stage1": {"faulty": stage1_baseline, "rows": stage1_rows},
+                "stage1_active": {"faulty": active_baseline, "rows": active_rows},
+                "stage1_active_cells": len(active_coords)}
 
     clean2_xyz, clean2_zyx = scoped_cloud(clean)
     faulty2_xyz, faulty2_zyx = scoped_cloud(faulty)
@@ -269,6 +275,8 @@ def main() -> None:
     parser.add_argument("--sampling-steps", type=int, default=64)
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--stage1-only", action="store_true",
+                        help="Skip Stage-II diffusion; score Stage I only")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available()
@@ -320,6 +328,7 @@ def main() -> None:
         "chamfer_definition": "mean(pred_to_clean_squared_L2)+mean(clean_to_pred_squared_L2)",
         "thresholds": thresholds,
         "sampling_steps": args.sampling_steps,
+        "stage1_only": args.stage1_only,
     }
     args.output_root.mkdir(parents=True, exist_ok=True)
     frames_dir = args.output_root / "frames"
@@ -348,11 +357,14 @@ def main() -> None:
                 sampling_steps=args.sampling_steps,
                 random_seed=args.random_seed, fault_seed=fault_seed,
                 forced_fault=None if args.fault_type == "auto" else args.fault_type,
-                device=args.device)
+                device=args.device, stage1_only=args.stage1_only)
             _atomic_json(path, record)
         records.append(record)
     result = {"run_config": run_identity, "selection_metric": args.select_by,
-              "stages": _summarize(records, thresholds, args.select_by)}
+              "stages": _summarize(
+        records, thresholds, args.select_by,
+        ("stage1", "stage1_active") if args.stage1_only
+        else ("stage1", "stage1_active", "stage2"))}
     _atomic_json(args.output_root / "threshold_metrics.json", result)
     fields = ("stage", "fault_type", "threshold", *METRICS,
               *(f"faulty_{metric}" for metric in METRICS),
