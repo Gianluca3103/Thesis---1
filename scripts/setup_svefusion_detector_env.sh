@@ -38,10 +38,12 @@ else
     exit 1
   fi
   echo 'Installing Miniforge for the new detector environment...'
-  INSTALLER=Miniforge3-Linux-x86_64.sh
+  # The unversioned installer has no matching .sha256 asset on GitHub.
+  MINIFORGE_RELEASE=26.9.4-0
+  INSTALLER=Miniforge3-$MINIFORGE_RELEASE-Linux-x86_64.sh
   DOWNLOAD_DIR=$(mktemp -d)
   trap 'rm -f "$DOWNLOAD_DIR/$INSTALLER" "$DOWNLOAD_DIR/$INSTALLER.sha256"; rmdir "$DOWNLOAD_DIR"' EXIT
-  URL=https://github.com/conda-forge/miniforge/releases/latest/download
+  URL=https://github.com/conda-forge/miniforge/releases/download/$MINIFORGE_RELEASE
   curl -fL --retry 3 "$URL/$INSTALLER" -o "$DOWNLOAD_DIR/$INSTALLER"
   curl -fL --retry 3 "$URL/$INSTALLER.sha256" -o "$DOWNLOAD_DIR/$INSTALLER.sha256"
   (cd "$DOWNLOAD_DIR" && sha256sum -c "$INSTALLER.sha256")
