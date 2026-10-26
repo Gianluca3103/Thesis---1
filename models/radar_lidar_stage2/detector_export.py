@@ -62,8 +62,14 @@ def retained_clean_mask(clean_xyz: np.ndarray, retained_xyz: np.ndarray) -> np.n
 
 def detector_clouds(clean_xyzi: np.ndarray, sector_indices: np.ndarray,
                     retained_sector_xyz: np.ndarray,
-                    additions_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Keep raw returns outside the radar sector; add Stage II XYZ with zero intensity."""
+                    additions_xyz: np.ndarray, *,
+                    retained_full_xyz: np.ndarray | None = None
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """Export a full-scan fault and add Stage II XYZ with zero intensity.
+
+    Fog has only a radar-sector simulation cache, so its outside returns stay
+    unchanged. Total-loss and FoV faults supply their full-scan retained XYZ.
+    """
     clean = np.asarray(clean_xyzi, dtype=np.float32)
     sector = np.asarray(sector_indices, dtype=np.int64)
     if len(np.unique(sector)) != len(sector) or np.any(sector < 0) or np.any(sector >= len(clean)):
@@ -71,8 +77,14 @@ def detector_clouds(clean_xyzi: np.ndarray, sector_indices: np.ndarray,
     additions = np.asarray(additions_xyz, dtype=np.float32).reshape(-1, 3)
     if not np.isfinite(additions).all():
         raise ValueError("Non-finite reconstructed point")
-    keep = np.ones(len(clean), dtype=bool)
-    keep[sector] = retained_clean_mask(clean[sector, :3], retained_sector_xyz)
+    sector_keep = retained_clean_mask(clean[sector, :3], retained_sector_xyz)
+    if retained_full_xyz is None:
+        keep = np.ones(len(clean), dtype=bool)
+        keep[sector] = sector_keep
+    else:
+        keep = retained_clean_mask(clean[:, :3], retained_full_xyz)
+        if not np.array_equal(keep[sector], sector_keep):
+            raise ValueError("Full-scan fault differs from Stage-II sector fault")
     faulty = np.ascontiguousarray(clean[keep])
     generated = np.column_stack((additions, np.zeros(len(additions), dtype=np.float32)))
     completed = np.ascontiguousarray(np.concatenate((faulty, generated), axis=0))

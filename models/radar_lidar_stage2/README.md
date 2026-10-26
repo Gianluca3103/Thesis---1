@@ -234,8 +234,10 @@ and faulty LiDAR with Stage-II additions plus radar. The exporter applies the
 same deterministic severe fault protocol, radar-conditioned Stage-I gate, and
 missing-voxel Stage-II sampler as `predict_stage2_sparse.py`. Its clean scan is
 used to synthesize the fault and label the reference condition; it is never
-passed to the Stage-I or Stage-II prediction call. Original points outside the
-Stage-II radar sector remain in both faulty and completed detector scans.
+passed to the Stage-I or Stage-II prediction call. Total loss deletes the
+full LiDAR scan; severe FoV loss filters the full scan. The available severe
+fog cache covers the Stage-II radar sector, so original points outside that
+sector remain for the fog subset.
 Surviving original returns retain their original intensity. Stage II predicts
 XYZ only, so generated points receive intensity zero. The detector's radar
 files, calibration, model weights, voxelization, FoV filtering, labels, and

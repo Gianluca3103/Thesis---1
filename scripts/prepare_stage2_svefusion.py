@@ -13,7 +13,12 @@ import json
 import pickle
 from pathlib import Path
 
+import numpy as np
 import yaml
+
+from Fault_Localization_Model.vod_dataset.vod_io import (
+    load_vod_lidar_to_camera, load_vod_radar_to_lidar,
+)
 
 
 CONDITIONS = ("clean", "faulty", "reconstructed")
@@ -74,20 +79,44 @@ def main() -> None:
         # the official VoD validation split only, with unchanged preprocessing.
         model["DATA_CONFIG"].setdefault("INFO_PATH", {})["test"] = ["vod_infos_val.pkl"]
     raw_root = Path(manifest["clean_points_root"])
+    stage1_radar_root = Path(manifest["radar_points_root"])
+    stage1_lidar_calib = Path(manifest["lidar_calibration_root"])
+    stage1_radar_calib = Path(manifest["radar_calibration_root"])
     detector_clean_root = Path(dataset.get(
         "LIDAR_POINTS_ROOT", data_root / "training" / "lidar"))
     radar_root = Path(dataset.get("RADAR_POINTS_ROOT", data_root / "training" / "radar_5f"))
+    lidar_calib = Path(dataset.get("LIDAR_CALIB_ROOT", data_root / "training" / "lidar_calib"))
+    radar_calib = Path(dataset.get("RADAR_CALIB_ROOT", data_root / "training" / "radar_calib"))
+    detector_label_calib = data_root / "training" / "calib"
     for frame_id in ids:
         for path in (raw_root / f"{frame_id}.bin",
                      detector_clean_root / f"{frame_id}.bin",
                      args.export_root / "faulty" / f"{frame_id}.bin",
                      args.export_root / "reconstructed" / f"{frame_id}.bin",
-                     radar_root / f"{frame_id}.bin"):
+                     radar_root / f"{frame_id}.bin",
+                     lidar_calib / f"{frame_id}.txt",
+                     radar_calib / f"{frame_id}.txt",
+                     detector_label_calib / f"{frame_id}.txt"):
             if not path.is_file():
                 raise FileNotFoundError(path)
-        if not filecmp.cmp(raw_root / f"{frame_id}.bin",
-                           detector_clean_root / f"{frame_id}.bin", shallow=False):
-            raise ValueError(f"Detector clean scan differs from Stage-II raw VoD: {frame_id}")
+        for source, target, suffix, label in (
+            (raw_root, detector_clean_root, "bin", "clean LiDAR"),
+            (stage1_radar_root, radar_root, "bin", "radar"),
+        ):
+            if not filecmp.cmp(source / f"{frame_id}.{suffix}",
+                               target / f"{frame_id}.{suffix}", shallow=False):
+                raise ValueError(f"Detector {label} differs from Stage-II VoD: {frame_id}")
+        source_lidar = stage1_lidar_calib / f"{frame_id}.txt"
+        source_radar = stage1_radar_calib / f"{frame_id}.txt"
+        target_lidar = lidar_calib / f"{frame_id}.txt"
+        target_radar = radar_calib / f"{frame_id}.txt"
+        if (not np.allclose(load_vod_lidar_to_camera(source_lidar),
+                            load_vod_lidar_to_camera(detector_label_calib / f"{frame_id}.txt"),
+                            rtol=0, atol=1e-6)
+                or not np.allclose(load_vod_radar_to_lidar(source_lidar, source_radar),
+                                   load_vod_radar_to_lidar(target_lidar, target_radar),
+                                   rtol=0, atol=1e-6)):
+            raise ValueError(f"Detector calibration differs from Stage-II VoD: {frame_id}")
     paths = {
         "clean": detector_clean_root,
         "faulty": (args.export_root / "faulty").resolve(),

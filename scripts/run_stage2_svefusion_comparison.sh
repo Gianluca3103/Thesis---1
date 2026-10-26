@@ -32,6 +32,10 @@ for required in "$STAGE2_PY" "$SVE_PY" "$DETECTOR_CONFIG" "$DETECTOR_CKPT" \
     exit 1
   fi
 done
+if ! grep -Fq 'if len(lidar_points) == 0:' "$SVE/pcdet/datasets/vod/vod_dataset.py"; then
+  echo "The SVEFusion loader must support empty LiDAR scans for the total-loss condition" >&2
+  exit 1
+fi
 
 export PYTHONPATH="$REPO:$SVE${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}

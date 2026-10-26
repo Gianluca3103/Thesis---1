@@ -24,6 +24,7 @@ from models.radar_lidar_stage2.detector_export import (
 )
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, severe_fault,
+    severe_fov_filter,
 )
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache, cache_identity
@@ -126,7 +127,7 @@ def main() -> None:
         "random_seed": args.random_seed,
         "gate_threshold": float(saved2["gate_threshold"]),
         "clean_lidar": "original full XYZI VoD scan",
-        "faulty_lidar": "raw XYZI outside Stage-I radar sector; retained original returns inside",
+        "faulty_lidar": "full-scan total/FoV faults; fog dropout in the cached radar sector",
         "completed_lidar": "faulty plus Stage-II missing-voxel points; generated intensity zero",
         "radar": "unmodified seven-channel five-frame VoD in SVEFusion",
     }
@@ -185,8 +186,14 @@ def main() -> None:
         else:
             additions = np.empty((0, 3), dtype=np.float32)
             allowed = 0
+        full_retained = None
+        if fault_name == "total_loss":
+            full_retained = np.empty((0, 3), dtype=np.float32)
+        elif fault_name == "fov_filter":
+            full_retained = severe_fov_filter(clean_full)[:, :3]
         faulty, completed = detector_clouds(
-            clean_full, sector, faulty_sector.numpy(), additions)
+            clean_full, sector, faulty_sector.numpy(), additions,
+            retained_full_xyz=full_retained)
         _write_cloud(faulty_path, faulty)
         _write_cloud(completed_path, completed)
         _write_json(stat_path, {
@@ -208,6 +215,11 @@ def main() -> None:
     _write_json(args.output_root / "export_manifest.json", {
         **identity, "exported_frames": count, "complete": complete,
         "clean_points_root": str(dataset.frames[0].lidar_path.parent.resolve()),
+        "radar_points_root": str(dataset.frames[0].radar_path.parent.resolve()),
+        "lidar_calibration_root": str(
+            dataset.frames[0].lidar_calibration_path.parent.resolve()),
+        "radar_calibration_root": str(
+            dataset.frames[0].radar_calibration_path.parent.resolve()),
         "faulty_points_root": str((args.output_root / "faulty").resolve()),
         "reconstructed_points_root": str((args.output_root / "reconstructed").resolve()),
     })

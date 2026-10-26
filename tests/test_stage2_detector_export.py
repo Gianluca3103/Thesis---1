@@ -32,6 +32,15 @@ class DetectorExportTests(unittest.TestCase):
             retained_clean_mask(np.array([[1, 2, 3]], dtype=np.float32),
                                 np.array([[1, 2, 4]], dtype=np.float32))
 
+    def test_full_scan_total_loss_does_not_keep_rear_lidar(self):
+        clean = np.array([[1, 0, 0, 0.2], [-1, 0, 0, 0.7]], dtype=np.float32)
+        faulty, completed = detector_clouds(
+            clean, np.array([0]), np.empty((0, 3), dtype=np.float32),
+            np.array([[1.5, 0, 0]], dtype=np.float32),
+            retained_full_xyz=np.empty((0, 3), dtype=np.float32))
+        self.assertEqual(faulty.shape, (0, 4))
+        np.testing.assert_array_equal(completed, [[1.5, 0, 0, 0]])
+
     def test_sector_preserves_raw_indices(self):
         clean = np.array([[1, 0, 0, 0.1], [-1, 0, 0, 0.2],
                           [2, 1, 0, 0.3]], dtype=np.float32)
