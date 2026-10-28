@@ -17,6 +17,7 @@ from torch.nn import functional as F
 from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 from models.radar_lidar_stage1.sparse import encode_keys
 
+from .addition import addition_context, healthy_region_negatives
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
@@ -31,7 +32,8 @@ except ImportError:
 
 
 VERSION = "stage2_sparse_residual_v1"
-MODEL_REVISION = "stage2_full_region_lpcr_residual_v9"
+LPCR_REVISION = "stage2_full_region_lpcr_residual_v9"
+MODEL_REVISION = "stage2_full_region_lpcr_additive_v10"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 1
 
@@ -186,8 +188,9 @@ class AllowedSiteLPCR(nn.Module):
 
     def forward(self, latent_features: torch.Tensor,
                 hierarchy: tuple[torch.Tensor, ...],
-                fine_probabilities: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                fine_probabilities: torch.Tensor,
+                *, return_hidden: bool = False
+                ) -> tuple[torch.Tensor, ...]:
         if len(hierarchy) != 5 or len(latent_features) != len(hierarchy[4]):
             raise ValueError("LPCR requires the five R2LDM active coordinate levels")
         if fine_probabilities.shape != (len(hierarchy[0]), 1):
@@ -214,7 +217,8 @@ class AllowedSiteLPCR(nn.Module):
                            self.grid.shape_at(level))
         half_cell = hidden.new_tensor(self.grid.voxel_xyz) * 0.5
         offsets = torch.tanh(self.offset(hidden)) * half_cell
-        return self.occupancy(hidden)[:, 0], offsets
+        logits = self.occupancy(hidden)[:, 0]
+        return (logits, offsets, hidden) if return_hidden else (logits, offsets)
 
     @torch.no_grad()
     def emit_points(self, coords: torch.Tensor, occupancy_logits: torch.Tensor,
@@ -308,12 +312,36 @@ class Stage2Conditions:
     cached_targets: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None
 
 
+class AdditionHead(nn.Module):
+    """Decide where an addition is needed after observing faulty LiDAR."""
+
+    def __init__(self):
+        super().__init__()
+        self.network = nn.Sequential(nn.Linear(20, 16), nn.SiLU(),
+                                     nn.Linear(16, 1))
+
+    def forward(self, hidden: torch.Tensor, full_logits: torch.Tensor,
+                radar_probabilities: torch.Tensor,
+                observed: torch.Tensor,
+                local_density: torch.Tensor) -> torch.Tensor:
+        count = len(full_logits)
+        if (hidden.shape != (count, 16) or radar_probabilities.shape != (count, 1)
+                or observed.shape != (count,) or local_density.shape != (count,)):
+            raise ValueError("Addition features differ from allowed fine cells")
+        features = torch.cat((hidden, full_logits[:, None], radar_probabilities,
+                              observed[:, None].to(hidden.dtype),
+                              local_density[:, None].to(hidden.dtype)), dim=1)
+        return self.network(features)[:, 0]
+
+
 class SparseResidualStage2(nn.Module):
     def __init__(self, grid: Stage2Grid = GRID):
         super().__init__()
         self.grid = grid
         self.lidar_encoder = SharedLidarEncoder(grid)
         self.lpcr = AllowedSiteLPCR(grid)
+        self.addition_head = AdditionHead()
+        self.use_addition_head = True
         self.radar_adapter = nn.Linear(64, LATENT_CHANNELS)
         self.diffusion = SparseResidualUNet(grid.shape_at(4))
 
@@ -362,10 +390,11 @@ class SparseResidualStage2(nn.Module):
                   offset_weight: float = 0.1,
                   batch_size: int = 1,
                   clean_batch_ids: torch.Tensor | None = None,
+                  decoded: tuple[torch.Tensor, torch.Tensor] | None = None,
                   ) -> dict[str, torch.Tensor | float]:
-        logits, offsets = self.lpcr(
+        logits, offsets = (decoded if decoded is not None else self.lpcr(
             latent, conditions.hierarchy,
-            torch.ones_like(conditions.fine_probabilities))
+            torch.ones_like(conditions.fine_probabilities)))
         occupied, known_free, target_offsets, coverage = (
             conditions.cached_targets if conditions.cached_targets is not None
             else reconstruction_targets(clean_xyz, conditions.hierarchy[0], grid=self.grid))
@@ -378,7 +407,8 @@ class SparseResidualStage2(nn.Module):
             return {"loss": zero, "occupancy": zero, "offset": zero,
                     "iou_known": 0.0, "iou_full": 0.0,
                     "gate_coverage": coverage, "known_sites": 0,
-                    "positive_sites": 0}
+                    "positive_sites": 0, "occupied_target": occupied,
+                    "known_free_target": known_free}
         known = occupied | known_free
         frame_ids = conditions.hierarchy[0][:, 0].long()
         if batch_size == 1:
@@ -418,12 +448,85 @@ class SparseResidualStage2(nn.Module):
                 "iou_known": iou_known, "iou_full": iou_full,
                 "gate_coverage": coverage,
                 "known_sites": float(known.sum()) / batch_size,
-                "positive_sites": float(occupied.sum()) / batch_size}
+                "positive_sites": float(occupied.sum()) / batch_size,
+                "occupied_target": occupied, "known_free_target": known_free}
+
+    def addition_loss(self, hidden: torch.Tensor, full_logits: torch.Tensor,
+                      faulty_xyz: torch.Tensor, clean_xyz: torch.Tensor,
+                      conditions: Stage2Conditions, occupied: torch.Tensor,
+                      known_free: torch.Tensor,
+                      *, faulty_batch_ids: torch.Tensor | None = None,
+                      clean_batch_ids: torch.Tensor | None = None,
+                      batch_size: int = 1) -> dict[str, torch.Tensor | float]:
+        """Supervise additions to faulty LiDAR, including healthy empty cells.
+
+        The final cloud is the observed faulty occupancy union new additions.
+        Clean LiDAR selects loss targets only and never enters the head.
+        """
+        fine = conditions.hierarchy[0]
+        context = addition_context(faulty_xyz, fine, faulty_batch_ids,
+                                   grid=self.grid)
+        logits = self.addition_head(
+            hidden, full_logits, conditions.fine_probabilities,
+            context.observed, context.local_faulty_density)
+        if occupied.shape != logits.shape or known_free.shape != logits.shape:
+            raise ValueError("Addition labels differ from allowed fine cells")
+        # The final occupancy is observed OR added. Observed cells are fixed,
+        # so its trainable loss is evaluated on the still-unobserved cells.
+        missing = occupied & ~context.observed
+        free = known_free & ~context.observed
+        healthy = healthy_region_negatives(
+            clean_xyz, fine, occupied, context, clean_batch_ids,
+            grid=self.grid) & ~free
+        frame_ids = fine[:, 0].long()
+
+        def term(mask: torch.Tensor, positive: bool) -> torch.Tensor:
+            if not bool(mask.any()):
+                return logits.sum() * 0
+            values = F.softplus(-logits[mask] if positive else logits[mask])
+            return (values.mean() if batch_size == 1 else
+                    _frame_mean(values, frame_ids[mask], batch_size))
+
+        positive_loss = term(missing, True)
+        free_loss = term(free, False)
+        healthy_loss = term(healthy, False)
+        with torch.no_grad():
+            added = (~context.observed) & (logits.sigmoid() >= 0.5)
+            final = context.observed | added
+            intersection = final & occupied
+            union = final | occupied
+            true_additions = added & missing
+            counts = {name: torch.bincount(frame_ids[mask], minlength=batch_size)
+                      for name, mask in (("intersection", intersection),
+                                         ("union", union),
+                                         ("true_additions", true_additions),
+                                         ("added", added),
+                                         ("missing", missing),
+                                         ("healthy_added", added & healthy),
+                                         ("healthy", healthy))}
+            metrics = {
+                "final_gate_iou": float((counts["intersection"] /
+                                         counts["union"].clamp_min(1)).float().mean()),
+                "addition_precision": float((counts["true_additions"] /
+                                             counts["added"].clamp_min(1)).float().mean()),
+                "addition_recall": float((counts["true_additions"] /
+                                          counts["missing"].clamp_min(1)).float().mean()),
+                "healthy_addition_rate": float((counts["healthy_added"] /
+                                                counts["healthy"].clamp_min(1)).float().mean()),
+                "missing_sites": float(missing.sum()) / batch_size,
+                "healthy_negative_sites": float(healthy.sum()) / batch_size,
+            }
+        return {"final": positive_loss + free_loss,
+                "missing_positive": positive_loss,
+                "known_free_negative": free_loss,
+                "healthy": healthy_loss, **metrics}
 
     def diffusion_loss(self, faulty_xyz: torch.Tensor, clean_xyz: torch.Tensor,
                        conditions: Stage2Conditions, alpha_bars: torch.Tensor,
                        *, residual_weight: float = 1.0,
                        reconstruction_weight: float = 1.0,
+                       addition_weight: float = 1.0,
+                       healthy_weight: float = 1.0,
                        generator: torch.Generator | None = None,
                        faulty_batch_ids: torch.Tensor | None = None,
                        clean_batch_ids: torch.Tensor | None = None,
@@ -451,13 +554,26 @@ class SparseResidualStage2(nn.Module):
                                         latent_frame_ids, batch_size)
         residual_loss = _frame_mean((residual_hat - residual).abs().mean(1),
                                     latent_frame_ids, batch_size)
-        reconstruction = self.lpcr_loss(clean_hat, conditions,
-                                         clean_xyz, batch_size=batch_size,
-                                         clean_batch_ids=clean_batch_ids)
+        logits, offsets, hidden = self.lpcr(
+            clean_hat, conditions.hierarchy,
+            torch.ones_like(conditions.fine_probabilities),
+            return_hidden=True)
+        reconstruction = self.lpcr_loss(
+            clean_hat, conditions, clean_xyz, batch_size=batch_size,
+            clean_batch_ids=clean_batch_ids, decoded=(logits, offsets))
+        addition = self.addition_loss(
+            hidden, logits, faulty_xyz, clean_xyz, conditions,
+            reconstruction["occupied_target"],
+            reconstruction["known_free_target"],
+            faulty_batch_ids=faulty_batch_ids,
+            clean_batch_ids=clean_batch_ids, batch_size=batch_size)
         total = (clean_latent_loss + residual_weight * residual_loss
-                 + reconstruction_weight * reconstruction["loss"])
+                 + reconstruction_weight * reconstruction["loss"]
+                 + addition_weight * addition["final"]
+                 + healthy_weight * addition["healthy"])
         return {"loss": total, "clean_latent": clean_latent_loss,
-                "residual": residual_loss, "reconstruction": reconstruction}
+                "residual": residual_loss, "reconstruction": reconstruction,
+                "addition": addition}
 
     @torch.no_grad()
     def sample(self, faulty_xyz: torch.Tensor, conditions: Stage2Conditions,
@@ -487,27 +603,43 @@ class SparseResidualStage2(nn.Module):
                                  (1 - alpha).sqrt().clamp_min(1e-6))
                     residual = (next_alpha.sqrt() * residual_hat
                                 + (1 - next_alpha).sqrt() * noise_hat)
-        logits, offsets = self.lpcr(
+        additive = self.use_addition_head and missing_only
+        decoded = self.lpcr(
             faulty + residual, conditions.hierarchy,
             (conditions.fine_probabilities
              if getattr(self, "lpcr_uses_stage1_probabilities", False)
-             else torch.ones_like(conditions.fine_probabilities)))
-        emitted = self.lpcr.emit_points(conditions.hierarchy[0], logits,
-                                        offsets, occupancy_threshold)
-        emitted["full_estimate_cells"] = emitted["predicted_cells"]
+             else torch.ones_like(conditions.fine_probabilities)),
+            return_hidden=additive)
+        logits, offsets = decoded[:2]
+        full = self.lpcr.emit_points(conditions.hierarchy[0], logits,
+                                     offsets, occupancy_threshold)
+        if additive:
+            context = addition_context(faulty_xyz, conditions.hierarchy[0],
+                                       grid=self.grid)
+            addition_logits = self.addition_head(
+                decoded[2], logits, conditions.fine_probabilities,
+                context.observed, context.local_faulty_density)
+            emitted = self.lpcr.emit_points(
+                conditions.hierarchy[0], addition_logits,
+                offsets, occupancy_threshold)
+        else:
+            emitted = full
+        emitted["full_estimate_cells"] = full["predicted_cells"]
         emitted["residual_abs_present_latent"] = (
             float(residual[present].abs().mean()) if bool(present.any()) else None)
         emitted["residual_abs_absent_latent"] = (
             float(residual[~present].abs().mean()) if bool((~present).any()) else None)
         observed_coords, _ = voxelize_means(faulty_xyz, grid=self.grid)
-        predicted_keys = encode_keys(emitted["coordinates"], self.grid.shape_zyx)
+        predicted_keys = encode_keys(full["coordinates"], self.grid.shape_zyx)
         observed_keys = encode_keys(observed_coords, self.grid.shape_zyx)
         overlap = torch.isin(predicted_keys, observed_keys)
         emitted["overlap_observed_cells"] = int(overlap.sum())
         if missing_only:
-            # LPCR estimates the complete clean cloud. Expose only new voxels
-            # as additions; surviving faulty returns are preserved separately.
-            keep = ~overlap
+            # Preserve observed faulty returns. The new revision learns an
+            # addition decision; older checkpoints only subtract overlap.
+            emitted_keys = encode_keys(emitted["coordinates"],
+                                       self.grid.shape_zyx)
+            keep = ~torch.isin(emitted_keys, observed_keys)
             for key in ("points_xyz", "coordinates", "occupied_coordinates",
                         "probabilities", "point_counts"):
                 emitted[key] = emitted[key][keep]

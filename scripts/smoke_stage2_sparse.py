@@ -87,7 +87,9 @@ def main() -> None:
     second["loss"].backward()
     diffusion_grad = model.diffusion.residual_head.weight.grad
     adapter_grad = model.radar_adapter.weight.grad
-    for name, grad in (("diffusion", diffusion_grad), ("radar adapter", adapter_grad)):
+    addition_grad = model.addition_head.network[0].weight.grad
+    for name, grad in (("diffusion", diffusion_grad), ("radar adapter", adapter_grad),
+                       ("addition head", addition_grad)):
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
             raise AssertionError(f"{name} gradient is missing, zero, or invalid")
     sampled = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),
@@ -105,9 +107,9 @@ def main() -> None:
     additions = model.sample(faulty, conditions,
                              cosine_alpha_bars(16, device=device),
                              steps=4, occupancy_threshold=0.01)
-    if (raw["predicted_cells"] != additions["predicted_cells"]
-            + additions["overlap_observed_cells"]):
-        raise AssertionError("Preserved faulty voxels were not excluded exactly")
+    if (additions["predicted_cells"] > additions["allowed_cells"] or
+            raw["predicted_cells"] > raw["allowed_cells"]):
+        raise AssertionError("Prediction escaped the Stage-I gate")
     faulty_voxels, _ = voxelize_means(faulty)
     if bool(torch.isin(encode_keys(additions["coordinates"], GRID.shape_zyx),
                        encode_keys(faulty_voxels, GRID.shape_zyx)).any()):
@@ -157,6 +159,9 @@ def main() -> None:
     print({"lpcr_loss": float(first["loss"]),
            "full_region_lpcr_loss": float(full_loss["loss"]),
            "diffusion_loss": float(second["loss"]),
+           "addition_loss": float(second["addition"]["final"]),
+           "healthy_loss": float(second["addition"]["healthy"]),
+           "missing_sites": second["addition"]["missing_sites"],
            "batched_diffusion_loss": float(batched["loss"]),
            "total_loss_diffusion_loss": float(total_loss["loss"]),
            "allowed": sampled["allowed_cells"],

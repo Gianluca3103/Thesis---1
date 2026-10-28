@@ -12,7 +12,7 @@ from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probabili
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import load_radar_autoencoder
 
 from .sparse_geometry import GRID
-from .sparse_residual import MODEL_REVISION, VERSION, SparseResidualStage2
+from .sparse_residual import LPCR_REVISION, MODEL_REVISION, VERSION, SparseResidualStage2
 
 
 def sha256(path: Path) -> str:
@@ -47,7 +47,8 @@ def load_stage2(path: Path, device: str,
                 *, phase: str = "diffusion") -> tuple[SparseResidualStage2, dict]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
     previous_diffusion_revision = "stage2_r2ldm_centroid_residual_v8"
-    accepted_revisions = {MODEL_REVISION}
+    accepted_revisions = ({LPCR_REVISION} if phase == "lpcr"
+                          else {MODEL_REVISION, LPCR_REVISION})
     if phase == "diffusion":
         accepted_revisions.add(previous_diffusion_revision)
     if (saved.get("version") != VERSION
@@ -57,7 +58,12 @@ def load_stage2(path: Path, device: str,
     if saved.get("grid") != asdict(GRID):
         raise ValueError("Stage-II checkpoint grid differs from current code")
     model = SparseResidualStage2().to(device)
-    model.load_state_dict(saved["model"], strict=True)
+    missing, unexpected = model.load_state_dict(saved["model"], strict=False)
+    if (unexpected or
+            (saved["model_revision"] == MODEL_REVISION and missing) or
+            any(not key.startswith("addition_head.") for key in missing)):
+        raise ValueError("Stage-II checkpoint model weights differ from the architecture")
+    model.use_addition_head = saved["model_revision"] == MODEL_REVISION
     model.lpcr_uses_stage1_probabilities = (
         saved["model_revision"] == previous_diffusion_revision)
     return model.eval(), saved

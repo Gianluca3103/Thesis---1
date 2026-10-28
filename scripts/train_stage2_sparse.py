@@ -14,6 +14,10 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+from models.radar_lidar_stage2.addition import (
+    HEALTHY_RETAINED_FRACTION, MIN_CLEAN_CELLS_IN_REGION,
+    REGION_STRIDE_ZYX,
+)
 from models.radar_lidar_stage2.fault_data import (
     FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
 )
@@ -21,7 +25,7 @@ from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
 from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
+    LPCR_REVISION, MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
     SparseResidualStage2, Stage2Conditions,
     cosine_alpha_bars,
 )
@@ -172,11 +176,14 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 result = model.diffusion_loss(faulty, clean, conditions, alpha_bars,
                                               residual_weight=args.residual_weight,
                                               reconstruction_weight=args.reconstruction_weight,
+                                              addition_weight=args.addition_weight,
+                                              healthy_weight=args.healthy_weight,
                                               generator=generator,
                                               faulty_batch_ids=faulty_batch_ids,
                                               clean_batch_ids=clean_batch_ids,
                                               batch_size=batch_size)
                 reconstruction = result["reconstruction"]
+                addition = result["addition"]
                 values = {"loss": result["loss"],
                           "clean_latent": result["clean_latent"],
                           "residual": result["residual"],
@@ -187,7 +194,15 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                           "iou_full": reconstruction["iou_full"],
                           "gate_coverage": reconstruction["gate_coverage"],
                           "known_sites": reconstruction["known_sites"],
-                          "positive_sites": reconstruction["positive_sites"]}
+                          "positive_sites": reconstruction["positive_sites"],
+                          "addition_final_loss": addition["final"],
+                          "addition_healthy_loss": addition["healthy"],
+                          "addition_precision": addition["addition_precision"],
+                          "addition_recall": addition["addition_recall"],
+                          "healthy_addition_rate": addition["healthy_addition_rate"],
+                          "final_gate_iou": addition["final_gate_iou"],
+                          "missing_sites": addition["missing_sites"],
+                          "healthy_negative_sites": addition["healthy_negative_sites"]}
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 values["loss"].backward()
@@ -268,6 +283,8 @@ def main() -> None:
     parser.add_argument("--fault-seed", type=int, default=3103)
     parser.add_argument("--residual-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
+    parser.add_argument("--addition-weight", type=float, default=1.0)
+    parser.add_argument("--healthy-weight", type=float, default=1.0)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -281,6 +298,7 @@ def main() -> None:
             args.lpcr_sites_per_frame < 7744 or
             args.paper_metrics_every < 1 or args.paper_metrics_frames < 1 or
             not 0 < args.paper_metrics_threshold < 1 or
+            min(args.addition_weight, args.healthy_weight) < 0 or
             args.phase == "diffusion" and args.stage1_checkpoint is None or
             args.phase == "diffusion" and args.batch_size > 1
             and args.stage2_cache_root is None or
@@ -308,11 +326,16 @@ def main() -> None:
                                             args.radar_variant)
         radius_m = float(stage1_saved.get("radius_m", 3.2))
     model = SparseResidualStage2().to(args.device)
-    identity = {"version": VERSION, "model_revision": MODEL_REVISION,
+    identity = {"version": VERSION,
+                "model_revision": (LPCR_REVISION if args.phase == "lpcr"
+                                   else MODEL_REVISION),
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
                 "occupancy_weight": 0.9, "offset_weight": 0.1,
-                "diffusion_objective": "clean_latent_mse_residual_l1_lpcr",
+                "diffusion_objective": (
+                    "clean_latent_mse_residual_l1_lpcr_addition_healthy"
+                    if args.phase == "diffusion" else
+                    "clean_latent_mse_residual_l1_lpcr"),
                 "stage1_sha256": (sha256(args.stage1_checkpoint)
                                   if args.phase == "diffusion" else None),
                 "radar_variant": (args.radar_variant if args.phase == "diffusion" else None),
@@ -335,19 +358,30 @@ def main() -> None:
                 "residual_weight": args.residual_weight,
                 "reconstruction_weight": args.reconstruction_weight}
     if args.phase == "diffusion":
+        identity.update({"addition_weight": args.addition_weight,
+                         "healthy_weight": args.healthy_weight,
+                         "addition_region_stride_zyx": REGION_STRIDE_ZYX,
+                         "healthy_min_clean_cells": MIN_CLEAN_CELLS_IN_REGION,
+                         "healthy_retained_fraction": HEALTHY_RETAINED_FRACTION})
+    if args.phase == "diffusion":
         saved_lpcr = torch.load(args.lpcr_checkpoint, map_location="cpu", weights_only=False)
         if (saved_lpcr.get("version") != VERSION
-                or saved_lpcr.get("model_revision") != MODEL_REVISION
+                or saved_lpcr.get("model_revision") != LPCR_REVISION
                 or saved_lpcr.get("phase") != "lpcr"
                 or not saved_lpcr.get("lpcr_full_region")):
             raise ValueError("Diffusion requires a full-region LPCR checkpoint")
-        model.load_state_dict(saved_lpcr["model"], strict=True)
+        missing, unexpected = model.load_state_dict(saved_lpcr["model"], strict=False)
+        if unexpected or any(not key.startswith("addition_head.") for key in missing):
+            raise ValueError("LPCR checkpoint differs from the Stage-II architecture")
         model.lidar_encoder.requires_grad_(False)
         model.lpcr.requires_grad_(False)
-        trainable = list(model.radar_adapter.parameters()) + list(model.diffusion.parameters())
+        trainable = (list(model.radar_adapter.parameters())
+                     + list(model.diffusion.parameters())
+                     + list(model.addition_head.parameters()))
     else:
         model.radar_adapter.requires_grad_(False)
         model.diffusion.requires_grad_(False)
+        model.addition_head.requires_grad_(False)
         trainable = list(model.lidar_encoder.parameters()) + list(model.lpcr.parameters())
     optimizer = torch.optim.AdamW(
         trainable, lr=args.lr,
@@ -452,6 +486,11 @@ def main() -> None:
                   f"Known/Full gate IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "
                   f"{diffusion_terms}occupancy BCE={val['occupancy']:.5f}, "
                   f"offset L1={val['offset']:.5f}, "
+                  f"addition/healthy loss={val['addition_final_loss']:.5f}/"
+                  f"{val['addition_healthy_loss']:.5f}, "
+                  f"addition precision/recall={val['addition_precision']:.4f}/"
+                  f"{val['addition_recall']:.4f}, "
+                  f"healthy addition rate={val['healthy_addition_rate']:.4f}, "
                   f"gate coverage={val['gate_coverage']:.4f}, "
                   f"train faults={train['fault_counts']}", flush=True)
 
