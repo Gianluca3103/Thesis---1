@@ -50,6 +50,18 @@ def _roi(points: np.ndarray) -> np.ndarray:
     return points[((xyz >= minimum) & (xyz < maximum)).all(axis=1)]
 
 
+def _allowed_view(coords: torch.Tensor, probabilities: torch.Tensor
+                  ) -> tuple[np.ndarray, np.ndarray]:
+    """The exact Stage-II gate, at physical voxel centers in XYZ order."""
+    local_xyz = coords[:, [3, 2, 1]].detach().cpu().numpy().astype(np.float32)
+    centers = (np.asarray(GRID.minimum_xyz, dtype=np.float32)
+               + (local_xyz + 0.5) * np.asarray(GRID.voxel_xyz, dtype=np.float32))
+    scores = probabilities.detach().cpu().numpy().reshape(-1).astype(np.float32)
+    if len(centers) != len(scores):
+        raise ValueError("Allowed coordinates and Stage-I probabilities differ")
+    return centers, scores
+
+
 def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
     """Match exact XYZ rows."""
     if not len(clean):
@@ -66,6 +78,8 @@ def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 faulty: np.ndarray, clean: np.ndarray, radar: np.ndarray,
                 predicted: np.ndarray, probabilities: np.ndarray,
+                allowed_xyz: np.ndarray, allowed_probabilities: np.ndarray,
+                gate_threshold: float,
                 threshold: float, allowed_cells: int, predicted_cells: int,
                 sampling_steps: int,
                 fault_type: str, totals: tuple[int, int, int, int],
@@ -75,6 +89,8 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
                 metrics: dict | None) -> None:
     if len(predicted) != len(probabilities):
         raise ValueError("One confidence value is required per reconstructed point")
+    if len(allowed_xyz) != len(allowed_probabilities) or len(allowed_xyz) != allowed_cells:
+        raise ValueError("Allowed voxel centers and probabilities differ from the gate")
     clouds = [faulty, clean, radar, predicted]
     nonempty = [cloud for cloud in clouds if len(cloud)]
     if nonempty:
@@ -89,6 +105,9 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         "radar": np.round(radar, 3).tolist(),
         "predicted": np.round(predicted, 3).tolist(),
         "probabilities": np.round(probabilities.astype(np.float64), 4).tolist(),
+        "allowed_xyz": np.round(allowed_xyz, 3).tolist(),
+        "allowed_probabilities": np.round(allowed_probabilities.astype(np.float64), 4).tolist(),
+        "gate_threshold": gate_threshold,
         "threshold": threshold, "allowed_cells": allowed_cells,
         "predicted_cells": predicted_cells,
         "sampling_steps": sampling_steps, "fault_type": fault_type,
@@ -116,13 +135,14 @@ section{min-width:0;background:#182633;border:1px solid #3b5164;border-radius:5p
 h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;background:#0c1620;touch-action:none;cursor:grab}
 .layers{display:flex;gap:4px 12px;flex-wrap:wrap;margin:5px 0 8px}.layers label{white-space:nowrap;cursor:pointer}.layers input{vertical-align:middle}
 .confidence,.camera-speed,.pitch-control,.rotation-mode{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.confidence input{width:220px}.camera-speed input,.pitch-control input{width:130px}select{background:#253847;color:inherit;border:1px solid #637b8b;border-radius:4px;padding:4px}
+.confidence[hidden]{display:none}
 .legend{color:#b9c8d6;margin-top:8px}
 @media(max-width:750px){.panels{display:block}section{margin-bottom:8px}canvas{height:50vh;min-height:280px}}
 </style>
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
-<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="rotation-mode">Drag rotation <select id="rotation-mode"><option value="locked">Axis locked</option><option value="pitch">Pitch only</option><option value="yaw">Yaw only</option><option value="free">Free</option></select></label><output id="yaw-value">Yaw -37°</output><label class="pitch-control">Pitch <output id="pitch-value">20°</output><input id="pitch-angle" type="range" min="-89" max="89" step="1" value="20"></label><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label></div>
+<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="rotation-mode">Drag rotation <select id="rotation-mode"><option value="locked">Axis locked</option><option value="pitch">Pitch only</option><option value="yaw">Yaw only</option><option value="free">Free</option></select></label><output id="yaw-value">Yaw -37°</output><label class="pitch-control">Pitch <output id="pitch-value">20°</output><input id="pitch-angle" type="range" min="-89" max="89" step="1" value="20"></label><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label><label class="confidence" id="gate-control">Show allowed cells with Stage I probability ≥ <output id="gate-value"></output><input id="gate-confidence" type="range" max="1" step="0.01"></label></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction. Each panel has its own layer switches. The confidence slider filters reconstructed points in every panel; it cannot show points below the generation threshold. Vertical drag pitches and horizontal drag yaws; the default drag mode locks to one axis. Choose Pitch only or use the Pitch slider to change elevation without yaw. Shift-drag or right-drag pans; the wheel zooms. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction &nbsp; <span style="color:#b97ae6">●</span> Stage I allowed voxel centers (violet shade shows gate probability). Each panel has its own layer switches. The gate slider only filters displayed allowed cells; it does not change the trained gate or rerun reconstruction. The reconstruction confidence slider cannot show points below the generation threshold. Vertical drag pitches and horizontal drag yaws; the default drag mode locks to one axis. Choose Pitch only or use the Pitch slider to change elevation without yaw. Shift-drag or right-drag pans; the wheel zooms. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -130,20 +150,25 @@ const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog responses and returns below the intensity detection floor are removed. Retained input points have original clean XYZ; intensity is not a model input.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} ${d.zero_residual?'Zero-residual ablation: the faulty LiDAR latent goes directly to LPCR; radar still selects the allowed region.':'The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.'} ${d.missing_only?'The reconstructed layer contains additions only; faulty-occupied voxels are preserved from the input.':'The reconstructed layer shows the unfiltered full-cloud estimate.'}`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} radar-allowed cells; generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} Stage I allowed cells at gate probability ≥ ${d.gate_threshold==null?'unknown':Number(d.gate_threshold).toFixed(2)}; reconstruction generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
 if(d.metrics){const m=d.metrics,p=document.createElement('p'),missing=m.missing_precision==null?'':`missing-voxel precision ${m.missing_precision.toFixed(4)}, recall ${m.missing_recall.toFixed(4)}, F1 ${m.missing_f1.toFixed(4)}, `;p.textContent=`${m.metric_scope||'Metrics'}: Known IoU ${m.known_iou.toFixed(4)}, Full IoU ${m.full_iou.toFixed(4)}, ${missing}gate coverage ${m.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
+const hasGate=Array.isArray(d.allowed_xyz)&&Array.isArray(d.allowed_probabilities)&&d.allowed_xyz.length===d.allowed_probabilities.length&&d.allowed_xyz.length===d.allowed_cells;
 const layers=[{key:'faulty',name:'Faulty LiDAR',color:'#ffb85c'},{key:'clean',name:'Clean LiDAR',color:'#60d796'},{key:'radar',name:'Radar',color:'#67b7ff'},{key:'predicted',name:'Reconstructed',color:'#ff8b6c'}];
-const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
+if(hasGate)layers.push({key:'allowed',name:'Stage I allowed cells',color:'#b97ae6'});
+const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['allowed','predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
 const panes=document.getElementById('panels'),panels=[];
 for(const preset of presets){const section=document.createElement('section'),h=document.createElement('h2'),switches=document.createElement('div'),canvas=document.createElement('canvas'),inputs={};switches.className='layers';h.textContent=preset.name;for(const layer of layers){const label=document.createElement('label'),input=document.createElement('input'),swatch=document.createElement('span');input.type='checkbox';input.checked=preset.visible.includes(layer.key);input.setAttribute('aria-label',`${preset.name}: ${layer.name}`);input.addEventListener('change',redraw);swatch.textContent='● ';swatch.style.color=layer.color;label.append(input,swatch,document.createTextNode(layer.name));switches.append(label);inputs[layer.key]=input;}section.append(h,switches,canvas);panes.append(section);panels.push({name:preset.name,heading:h,canvas,inputs});}
 const confidence=document.getElementById('confidence'),confidenceValue=document.getElementById('confidence-value');confidence.min=String(d.threshold);confidence.value=String(d.threshold);confidenceValue.textContent=Number(confidence.value).toFixed(2);
+const gateConfidence=document.getElementById('gate-confidence'),gateValue=document.getElementById('gate-value');
+const gateMinimum=Number(d.gate_threshold??0.25);gateConfidence.min=String(gateMinimum);gateConfidence.value=String(gateMinimum);gateValue.textContent=gateMinimum.toFixed(2);document.getElementById('gate-control').hidden=!hasGate;
 const cameraSpeed=document.getElementById('camera-speed'),cameraSpeedValue=document.getElementById('camera-speed-value');cameraSpeed.addEventListener('input',()=>{cameraSpeedValue.textContent=`${Number(cameraSpeed.value).toFixed(1)}×`;});
 const rotationMode=document.getElementById('rotation-mode'),pitchAngle=document.getElementById('pitch-angle'),pitchValue=document.getElementById('pitch-value'),yawValue=document.getElementById('yaw-value');
 const mid=d.minimum.map((x,i)=>(x+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((x,i)=>d.maximum[i]-x))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial},maxPitch=89*Math.PI/180;
 function project(p,w,h,s){const x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);const u=cy*x-sy*y,v=sy*x+cy*y;return [w/2+view.panX+u*s,h/2+view.panY-(cp*z-sp*v)*s];}
 function plot(ctx,points,w,h,s,color,scores,cutoff,size){let selected=0;ctx.fillStyle=color;for(let i=0;i<points.length;i++){if(scores&&scores[i]<cutoff)continue;selected++;const [x,y]=project(points[i],w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-size/2,y-size/2,size,size);}return selected;}
-function draw(panel){const canvas=panel.canvas,ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;let count=0;for(const key of ['predicted','faulty','clean','radar']){if(!panel.inputs[key].checked)continue;const layer=layers.find(item=>item.key===key);count+=plot(ctx,d[key],w,h,scale,layer.color,key==='predicted'?d.probabilities:null,Number(confidence.value),key==='radar'?4:2);}panel.heading.textContent=`${panel.name}: ${count.toLocaleString()} layer points selected`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
+function plotGate(ctx,w,h,s){const palette=['#79609f','#9868bc','#b97ae6','#e9a4fa'];let selected=0,last=-1;ctx.save();ctx.globalAlpha=.45;for(let i=0;i<d.allowed_xyz.length;i++){const score=d.allowed_probabilities[i];if(score<Number(gateConfidence.value))continue;selected++;const bin=Math.min(3,Math.max(0,Math.floor(4*(score-gateMinimum)/(1-gateMinimum))));if(bin!==last){ctx.fillStyle=palette[bin];last=bin;}const [x,y]=project(d.allowed_xyz[i],w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-1,y-1,2,2);}ctx.restore();return selected;}
+function draw(panel){const canvas=panel.canvas,ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*ratio);canvas.height=Math.round(h*ratio);const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const scale=.88*Math.min(w,h)*view.zoom/extent;const gateCount=panel.inputs.allowed?.checked?plotGate(ctx,w,h,scale):0;let count=0;for(const key of ['predicted','faulty','clean','radar']){if(!panel.inputs[key].checked)continue;const layer=layers.find(item=>item.key===key);count+=plot(ctx,d[key],w,h,scale,layer.color,key==='predicted'?d.probabilities:null,Number(confidence.value),key==='radar'?4:2);}panel.heading.textContent=`${panel.name}: ${count.toLocaleString()} points${gateCount?`, ${gateCount.toLocaleString()} allowed voxels`:''}`;const origin=project([0,0,0],w,h,scale);for(const [name,tint,end] of [['X','#eb7777',[5,0,0]],['Y','#78d18b',[0,5,0]],['Z','#9eabf0',[0,0,2]]]){const tip=project(end,w,h,scale);ctx.strokeStyle=tint;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...tip);ctx.stroke();ctx.fillStyle=tint;ctx.fillText(name,tip[0],tip[1]);}}
 let pending=false;function redraw(){pitchAngle.value=String(Math.round(view.pitch*180/Math.PI));pitchValue.textContent=`${Number(pitchAngle.value)}°`;yawValue.textContent=`Yaw ${Math.round(view.yaw*180/Math.PI)}°`;if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;panels.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
 for(const {canvas} of panels){
@@ -174,6 +199,7 @@ for(const {canvas} of panels){
 }
 pitchAngle.addEventListener('input',()=>{view.pitch=Number(pitchAngle.value)*Math.PI/180;redraw();});
 confidence.addEventListener('input',()=>{confidenceValue.textContent=Number(confidence.value).toFixed(2);redraw();});
+gateConfidence.addEventListener('input',()=>{gateValue.textContent=Number(gateConfidence.value).toFixed(2);redraw();});
 document.getElementById('zin').onclick=()=>{const canvas=panels[0].canvas;zoom(1.25,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('zout').onclick=()=>{const canvas=panels[0].canvas;zoom(1/1.25,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);redraw();};document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};window.addEventListener('resize',redraw);redraw();
 })();
 </script></html>'''
@@ -269,6 +295,8 @@ def main() -> None:
         if not len(conditions.hierarchy[0]):
             print(f"{frame_id}: no radar-allowed cells; skipped", flush=True)
             continue
+        allowed_xyz, allowed_probabilities = _allowed_view(
+            conditions.hierarchy[0], conditions.fine_probabilities)
         if args.faulty_root:
             faulty, fault_type = load_faulty(args.faulty_root, args.split, frame_id), "real"
         else:
@@ -313,6 +341,8 @@ def main() -> None:
                        completed_xyz, completed_scores)
         np.savez_compressed(stem.with_suffix(".npz"), xyz=xyz,
                             probability=scores,
+                            allowed_xyz=allowed_xyz,
+                            allowed_probability=allowed_probabilities,
                             coordinates=predicted["coordinates"].cpu().numpy(),
                             occupied_coordinates=predicted[
                                 "occupied_coordinates"].cpu().numpy(),
@@ -385,6 +415,9 @@ def main() -> None:
                         faulty=faulty_roi[:, :3], clean=clean_roi[:, :3],
                         radar=radar_roi[:, :3], predicted=xyz,
                         probabilities=scores,
+                        allowed_xyz=allowed_xyz,
+                        allowed_probabilities=allowed_probabilities,
+                        gate_threshold=float(saved2["gate_threshold"]),
                         threshold=args.occupancy_threshold,
                         allowed_cells=predicted["allowed_cells"],
                         predicted_cells=predicted["predicted_cells"],
