@@ -110,7 +110,8 @@ def addition_ray_losses(
             matched = ((positions < len(clean_keys)) &
                        (clean_keys[positions.clamp(max=max(len(clean_keys) - 1, 0))]
                         == allowed_keys)) if len(clean_keys) else torch.zeros_like(positions, dtype=torch.bool)
-            hit_indices = torch.flatnonzero(clean_occupied & ~observed & matched)
+            hit_indices = torch.nonzero(
+                clean_occupied & ~observed & matched, as_tuple=True)[0]
             hit_positions = positions[hit_indices]
             hits_np = hit_indices.cpu().numpy()
             hit_xyz = clean_means[hit_positions].detach().cpu().numpy().astype(np.float64)
