@@ -96,8 +96,10 @@ def main() -> None:
             raise AssertionError(f"{name} gradient is missing, zero, or invalid")
     if args.check_ray_loss:
         model.zero_grad(set_to_none=True)
+        # The preceding backward freed the radar-adapter graph in conditions.
+        ray_conditions = model.conditions(stage1, 0.3)
         ray_trial = model.diffusion_loss(
-            faulty, clean, conditions, cosine_alpha_bars(16, device=device),
+            faulty, clean, ray_conditions, cosine_alpha_bars(16, device=device),
             ray_hit_weight=0.1, ray_extra_weight=0.1)
         ray_trial["loss"].backward()
         if (not torch.isfinite(ray_trial["rays"]["hit"])
