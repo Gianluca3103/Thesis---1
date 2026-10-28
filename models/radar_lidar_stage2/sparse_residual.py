@@ -28,8 +28,11 @@ from .sparse_geometry import (
 
 try:
     import MinkowskiEngine as ME
-except ImportError:
+except ImportError as exc:
     ME = None
+    _ME_IMPORT_ERROR = exc
+else:
+    _ME_IMPORT_ERROR = None
 
 
 VERSION = "stage2_sparse_residual_v1"
@@ -41,7 +44,7 @@ MAX_POINTS_PER_VOXEL = 1
 
 def _require_me() -> None:
     if ME is None:
-        raise RuntimeError("Stage II requires CUDA MinkowskiEngine")
+        raise RuntimeError("Stage II requires CUDA MinkowskiEngine; see the chained import error") from _ME_IMPORT_ERROR
 
 
 def _replace(tensor, features):

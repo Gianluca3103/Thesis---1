@@ -17,8 +17,11 @@ from .teacher import ResidualAdapter
 
 try:
     import MinkowskiEngine as ME
-except ImportError:
+except ImportError as exc:
     ME = None
+    _ME_IMPORT_ERROR = exc
+else:
+    _ME_IMPORT_ERROR = None
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ class GenerativeBlock(nn.Module):
     def __init__(self, in_channels, out_channels, skip_channels):
         super().__init__()
         if ME is None:
-            raise RuntimeError("MinkowskiEngine is required for unpruned generative sparse decoding")
+            raise RuntimeError("MinkowskiEngine is required for unpruned generative sparse decoding; see the chained import error") from _ME_IMPORT_ERROR
         self.up = ME.MinkowskiGenerativeConvolutionTranspose(
             in_channels, out_channels, kernel_size=2, stride=2, dimension=3)
         self.norm = nn.LayerNorm(out_channels)
