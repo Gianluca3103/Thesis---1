@@ -73,7 +73,7 @@ def _stage_table(stage_result: dict, threshold: float | None) -> list[str]:
               "Prec", "Recall", "Prec@0.2m", "Recall@0.2m",
               "Pred/frame", "Obs/frame",
               "Chamfer (paired)"]
-    lines = [f"Threshold {chosen:.2f} "
+    lines = [f"Threshold {chosen:.3f} "
              f"({'selected on overall ' + stage_result['selection_metric'] if threshold is None else 'user-specified'}). "
              "Cells read `faulty LiDAR -> model`.", "",
              "| " + " | ".join(header) + " |",
@@ -106,10 +106,34 @@ def _full_tables(stage_result: dict) -> list[str]:
                   " | Pred/frame | Obs/frame | Chamfer |",
                   "|---|" + "---|" * (len(METRICS) + 7)]
         for row in scope["rows"]:
-            lines.append(f"| {row['threshold']:.2f} | "
+            lines.append(f"| {row['threshold']:.3f} | "
                          + " | ".join(_num(row[name]) for name, _ in METRICS)
                          + " | " + " | ".join(_diagnostics(row))
                          + f" | {_num(row.get('chamfer_squared_l2'), 2)} |")
+    return lines
+
+
+def _false_positive_table(diagnostics: dict, threshold: float) -> list[str]:
+    columns = ("addition_points", "false_positive_additions",
+               "near_clean_0_2m", "known_free_before_clean_return",
+               "behind_retained_faulty_return",
+               "no_retained_return_false_positives",
+               "no_retained_return_unmatched_ray")
+    header = ("Scope", "Additions", "Exact FP", "Near clean", "Known free",
+              "Behind retained", "No retained match", "No clean ray match",
+              "Gate clean coverage")
+    lines = [f"At Stage II threshold {threshold:.3f}. Categories count generated "
+             "points that miss an exact clean voxel; ray matches are XYZ-based proxies.",
+             "", "| " + " | ".join(header) + " |",
+             "|" + "|".join(["---"] * len(header)) + "|"]
+    for key, label in SCOPES:
+        scope = diagnostics.get(key)
+        if scope is None:
+            continue
+        row = _row_at(scope, threshold)
+        values = [label, *[str(row[name]) for name in columns],
+                  _num(scope["gate"]["clean_cell_coverage"])]
+        lines.append("| " + " | ".join(values) + " |")
     return lines
 
 
@@ -136,6 +160,12 @@ def main() -> None:
         lines += _stage_table(stages[name], args.threshold)
         if args.full:
             lines += _full_tables(stages[name])
+    diagnostics = result.get("stage2_false_positive_diagnostics")
+    if diagnostics is not None and "stage2" in stages:
+        threshold = (args.threshold if args.threshold is not None
+                     else stages["stage2"]["selected_threshold"])
+        lines += ["", "## Stage II false-positive additions", ""]
+        lines += _false_positive_table(diagnostics, threshold)
     if missing:
         lines += ["", f"_Not in this run: {', '.join(missing)} "
                   "(rerun the sweep with the current code)._"]

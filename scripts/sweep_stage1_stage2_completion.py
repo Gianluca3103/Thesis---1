@@ -1,12 +1,13 @@
-"""Sweep Stage-I and Stage-II thresholds against clean and severe-faulty LiDAR.
+"""Sweep Stage-I/II thresholds and diagnose Stage-II false-positive additions.
 
 Stage I is scored in radar support within the Stage-II ROI. Stage II is scored
 over the full ROI after preserving faulty returns and adding reconstruction.
-"stage1_active" scores Stage I only on its active cells: the radar-supported
-voxels the decoder generated, with no penalty for clean LiDAR voxels it never
-generated. IoU/F1 only; Chamfer is undefined there.
+"stage1_active" scores Stage I only on its generated, radar-supported cells.
+It does not penalize clean LiDAR voxels outside those cells; Chamfer is undefined.
 Diffusion runs once per frame at the lowest occupancy threshold; higher
-thresholds filter the same decoded points. Per-frame records support resume.
+thresholds filter the same decoded points. Ray categories use XYZ-only proxy
+matching because the paired scan contains no explicit beam IDs. Per-frame
+records support resume.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.completion_eval import (
-    overlap_counts, rates, restrict_to_cells, score, scoped_cloud,
-    voxel_centers,
+    FP_CATEGORIES, classify_addition_false_positives, overlap_counts,
+    rates, restrict_to_cells, score, scoped_cloud, voxel_centers,
 )
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, severe_fault,
@@ -48,14 +49,17 @@ from models.radar_lidar_stage2.stage2_io import (
 )
 
 
-VERSION = "stage1_stage2_completion_sweep_v2"
-DEFAULT_THRESHOLDS = tuple(round(i / 10, 2) for i in range(1, 10))
+VERSION = "stage1_stage2_completion_sweep_v2_ray_diagnostic"
+DEFAULT_THRESHOLDS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+                      0.95, 0.975, 0.99)
 METRICS = ("iou_exact", "iou_at_0_2m", "f1_exact", "f1_at_0_2m",
+           "precision_exact", "precision_at_0_2m", "recall_exact",
+           "recall_at_0_2m", "f0_5_exact", "f0_5_at_0_2m",
            "chamfer_squared_l2")
-ACTIVE_FLOOR = 1e-30  # keeps every generated cell, unlike the 0.1 gate
-PR_METRICS = ("precision_exact", "recall_exact",
-              "precision_at_0_2m", "recall_at_0_2m")
 COUNT_FIELDS = ("predicted", "observed", "tp_exact", "tp_at_0_2m")
+FP_FIELDS = ("addition_points", "true_positive_additions", "false_positive_additions",
+             "no_retained_return_false_positives", *FP_CATEGORIES)
+ACTIVE_FLOOR = 1e-30
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -125,8 +129,47 @@ def _improvement(model: dict, faulty: dict, total: dict) -> dict:
     return result
 
 
+def _summarize_false_positives(records: list[dict],
+                               thresholds: tuple[float, ...]) -> dict:
+    scopes = {}
+    for fault in ("overall", *FAULT_NAMES):
+        selected = [record for record in records
+                    if fault == "overall" or record["fault_type"] == fault]
+        rows = []
+        for index, threshold in enumerate(thresholds):
+            counts = {key: 0 for key in FP_FIELDS}
+            for frame in selected:
+                for key in FP_FIELDS:
+                    counts[key] += frame["stage2"]["false_positive_rows"][index][key]
+            if counts["addition_points"] != (counts["true_positive_additions"]
+                                              + counts["false_positive_additions"]):
+                raise AssertionError("Addition diagnostic counts do not partition outputs")
+            if counts["false_positive_additions"] != sum(
+                    counts[key] for key in FP_CATEGORIES):
+                raise AssertionError("False-positive categories do not partition outputs")
+            rows.append({"threshold": threshold, **counts,
+                         "false_positive_fraction": (
+                             counts["false_positive_additions"] / counts["addition_points"]
+                             if counts["addition_points"] else None),
+                         "no_retained_return_fp_fraction": (
+                             counts["no_retained_return_false_positives"]
+                             / counts["false_positive_additions"]
+                             if counts["false_positive_additions"] else None)})
+        allowed = sum(frame["stage2_allowed_cells"] for frame in selected)
+        clean = sum(frame["stage2_clean_cells"] for frame in selected)
+        covered = sum(frame["stage2_clean_cells_in_gate"] for frame in selected)
+        scopes[fault] = {"frames": len(selected), "rows": rows,
+                         "gate": {"allowed_cells": allowed, "clean_cells": clean,
+                                  "clean_cells_in_gate": covered,
+                                  "clean_cell_coverage": covered / clean if clean else None,
+                                  "clean_return_fraction_of_allowed": (
+                                      covered / allowed if allowed else None)}}
+    return scopes
+
+
 def _summarize(records: list[dict], thresholds: tuple[float, ...],
-               selection_metric: str, stages: tuple[str, ...]) -> dict:
+               selection_metric: str,
+               stages: tuple[str, ...] = ("stage1", "stage2")) -> dict:
     result = {}
     for stage in stages:
         scopes = {}
@@ -176,6 +219,7 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
                   alpha_bars: torch.Tensor, radius_m: float, gate_threshold: float,
                   thresholds: tuple[float, ...], sampling_steps: int,
                   random_seed: int, fault_seed: int, forced_fault: str | None,
+                  ray_angle_deg: float, ray_lateral_m: float,
                   device: str, stage1_only: bool = False) -> dict:
     clean = frame["clean_lidar"][:, :3].numpy()
     faulty_tensor, fault_type = severe_fault(
@@ -215,7 +259,6 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
         coords = active_coords[active_scores >= threshold]
         active_rows.append({"threshold": threshold,
                             **_active_score(coords, clean_active)})
-
     if stage1_only:
         return {"frame_id": frame_id, "fault_type": fault_type,
                 "stage1": {"faulty": stage1_baseline, "rows": stage1_rows},
@@ -229,6 +272,10 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
     stage2_output = (stage2_cache.load(frame_id, device)[0]
                      if stage2_cache is not None else live)
     conditions = stage2.conditions(stage2_output, gate_threshold)
+    allowed_zyx = conditions.hierarchy[0][:, 1:].cpu().numpy()
+    allowed_keys = np.ravel_multi_index(allowed_zyx.T, GRID.shape_zyx)
+    clean_keys = np.ravel_multi_index(clean2_zyx.T, GRID.shape_zyx)
+    clean_in_gate = int(np.isin(clean_keys, allowed_keys).sum())
     if len(conditions.hierarchy[0]):
         seed = int.from_bytes(hashlib.sha256(
             f"{random_seed}:{frame_id}".encode()).digest()[:8], "little")
@@ -242,20 +289,38 @@ def _frame_scores(frame: dict, frame_id: str, *, stage1, stage2,
     else:
         additions = np.empty((0, 3), dtype=np.float32)
         addition_scores = np.empty(0, dtype=np.float32)
+    fp_labels, no_retained = classify_addition_false_positives(
+        additions, clean, faulty,
+        angular_tolerance_deg=ray_angle_deg,
+        lateral_tolerance_m=ray_lateral_m)
     stage2_rows = []
+    fp_rows = []
     for threshold in thresholds:
-        selected = additions[addition_scores >= threshold]
+        selected_mask = addition_scores >= threshold
+        selected = additions[selected_mask]
         completed = np.concatenate((faulty2_xyz, selected), axis=0)
         completed_xyz, completed_zyx = scoped_cloud(completed)
         stage2_rows.append({"threshold": threshold,
                             **score(completed_xyz, completed_zyx,
                                     clean2_xyz, clean2_zyx)})
+        labels = fp_labels[selected_mask]
+        fp_rows.append({"threshold": threshold,
+                        "addition_points": len(labels),
+                        "true_positive_additions": int(np.count_nonzero(labels == "true_positive")),
+                        "false_positive_additions": int(np.count_nonzero(labels != "true_positive")),
+                        "no_retained_return_false_positives": int(np.count_nonzero(
+                            no_retained[selected_mask] & (labels != "true_positive"))),
+                        **{name: int(np.count_nonzero(labels == name))
+                           for name in FP_CATEGORIES}})
     return {"frame_id": frame_id, "fault_type": fault_type,
             "stage1": {"faulty": stage1_baseline, "rows": stage1_rows},
             "stage1_active": {"faulty": active_baseline, "rows": active_rows},
-            "stage2": {"faulty": stage2_baseline, "rows": stage2_rows},
+            "stage2": {"faulty": stage2_baseline, "rows": stage2_rows,
+                       "false_positive_rows": fp_rows},
             "stage1_active_cells": len(active_coords),
             "stage2_allowed_cells": len(conditions.hierarchy[0]),
+            "stage2_clean_cells": len(clean2_zyx),
+            "stage2_clean_cells_in_gate": clean_in_gate,
             "stage2_lowest_threshold_additions": len(additions)}
 
 
@@ -275,6 +340,10 @@ def main() -> None:
                         default=DEFAULT_THRESHOLDS)
     parser.add_argument("--select-by", choices=METRICS, default="iou_exact")
     parser.add_argument("--sampling-steps", type=int, default=64)
+    parser.add_argument("--ray-angle-deg", type=float, default=0.15,
+                        help="Maximum angular separation for the XYZ-only ray proxy")
+    parser.add_argument("--ray-lateral-m", type=float, default=0.15,
+                        help="Maximum perpendicular distance to a measured ray")
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--stage1-only", action="store_true",
@@ -285,6 +354,7 @@ def main() -> None:
             or args.sampling_steps < 1 or not args.thresholds
             or any(not 0 < threshold < 1 for threshold in args.thresholds)
             or len(set(args.thresholds)) != len(args.thresholds)
+            or args.ray_angle_deg <= 0 or args.ray_lateral_m <= 0
             or args.limit is not None and args.limit < 1):
         parser.error("CUDA, positive limits/steps, and unique thresholds in (0,1) are required")
     thresholds = tuple(sorted(args.thresholds))
@@ -331,6 +401,10 @@ def main() -> None:
         "thresholds": thresholds,
         "sampling_steps": args.sampling_steps,
         "stage1_only": args.stage1_only,
+        "ray_proxy": {"angle_deg": args.ray_angle_deg,
+                      "lateral_m": args.ray_lateral_m,
+                      "radial_margin_m": 0.5 * float(np.linalg.norm(GRID.voxel_xyz)),
+                      "beam_ids_available": False},
     }
     args.output_root.mkdir(parents=True, exist_ok=True)
     frames_dir = args.output_root / "frames"
@@ -359,18 +433,23 @@ def main() -> None:
                 sampling_steps=args.sampling_steps,
                 random_seed=args.random_seed, fault_seed=fault_seed,
                 forced_fault=None if args.fault_type == "auto" else args.fault_type,
+                ray_angle_deg=args.ray_angle_deg,
+                ray_lateral_m=args.ray_lateral_m,
                 device=args.device, stage1_only=args.stage1_only)
             _atomic_json(path, record)
         records.append(record)
     result = {"run_config": run_identity, "selection_metric": args.select_by,
               "stages": _summarize(
-        records, thresholds, args.select_by,
-        ("stage1", "stage1_active") if args.stage1_only
-        else ("stage1", "stage1_active", "stage2"))}
+                  records, thresholds, args.select_by,
+                  ("stage1", "stage1_active") if args.stage1_only
+                  else ("stage1", "stage1_active", "stage2"))}
+    if not args.stage1_only:
+        result["stage2_false_positive_diagnostics"] = _summarize_false_positives(
+            records, thresholds)
     _atomic_json(args.output_root / "threshold_metrics.json", result)
-    fields = ("stage", "fault_type", "threshold", *METRICS, *PR_METRICS,
+    fields = ("stage", "fault_type", "threshold", *METRICS,
               "predicted", "observed", "tp_exact", "tp_at_0_2m", "frames",
-              *(f"faulty_{metric}" for metric in (*METRICS, *PR_METRICS)),
+              *(f"faulty_{metric}" for metric in METRICS),
               "iou_exact_gain", "iou_at_0_2m_gain", "f1_exact_gain",
               "f1_at_0_2m_gain", "chamfer_squared_l2_reduction",
               "chamfer_paired_frames", "chamfer_faulty_paired_mean",
@@ -385,27 +464,48 @@ def main() -> None:
                 for row in scope["rows"]:
                     values = {"stage": stage, "fault_type": fault,
                               **row, **{f"faulty_{name}": faulty[name]
-                                       for name in (*METRICS, *PR_METRICS)}}
+                                       for name in METRICS}}
                     writer.writerow({name: values.get(name) for name in fields})
+    if not args.stage1_only:
+        fp_fields = ("fault_type", "threshold", *FP_FIELDS,
+                     "false_positive_fraction", "no_retained_return_fp_fraction",
+                     "gate_allowed_cells", "gate_clean_cells", "gate_clean_cells_in_gate",
+                     "gate_clean_cell_coverage", "gate_clean_return_fraction_of_allowed")
+        with (args.output_root / "false_positive_diagnostics.csv").open(
+                "w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fp_fields)
+            writer.writeheader()
+            for fault, scope in result["stage2_false_positive_diagnostics"].items():
+                gate_fields = {f"gate_{key}": value for key, value in scope["gate"].items()}
+                for row in scope["rows"]:
+                    writer.writerow({**{"fault_type": fault}, **row, **gate_fields})
     for stage, stage_result in result["stages"].items():
         threshold = stage_result["selected_threshold"]
         selected = next(row for row in stage_result["scopes"]["overall"]["rows"]
                         if row["threshold"] == threshold)
         baseline = stage_result["scopes"]["overall"]["faulty_baseline"]
-        print(f"{stage}: best {args.select_by} threshold={threshold:.2f}; "
+        print(f"{stage}: best {stage_result['selection_metric']} threshold={threshold:.3f}; "
               f"exact IoU {baseline['iou_exact']} -> {selected['iou_exact']}; "
               f"IoU@0.2m {baseline['iou_at_0_2m']} -> {selected['iou_at_0_2m']}; "
               f"F1 {baseline['f1_exact']} -> {selected['f1_exact']}; "
               f"F1@0.2m {baseline['f1_at_0_2m']} -> {selected['f1_at_0_2m']}; "
-              f"precision {baseline['precision_exact']} -> {selected['precision_exact']}; "
-              f"recall {baseline['recall_exact']} -> {selected['recall_exact']}; "
-              f"precision@0.2m {baseline['precision_at_0_2m']} -> {selected['precision_at_0_2m']}; "
-              f"recall@0.2m {baseline['recall_at_0_2m']} -> {selected['recall_at_0_2m']}; "
               f"Chamfer {baseline['chamfer_squared_l2']} -> "
               f"{selected['chamfer_squared_l2']} "
               f"(paired reduction {selected['chamfer_squared_l2_reduction']} "
               f"on {selected['chamfer_paired_frames']} frames)", flush=True)
-    print(f"Saved {args.output_root / 'threshold_metrics.json'} and CSV", flush=True)
+    if not args.stage1_only:
+        selected_stage2 = result["stages"]["stage2"]["selected_threshold"]
+        diagnostics = result["stage2_false_positive_diagnostics"]["overall"]
+        selected_diagnostic = next(row for row in diagnostics["rows"]
+                                   if row["threshold"] == selected_stage2)
+        print(f"Stage II at {selected_stage2:.3f}: "
+              f"{selected_diagnostic['false_positive_additions']} exact-voxel FP additions; "
+              f"{selected_diagnostic['known_free_before_clean_return']} before clean returns; "
+              f"{selected_diagnostic['behind_retained_faulty_return']} behind retained returns; "
+              f"{selected_diagnostic['no_retained_return_false_positives']} without a retained "
+              f"ray match. Gate clean-cell coverage: "
+              f"{diagnostics['gate']['clean_cell_coverage']}", flush=True)
+    print(f"Saved metrics and false-positive diagnostics under {args.output_root}", flush=True)
 
 
 if __name__ == "__main__":
