@@ -195,10 +195,24 @@ Checkpoints record the Stage-I SHA-256, gate, model revision, and fault policy
 to prevent incompatible runs.
 
 The adapted LPCR loss is `0.9 L_occ + 0.1 L_offset` at fine resolution.
-The diffusion loss is `L_clean_latent_MSE + L_residual_L1 + L_LPCR` with default
-outer weights of one. R2LDM itself uses clean-latent MSE during diffusion;
-the residual and decoded LPCR terms are this project's additions. The
-30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
+The diffusion loss is `L_clean_latent_MSE + L_residual_L1 + L_LPCR +
+L_addition + L_healthy` with default outer weights of one. R2LDM itself uses
+clean-latent MSE during diffusion; the other terms are this project's additions.
+The 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
+
+Two optional ray terms are implemented for later ablations. `L_hit` rewards an
+addition at a missing clean return and penalizes earlier unobserved candidate
+cells on its matched ray; `L_extra` penalizes an addition clearly behind the
+first clean return on a matched ray. Both operate on addition logits within
+the radar-selected gate. They do not label unmatched cells as free or require
+clean LiDAR at inference. VoD point files lack beam IDs, so ray matching uses
+XYZ direction (default 1.5 degrees), lateral distance (0.15 m), and a
+half-voxel-diagonal range margin. These are tunable geometric proxies.
+`L_hit` partly overlaps the existing missing-positive and known-free losses.
+The trainer defaults to `--ray-hit-weight 0 --ray-extra-weight 0`, which skips
+ray matching entirely and preserves the current objective. A future ablation
+can set either weight above zero in a separate training run. The new flags
+and geometry settings are recorded in diffusion checkpoints.
 
 Start with `--train-limit 2 --val-limit 2 --epochs 1 --num-workers 0`
 in a new output directory to check the full Stage-I-to-Stage-II path.

@@ -92,6 +92,16 @@ def main() -> None:
                        ("addition head", addition_grad)):
         if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
             raise AssertionError(f"{name} gradient is missing, zero, or invalid")
+    model.zero_grad(set_to_none=True)
+    ray_trial = model.diffusion_loss(
+        faulty, clean, conditions, cosine_alpha_bars(16, device=device),
+        ray_hit_weight=0.1, ray_extra_weight=0.1)
+    ray_trial["loss"].backward()
+    if (not torch.isfinite(ray_trial["rays"]["hit"])
+            or not torch.isfinite(ray_trial["rays"]["extra"])
+            or model.addition_head.network[0].weight.grad is None
+            or not torch.isfinite(model.addition_head.network[0].weight.grad).all()):
+        raise AssertionError("Optional ray loss or addition gradient is invalid")
     sampled = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:

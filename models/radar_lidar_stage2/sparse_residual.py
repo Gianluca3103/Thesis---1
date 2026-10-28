@@ -18,6 +18,7 @@ from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 from models.radar_lidar_stage1.sparse import encode_keys
 
 from .addition import addition_context, healthy_region_negatives
+from .ray_loss import addition_ray_losses
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
     GRID, Stage2Grid, active_hierarchy, gather_features, parent_features,
@@ -519,7 +520,8 @@ class SparseResidualStage2(nn.Module):
         return {"final": positive_loss + free_loss,
                 "missing_positive": positive_loss,
                 "known_free_negative": free_loss,
-                "healthy": healthy_loss, **metrics}
+                "healthy": healthy_loss, "logits": logits,
+                "observed": context.observed, **metrics}
 
     def diffusion_loss(self, faulty_xyz: torch.Tensor, clean_xyz: torch.Tensor,
                        conditions: Stage2Conditions, alpha_bars: torch.Tensor,
@@ -527,6 +529,11 @@ class SparseResidualStage2(nn.Module):
                        reconstruction_weight: float = 1.0,
                        addition_weight: float = 1.0,
                        healthy_weight: float = 1.0,
+                       ray_hit_weight: float = 0.0,
+                       ray_extra_weight: float = 0.0,
+                       ray_angular_tolerance_deg: float = 1.5,
+                       ray_lateral_tolerance_m: float = 0.15,
+                       ray_range_margin_m: float | None = None,
                        generator: torch.Generator | None = None,
                        faulty_batch_ids: torch.Tensor | None = None,
                        clean_batch_ids: torch.Tensor | None = None,
@@ -567,13 +574,29 @@ class SparseResidualStage2(nn.Module):
             reconstruction["known_free_target"],
             faulty_batch_ids=faulty_batch_ids,
             clean_batch_ids=clean_batch_ids, batch_size=batch_size)
+        if ray_hit_weight or ray_extra_weight:
+            rays = addition_ray_losses(
+                conditions.hierarchy[0], addition["logits"], addition["observed"],
+                reconstruction["occupied_target"], clean_xyz,
+                clean_batch_ids=clean_batch_ids,
+                angular_tolerance_deg=ray_angular_tolerance_deg,
+                lateral_tolerance_m=ray_lateral_tolerance_m,
+                range_margin_m=ray_range_margin_m,
+                hit_enabled=ray_hit_weight > 0,
+                extra_enabled=ray_extra_weight > 0, grid=self.grid)
+        else:
+            zero = addition["logits"].sum() * 0
+            rays = {"hit": zero, "extra": zero, "hit_rays": 0,
+                    "extra_sites": 0}
         total = (clean_latent_loss + residual_weight * residual_loss
                  + reconstruction_weight * reconstruction["loss"]
                  + addition_weight * addition["final"]
-                 + healthy_weight * addition["healthy"])
+                 + healthy_weight * addition["healthy"]
+                 + ray_hit_weight * rays["hit"]
+                 + ray_extra_weight * rays["extra"])
         return {"loss": total, "clean_latent": clean_latent_loss,
                 "residual": residual_loss, "reconstruction": reconstruction,
-                "addition": addition}
+                "addition": addition, "rays": rays}
 
     @torch.no_grad()
     def sample(self, faulty_xyz: torch.Tensor, conditions: Stage2Conditions,

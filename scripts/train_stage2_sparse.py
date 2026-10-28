@@ -178,12 +178,18 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                               reconstruction_weight=args.reconstruction_weight,
                                               addition_weight=args.addition_weight,
                                               healthy_weight=args.healthy_weight,
+                                              ray_hit_weight=args.ray_hit_weight,
+                                              ray_extra_weight=args.ray_extra_weight,
+                                              ray_angular_tolerance_deg=args.ray_angular_tolerance_deg,
+                                              ray_lateral_tolerance_m=args.ray_lateral_tolerance_m,
+                                              ray_range_margin_m=args.ray_range_margin_m,
                                               generator=generator,
                                               faulty_batch_ids=faulty_batch_ids,
                                               clean_batch_ids=clean_batch_ids,
                                               batch_size=batch_size)
                 reconstruction = result["reconstruction"]
                 addition = result["addition"]
+                rays = result["rays"]
                 values = {"loss": result["loss"],
                           "clean_latent": result["clean_latent"],
                           "residual": result["residual"],
@@ -203,6 +209,10 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                           "final_gate_iou": addition["final_gate_iou"],
                           "missing_sites": addition["missing_sites"],
                           "healthy_negative_sites": addition["healthy_negative_sites"]}
+                values.update({"ray_hit_loss": rays["hit"],
+                               "ray_extra_loss": rays["extra"],
+                               "ray_hit_rays": rays["hit_rays"] / batch_size,
+                               "ray_extra_sites": rays["extra_sites"] / batch_size})
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 values["loss"].backward()
@@ -285,6 +295,14 @@ def main() -> None:
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--addition-weight", type=float, default=1.0)
     parser.add_argument("--healthy-weight", type=float, default=1.0)
+    parser.add_argument("--ray-hit-weight", type=float, default=0.0,
+                        help="First-hit likelihood on clean target rays; 0 disables ray matching")
+    parser.add_argument("--ray-extra-weight", type=float, default=0.0,
+                        help="Penalty for added returns behind a clean first return; 0 disables matching")
+    parser.add_argument("--ray-angular-tolerance-deg", type=float, default=1.5)
+    parser.add_argument("--ray-lateral-tolerance-m", type=float, default=0.15)
+    parser.add_argument("--ray-range-margin-m", type=float, default=None,
+                        help="Clearance around a return (default: half voxel diagonal)")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -298,7 +316,11 @@ def main() -> None:
             args.lpcr_sites_per_frame < 7744 or
             args.paper_metrics_every < 1 or args.paper_metrics_frames < 1 or
             not 0 < args.paper_metrics_threshold < 1 or
-            min(args.addition_weight, args.healthy_weight) < 0 or
+            min(args.addition_weight, args.healthy_weight,
+                args.ray_hit_weight, args.ray_extra_weight) < 0 or
+            args.ray_angular_tolerance_deg <= 0 or
+            args.ray_lateral_tolerance_m <= 0 or
+            args.ray_range_margin_m is not None and args.ray_range_margin_m < 0 or
             args.phase == "diffusion" and args.stage1_checkpoint is None or
             args.phase == "diffusion" and args.batch_size > 1
             and args.stage2_cache_root is None or
@@ -360,9 +382,15 @@ def main() -> None:
     if args.phase == "diffusion":
         identity.update({"addition_weight": args.addition_weight,
                          "healthy_weight": args.healthy_weight,
+                         "ray_hit_weight": args.ray_hit_weight,
+                         "ray_extra_weight": args.ray_extra_weight,
                          "addition_region_stride_zyx": REGION_STRIDE_ZYX,
                          "healthy_min_clean_cells": MIN_CLEAN_CELLS_IN_REGION,
                          "healthy_retained_fraction": HEALTHY_RETAINED_FRACTION})
+        if args.ray_hit_weight or args.ray_extra_weight:
+            identity.update({"ray_angular_tolerance_deg": args.ray_angular_tolerance_deg,
+                             "ray_lateral_tolerance_m": args.ray_lateral_tolerance_m,
+                             "ray_range_margin_m": args.ray_range_margin_m})
     if args.phase == "diffusion":
         saved_lpcr = torch.load(args.lpcr_checkpoint, map_location="cpu", weights_only=False)
         if (saved_lpcr.get("version") != VERSION
@@ -431,7 +459,9 @@ def main() -> None:
     start, best = 1, float("inf")
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if any(saved.get(key) != value for key, value in identity.items()):
+        if any(saved.get(key, 0.0 if key in
+                         ("ray_hit_weight", "ray_extra_weight") else None) != value
+               for key, value in identity.items()):
             raise ValueError("Resume checkpoint configuration differs")
         model.load_state_dict(saved["model"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
@@ -488,6 +518,8 @@ def main() -> None:
                   f"offset L1={val['offset']:.5f}, "
                   f"addition/healthy loss={val['addition_final_loss']:.5f}/"
                   f"{val['addition_healthy_loss']:.5f}, "
+                  f"ray hit/extra loss={val['ray_hit_loss']:.5f}/"
+                  f"{val['ray_extra_loss']:.5f}, "
                   f"addition precision/recall={val['addition_precision']:.4f}/"
                   f"{val['addition_recall']:.4f}, "
                   f"healthy addition rate={val['healthy_addition_rate']:.4f}, "
