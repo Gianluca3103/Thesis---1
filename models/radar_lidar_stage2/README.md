@@ -82,6 +82,18 @@ fourth column is read for file-format compatibility and then discarded.
 
 ## Run on the professor machine
 
+For a new official five-scan radar-only Stage-I and selective-addition Stage-II
+experiment, run `bash scripts/run_fresh_radar_stage2_selective.sh` from the
+repository root. It builds a new severity-5 fog cache, checks that the fault
+injector removes returns, pretrains the radar encoder, trains Stage I, builds
+the per-frame 0.25 probability gate, trains full-region LPCR, and trains the
+selective-addition diffusion model. The default output is
+`radar_stage2_selective_20261028` under `sensor_fusion_outputs`; override `OUT`
+for another fresh run. `RAW`, `FOG_SIM`, `PY`, `VOD`, and `LIDAR_ENCODER` can be
+overridden as environment variables. Re-running the script with the same `OUT`
+resumes its checkpoints. The earlier LiDAR encoder is used only to verify the
+spatial geometry cache; its features are not inputs to the radar-only Stage I.
+
 The existing CUDA environment must import PyTorch, SciPy, and MinkowskiEngine.
 Use the matching official five-scan radar checkpoint and fixed-frame cache.
 The Stage-II cache stores the fixed radar output and clean targets once, with
