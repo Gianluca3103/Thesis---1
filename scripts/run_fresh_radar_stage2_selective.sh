@@ -199,6 +199,7 @@ fi
   --epochs 50 --lr 0.0002 --batch-size 16 --num-workers "$WORKERS" \
   --residual-weight 1 --reconstruction-weight 1 \
   --addition-weight 1 --healthy-weight 1 \
+  --ray-hit-weight 0 --ray-extra-weight 0 \
   --device cuda "${diff_resume[@]}"
 [[ -s "$DIFF/best.ckpt" ]] || fail "Diffusion produced no best.ckpt"
 
