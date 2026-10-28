@@ -6,7 +6,8 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage2.fault_data import (
-    decode_fog_points, encode_fog_points, retain_original_fog_returns,
+    decode_fog_points, encode_fog_points, fog_detection_floor,
+    retain_original_fog_returns,
     severe_fault,
 )
 from models.radar_lidar_stage2.sparse_batch import voxelize_means_batched
@@ -33,21 +34,34 @@ class TestStage2LidarFeatures(unittest.TestCase):
         self.assertEqual(tuple(features.shape), (0, 3))
 
     def test_fog_drops_shifted_returns_and_extra_duplicates(self):
-        clean = np.array([[1, 2, 3], [1, 2, 3], [4, 5, 6]], dtype=np.float32)
-        cached = np.array([[1, 2, 3, 10], [9, 9, 9, 100],
-                           [1, 2, 3, 20], [1, 2, 3, 30],
-                           [4, 5, 6, 40]], dtype=np.float32)
+        clean = np.array([[1, 2, 3, 100], [1, 2, 3, 100],
+                          [4, 5, 6, 100]], dtype=np.float32)
+        cached = np.array([[1, 2, 3, 100], [9, 9, 9, 100],
+                           [1, 2, 3, 100], [1, 2, 3, 100],
+                           [4, 5, 6, 100]], dtype=np.float32)
         retained = retain_original_fog_returns(clean, cached)
-        np.testing.assert_array_equal(retained, clean)
+        np.testing.assert_array_equal(retained, clean[:, :3])
         self.assertEqual(retained.shape[1], 3)
+
+    def test_fog_attenuation_removes_unchanged_xyz(self):
+        clean = np.array([[1, 0, 0, 100], [2, 0, 0, 80],
+                          [3, 0, 0, 40]], dtype=np.float32)
+        self.assertEqual(fog_detection_floor(clean), 48.0)
+        simulated = np.array([[1, 0, 0, 80], [2, 0, 0, 20],
+                              [3, 0, 0, 0]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            retain_original_fog_returns(clean, simulated), clean[:1, :3])
+        with self.assertRaisesRegex(ValueError, "attenuated intensity"):
+            retain_original_fog_returns(clean, simulated[:, :3])
 
     def test_fog_fault_exposes_only_original_xyz(self):
         clean = torch.tensor([[1.0, 2.0, 3.0, 120.0],
                               [4.0, 5.0, 6.0, 80.0]])
         class Cache:
             def load(self, _frame_id):
-                return torch.tensor([[1.0, 2.0, 3.0],
-                                     [8.0, 9.0, 10.0]])
+                return torch.tensor([[1.0, 2.0, 3.0, 100.0],
+                                     [4.0, 5.0, 6.0, 0.0],
+                                     [8.0, 9.0, 10.0, 100.0]])
         faulty, name = severe_fault(clean, "00001", 0, Cache(),
                                     fault_type="fog_sim")
         self.assertEqual(name, "fog_sim")
