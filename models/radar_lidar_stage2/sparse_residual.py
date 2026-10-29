@@ -248,17 +248,38 @@ class AllowedSiteLPCR(nn.Module):
     @torch.no_grad()
     def emit_points(self, coords: torch.Tensor, occupancy_logits: torch.Tensor,
                     offsets: torch.Tensor, threshold: float) -> dict:
-        """Emit one predicted centroid per selected occupied voxel."""
-        if offsets.shape != (len(coords), 3):
-            raise ValueError("LPCR offsets must have one XYZ vector per voxel")
+        """Emit at most one in-cell centroid per voxel for every model type."""
+        if (coords.ndim != 2 or coords.shape[1] != 4 or
+                occupancy_logits.shape != (len(coords),) or
+                offsets.shape != (len(coords), 3)):
+            raise ValueError("LPCR needs one logit and XYZ offset per [batch,z,y,x] cell")
         probabilities = occupancy_logits.sigmoid()
-        selected = probabilities >= threshold
+        selected = torch.where(probabilities >= threshold)[0]
+        keys = encode_keys(coords[selected], self.grid.shape_zyx)
+        if len(keys) > 1 and not bool((keys[1:] > keys[:-1]).all()):
+            # Normal Stage-I coordinates are already unique and sorted. For
+            # any other caller, retain the highest-probability point per cell.
+            ranked = selected[torch.argsort(probabilities[selected],
+                                            descending=True, stable=True)]
+            ranked_keys = encode_keys(coords[ranked], self.grid.shape_zyx)
+            order = torch.argsort(ranked_keys, stable=True)
+            ordered = ranked[order]
+            ordered_keys = ranked_keys[order]
+            keep = torch.ones(len(ordered), dtype=torch.bool,
+                              device=ordered.device)
+            keep[1:] = ordered_keys[1:] != ordered_keys[:-1]
+            selected = ordered[keep]
         chosen = coords[selected]
         centers = (offsets.new_tensor(self.grid.minimum_xyz)
                    + (chosen[:, [3, 2, 1]].to(offsets.dtype) + 0.5)
                    * offsets.new_tensor(self.grid.voxel_xyz))
+        # Keep emitted XYZ strictly inside its selected voxel even if tanh
+        # saturates at a face, where another voxel could receive the point.
+        half_cell = offsets.new_tensor(self.grid.voxel_xyz) * 0.5
+        bounded_offsets = offsets[selected].clamp(
+            min=-half_cell + 1e-4, max=half_cell - 1e-4)
         count = len(chosen)
-        return {"points_xyz": centers + offsets[selected],
+        return {"points_xyz": centers + bounded_offsets,
                 "coordinates": chosen, "occupied_coordinates": chosen,
                 "probabilities": probabilities[selected],
                 "point_counts": torch.ones(count, dtype=torch.long,

@@ -138,7 +138,10 @@ def main() -> None:
         if (epsilon_sample["predicted_points"] > epsilon_sample["allowed_cells"]
                 or epsilon_sample["predicted_points"] !=
                 int(epsilon_sample["point_counts"].sum())
-                or bool((epsilon_sample["point_counts"] > 1).any())):
+                or bool((epsilon_sample["point_counts"] > 1).any())
+                or len(torch.unique(encode_keys(
+                    epsilon_sample["coordinates"], GRID.shape_zyx))) !=
+                epsilon_sample["predicted_points"]):
             raise AssertionError("Epsilon sampler exceeded the one-point-per-voxel gate")
     sampled = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),
                            steps=4)
@@ -146,7 +149,10 @@ def main() -> None:
         raise AssertionError("Reconstruction escaped the Stage-I gate")
     if (sampled["predicted_points"] != len(sampled["points_xyz"])
             or sampled["predicted_points"] != int(sampled["point_counts"].sum())
-            or sampled["predicted_points"] != sampled["predicted_cells"]):
+            or sampled["predicted_points"] != sampled["predicted_cells"]
+            or len(torch.unique(encode_keys(
+                sampled["coordinates"], GRID.shape_zyx))) !=
+            sampled["predicted_points"]):
         raise AssertionError("LPCR must emit one centroid per selected voxel")
     torch.manual_seed(3103)
     raw = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),

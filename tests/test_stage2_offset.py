@@ -34,6 +34,27 @@ class TestStage2Offset(unittest.TestCase):
         torch.testing.assert_close(output["points_xyz"][0],
                                    torch.tensor([1.12, 0.09, 0.155]))
 
+    def test_duplicate_cell_keeps_highest_confidence_and_offset_stays_inside(self):
+        head = self._head()
+        coords = torch.tensor([[0, 8, 80, 5], [0, 8, 80, 5],
+                               [0, 8, 80, 6]])
+        logits = torch.tensor([0.2, 2.0, 1.0])
+        offsets = torch.tensor([[0.0, 0.0, 0.0],
+                                [0.10, 0.10, 0.125],
+                                [-0.10, -0.10, -0.125]])
+        output = head.emit_points(coords, logits, offsets, 0.5)
+        self.assertEqual(output["predicted_points"], 2)
+        self.assertEqual(output["point_counts"].tolist(), [1, 1])
+        self.assertEqual(output["coordinates"].tolist(),
+                         [coords[0].tolist(), coords[2].tolist()])
+        torch.testing.assert_close(output["probabilities"][0],
+                                   logits[1].sigmoid())
+        lower = torch.tensor(GRID.minimum_xyz)
+        size = torch.tensor(GRID.voxel_xyz)
+        actual_xyz = torch.floor((output["points_xyz"] - lower) / size).long()
+        torch.testing.assert_close(actual_xyz[:, [2, 1, 0]],
+                                   output["coordinates"][:, 1:])
+
     def test_paper_weighted_occupancy_and_centroid_offset_loss(self):
         head = self._head()
         logits = torch.tensor([2., -2.], requires_grad=True)

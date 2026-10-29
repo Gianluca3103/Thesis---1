@@ -213,6 +213,11 @@ LPCR checkpoint from `radar_stage2_ray0_20261028`. It saves a separate
 `radar_stage2_epsilon_ray025_20261029` checkpoint; the residual run and its
 loader behavior remain unchanged. Set `SOURCE_RUN` and `OUT` to override these
 defaults. Both modes emit at most one reconstructed centroid per allowed voxel.
+The common LPCR emission path enforces this for residual, epsilon, and legacy
+checkpoints: if a caller supplies duplicate selected cells, it keeps the
+highest-probability point, and offsets stay strictly inside their source cell.
+Original faulty LiDAR returns are preserved and are not subject to this
+generated-point limit.
 
 For the epsilon mode, the sparse U-Net predicts the sampled Gaussian noise
 `epsilon_hat` instead of the clean-minus-faulty latent residual. The bounded
