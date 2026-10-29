@@ -85,6 +85,17 @@ pre-aligned `float32` `.bin` files with four columns at
 `FAULTY_ROOT/{train,val,test}/FRAME.bin` (or `FAULTY_ROOT/FRAME.bin`). The
 fourth column is read for file-format compatibility and then discarded.
 
+For a separate mild-fault dataset, run `python -m scripts.cache_stage2_mild_faults`
+with `--vod-root`, `--data-cache-root`, `--fog-cache-root`, and `--output-root`.
+It assigns one deterministic, balanced fault to each train/validation frame:
+severity-5 fog or a spatially contiguous azimuth loss removing 30%, 40%, or
+50% of clean returns. Partial-loss frames retain at least half their original
+returns; severity-5 fog can retain less. Fog uses the existing simulator cache
+and original-return filter, so no synthetic fog points enter the output.
+The dataset stores only XYZ as losslessly compressed `.npz` files, plus a
+manifest describing each frame's fault. Pass the output directory to
+`--faulty-root` when training Stage-II diffusion on this dataset.
+
 ## Run on the professor machine
 
 For a new official five-scan radar-only Stage-I and selective-addition Stage-II

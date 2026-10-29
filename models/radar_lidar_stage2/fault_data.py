@@ -68,7 +68,7 @@ def severe_fov_filter(points: np.ndarray) -> np.ndarray:
 
 
 class SevereFogCache:
-    def __init__(self, root: Path, split: str, frame_ids: list[str],
+    def __init__(self, root: Path, split: str, frame_ids: list[str] | None,
                  *, seed: int = 3103, check_complete: bool = True):
         self.root = Path(root) / split
         manifest_path = self.root / "manifest.json"
@@ -80,10 +80,13 @@ class SevereFogCache:
                 or manifest.get("severity") != 5
                 or manifest.get("alpha") != FOG_ALPHA
                 or manifest.get("noise") != FOG_NOISE
-                or manifest.get("frame_ids") != frame_ids):
+                or (frame_ids is not None
+                    and manifest.get("frame_ids") != frame_ids)):
             raise ValueError(f"Severe fog cache manifest differs: {manifest_path}")
         self.seed = seed
         if check_complete:
+            if frame_ids is None:
+                raise ValueError("Complete fog-cache validation requires frame IDs")
             missing = [frame for frame in frame_ids if not self.path(frame).is_file()]
             if missing:
                 raise FileNotFoundError(
@@ -191,13 +194,30 @@ def severe_fault(clean: torch.Tensor, frame_id: str, epoch: int,
 
 
 def load_faulty(root: Path, split: str, frame_id: str) -> torch.Tensor:
-    """Read the legacy four-column file and expose only XYZ to Stage II."""
-    paths = (root / split / f"{frame_id}.bin", root / f"{frame_id}.bin")
+    """Read legacy four-column BIN or compressed mild-fault XYZ for Stage II."""
+    paths = (root / split / f"{frame_id}.bin", root / f"{frame_id}.bin",
+             root / split / f"{frame_id}.npz", root / f"{frame_id}.npz")
     matches = [path for path in paths if path.is_file()]
     if len(matches) != 1:
         raise FileNotFoundError(
-            f"Expected one calibrated four-float LiDAR file for {split}/{frame_id} "
+            f"Expected one calibrated faulty LiDAR file for {split}/{frame_id} "
             f"under {root}; found {len(matches)}")
+    if matches[0].suffix == ".npz":
+        from .mild_fault_data import (
+            MILD_FAULT_ENCODING, MILD_FAULT_TYPES, MILD_FAULT_VERSION,
+            decode_mild_xyz,
+        )
+        with np.load(matches[0], allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata_json"].item()))
+            if (metadata.get("version") != MILD_FAULT_VERSION
+                    or metadata.get("frame_id") != frame_id
+                    or metadata.get("split") != split
+                    or metadata.get("fault_type") not in MILD_FAULT_TYPES
+                    or metadata.get("encoding") != MILD_FAULT_ENCODING):
+                raise ValueError(f"Invalid mild-fault metadata: {matches[0]}")
+            points = decode_mild_xyz(
+                archive["points_bytes"], int(metadata["retained_points"]))
+        return torch.from_numpy(points)
     raw = np.fromfile(matches[0], dtype=np.float32)
     if raw.size % 4:
         raise ValueError(f"Faulty LiDAR must have four float32 columns: {matches[0]}")
