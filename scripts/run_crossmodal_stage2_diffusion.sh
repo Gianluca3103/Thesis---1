@@ -74,12 +74,15 @@ df -h "$OUT"
 
 # Reuse an aligned 20-frame cache only when the current loader validates its
 # manifest, source hash, FOV and complete train/validation frame lists.
+REQUESTED_RAW=${RAW:-}
 RAW=
 for candidate in \
+  "$REQUESTED_RAW" \
   "$OUT/fixed_frames" \
   "$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames" \
   "$DATA/crossmodal_noaug_30ep_20261015/fixed_frames"; do
-  if [[ -s "$candidate/train/manifest.json" && -s "$candidate/val/manifest.json" ]] &&
+  if [[ -n "$candidate" && -s "$candidate/train/manifest.json" &&
+        -s "$candidate/val/manifest.json" ]] &&
      "$PY" -c '
 import sys
 from pathlib import Path

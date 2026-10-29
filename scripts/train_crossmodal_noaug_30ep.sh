@@ -12,7 +12,7 @@ RADAR_VARIANT=radar_20frames_verified_doppler_radial
 NOAUG=$REPO/configs/crossmodal_no_geometric_augmentation.json
 TEACHER_CONFIG=$REPO/configs/crossmodal_teacher_raw64.json
 STUDENT_CONFIG=$REPO/configs/crossmodal_student_raw64.json
-RAW=$OUT/fixed_frames
+RAW=${RAW:-$OUT/fixed_frames}
 TEACHER_CACHE=${TEACHER_CACHE:-$OUT/teacher_static}
 STUDENT_CACHE_FORMAT=${STUDENT_CACHE_FORMAT:-legacy}
 STUDENT_COMPRESSION_CODEC=${STUDENT_COMPRESSION_CODEC:-zlib}
@@ -72,7 +72,7 @@ SHORT_TMP=${CROSSMODAL_TMPDIR:-/dev/shm/cm-$UID}
 mkdir -p "$SHORT_TMP"
 export TMPDIR="$SHORT_TMP" TMP="$SHORT_TMP" TEMP="$SHORT_TMP"
 export MPLCONFIGDIR="$OUT/matplotlib" MPLBACKEND=Agg
-export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
 export CROSSMODAL_GPU_NEIGHBORS=${CROSSMODAL_GPU_NEIGHBORS:-1}
@@ -81,7 +81,7 @@ cd "$REPO"
 "$PY" -c 'import json,sys; assert json.load(open(sys.argv[1]))["enabled"] is False' "$NOAUG"
 "$PY" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0), flush=True)'
 "$PY" -m scripts.smoke_crossmodal_raw_decoder
-printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "$OUT"
+printf 'Source: %s\nOutput: %s\n' "$(git rev-parse HEAD 2>/dev/null || printf archive)" "$OUT"
 
 run_phase() {
   local name=$1 root=$2 module=$3
