@@ -10,6 +10,7 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probability_map
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import load_radar_autoencoder
+from models.radar_lidar_crossmodal_v1.train_student import load_student
 
 from .sparse_geometry import GRID
 from .sparse_residual import LPCR_REVISION, MODEL_REVISION, VERSION, SparseResidualStage2
@@ -24,7 +25,11 @@ def sha256(path: Path) -> str:
 
 
 def load_stage1(path: Path, device: str, radar_variant: str):
-    model, saved = load_radar_autoencoder(path, device)
+    header = torch.load(path, map_location="cpu", weights_only=False)
+    if header.get("version") == "crossmodal_student_v5_multiscale_refined_raw64":
+        model, saved = load_student(path, device)
+    else:
+        model, saved = load_radar_autoencoder(path, device)
     if saved.get("radar_variant") != radar_variant:
         raise ValueError("Stage-I radar variant does not match the paired dataset")
     model.requires_grad_(False)

@@ -171,8 +171,13 @@ def load_student(path, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
     if saved.get("version") != "crossmodal_student_v5_multiscale_refined_raw64":
         raise ValueError("Expected a trained multiscale-refined raw-confidence student checkpoint")
-    model = RadarOnlyStudent(saved["radar_checkpoint"], StudentConfig(**saved["config"]))
+    # The student checkpoint contains the complete radar encoder state. Loading
+    # it must not depend on the separate pretraining file still being present.
+    model = RadarOnlyStudent(None, StudentConfig(**saved["config"]),
+                             trainable_encoder=True)
     model.load_state_dict(saved["model"], strict=True)
+    model.radar_encoder.frozen = True
+    model.radar_encoder.requires_grad_(False)
     return model.to(device).eval(), saved
 
 

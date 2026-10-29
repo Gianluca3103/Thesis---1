@@ -13,6 +13,11 @@ latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
 1. Frozen radar-only Stage I reads calibrated VoD radar and supplies a
    fine-voxel probability map and stride-8 radar features. Its 3.2 m radar
    support is retained.
+   Stage I can be the direct radar occupancy autoencoder or the trained
+   cross-modal raw-confidence student. The latter uses the teacher only during
+   its own training; Stage-II inference still reads radar and faulty LiDAR.
+   Changing Stage-I checkpoints requires rebuilding the Stage-II gate cache
+   and retraining diffusion, since both are bound to the Stage-I weight hash.
 2. The probability threshold selects active cells **before** sparse decoding.
    Only these cells and their parents are allocated at the five LPCR scales.
 3. One shared Minkowski LiDAR encoder processes only XYZ from clean LiDAR
