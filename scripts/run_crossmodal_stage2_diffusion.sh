@@ -129,6 +129,35 @@ printf '\n=== Build cross-modal Stage-I gate cache ===\n'
   --radar-variant "$RADAR_VARIANT" --gate-threshold "$GATE" \
   --split both --num-workers "$WORKERS" --device cuda
 
+printf '\n=== Verify cached radar conditioning comes from the cross-modal student ===\n'
+"$PY" -c '
+import json, sys, torch
+from pathlib import Path
+from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+from models.radar_lidar_stage2.stage2_cache import Stage2FixedCache
+from models.radar_lidar_stage2.stage2_io import load_stage1, sha256, stage1_frame
+
+ckpt, cache_root, vod, raw = map(Path, sys.argv[1:5])
+variant = sys.argv[5]
+torch.set_grad_enabled(False)
+manifest = json.loads((cache_root / "val" / "manifest.json").read_text())
+if manifest["stage1_sha256"] != sha256(ckpt):
+    raise ValueError("Gate cache belongs to another Stage-I checkpoint")
+model, saved = load_stage1(ckpt, "cuda", variant)
+row = paired_dataset(vod, "val", variant, data_cache_root=raw, limit=1)[0]
+live = stage1_frame(model, row["radar"].cuda(), float(saved.get("radius_m", 3.2)))
+cached, _ = Stage2FixedCache(cache_root / "val", manifest).load(row["frame_id"], "cpu")
+if not torch.equal(cached["conditioning_coords"], live["conditioning_coords"].cpu()):
+    raise ValueError("Cached conditioning coordinates differ from the cross-modal student")
+torch.testing.assert_close(cached["conditioning_features"],
+                           live["conditioning_features"].cpu(), rtol=1e-5,
+                           atol=1e-6)
+sites = len(cached["conditioning_coords"])
+digest = manifest["stage1_sha256"]
+print(f"Verified {sites} stride-8 conditioning sites from Stage-I SHA256 "
+      f"{digest[:12]}", flush=True)
+' "$STAGE1_CKPT" "$STAGE2_CACHE" "$VOD" "$RAW" "$RADAR_VARIANT"
+
 printf '\n=== Train Stage-II diffusion with the same ray loss as ray_on ===\n'
 resume=()
 if [[ -s "$DIFF/last.ckpt" ]]; then
