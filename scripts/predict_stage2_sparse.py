@@ -76,6 +76,7 @@ def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
 
 
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
+                diffusion_target: str,
                 faulty: np.ndarray, clean: np.ndarray, radar: np.ndarray,
                 predicted: np.ndarray, probabilities: np.ndarray,
                 allowed_xyz: np.ndarray, allowed_probabilities: np.ndarray,
@@ -100,6 +101,7 @@ def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
         minimum, maximum = list(GRID.minimum_xyz), list(GRID.maximum_xyz)
     payload = json.dumps({
         "frame": frame_id, "epoch": epoch, "split": split,
+        "diffusion_target": diffusion_target,
         "faulty": np.round(faulty, 3).tolist(),
         "clean": np.round(clean, 3).tolist(),
         "radar": np.round(radar, 3).tolist(),
@@ -147,7 +149,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 <script>
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent);
-document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · diffusion epoch ${d.epoch}`;
+document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · ${d.diffusion_target||'residual'} diffusion epoch ${d.epoch}`;
 const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog responses and returns below the intensity detection floor are removed. Retained input points have original clean XYZ; intensity is not a model input.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} ${d.zero_residual?'Zero-residual ablation: the faulty LiDAR latent goes directly to LPCR; radar still selects the allowed region.':'The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.'} ${d.missing_only?'The reconstructed layer contains additions only; faulty-occupied voxels are preserved from the input.':'The reconstructed layer shows the unfiltered full-cloud estimate.'}`;
 document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} Stage I allowed cells at gate probability ≥ ${d.gate_threshold==null?'unknown':Number(d.gate_threshold).toFixed(2)}; reconstruction generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
@@ -354,6 +356,7 @@ def main() -> None:
                             prediction_mode=np.asarray("full_estimate" if args.full_estimate
                                                        else "missing_only"))
         stats = {"frame_id": frame_id, "epoch": int(saved2["epoch"]),
+                 "diffusion_target": saved2.get("diffusion_target", "residual"),
                  "fault_type": fault_type,
                  "allowed_cells": predicted["allowed_cells"],
                  "predicted_occupied_cells": predicted["predicted_cells"],
@@ -412,6 +415,7 @@ def main() -> None:
             viewer = stem.with_suffix(".html")
             _write_html(viewer, frame_id=frame_id, epoch=int(saved2["epoch"]),
                         split=args.split,
+                        diffusion_target=saved2.get("diffusion_target", "residual"),
                         faulty=faulty_roi[:, :3], clean=clean_roi[:, :3],
                         radar=radar_roi[:, :3], predicted=xyz,
                         probabilities=scores,

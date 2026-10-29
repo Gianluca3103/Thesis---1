@@ -38,6 +38,7 @@ else:
 VERSION = "stage2_sparse_residual_v1"
 LPCR_REVISION = "stage2_full_region_lpcr_residual_v9"
 MODEL_REVISION = "stage2_full_region_lpcr_additive_v10"
+EPSILON_MODEL_REVISION = "stage2_full_region_lpcr_additive_epsilon_v1"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 1
 
@@ -59,6 +60,26 @@ def _frame_mean(values: torch.Tensor, batch_ids: torch.Tensor,
     counts = values.new_zeros(batch_size).scatter_add_(
         0, batch_ids, torch.ones_like(values))
     return (sums / counts.clamp_min(1)).mean()
+
+
+def residual_from_epsilon(noisy: torch.Tensor, predicted_noise: torch.Tensor,
+                          alpha: torch.Tensor) -> torch.Tensor:
+    """Recover a bounded x0 residual from an epsilon prediction.
+
+    The shared encoder ends in tanh, so clean-minus-faulty latents lie in
+    [-2, 2]. Clipping prevents the near-zero terminal alpha from sending
+    an arbitrarily large estimate into the frozen LPCR decoder.
+    """
+    if noisy.shape != predicted_noise.shape:
+        raise ValueError("Noisy residual and predicted noise shapes differ")
+    return ((noisy - (1 - alpha).sqrt() * predicted_noise) /
+            alpha.sqrt().clamp_min(1e-6)).clamp(-2.0, 2.0)
+
+
+def epsilon_task_weight(alpha: torch.Tensor) -> torch.Tensor:
+    """Bound decoded-task gradients after the epsilon-to-x0 conversion."""
+    return torch.minimum(torch.ones_like(alpha),
+                         (alpha / (1 - alpha).clamp_min(1e-8)).sqrt())
 
 
 class SparseConvNorm(nn.Module):
@@ -339,9 +360,13 @@ class AdditionHead(nn.Module):
 
 
 class SparseResidualStage2(nn.Module):
-    def __init__(self, grid: Stage2Grid = GRID):
+    def __init__(self, grid: Stage2Grid = GRID,
+                 *, diffusion_target: str = "residual"):
         super().__init__()
+        if diffusion_target not in ("residual", "epsilon"):
+            raise ValueError("Diffusion target must be residual or epsilon")
         self.grid = grid
+        self.diffusion_target = diffusion_target
         self.lidar_encoder = SharedLidarEncoder(grid)
         self.lpcr = AllowedSiteLPCR(grid)
         self.addition_head = AdditionHead()
@@ -546,17 +571,32 @@ class SparseResidualStage2(nn.Module):
                 faulty_xyz, conditions, faulty_batch_ids)
             clean, _ = self.encode_lidar(clean_xyz, conditions, clean_batch_ids)
         residual = clean - faulty
-        timestep = torch.randint(len(alpha_bars), (batch_size,), device=residual.device,
+        # A shared timestep keeps the decoded-task weight exact for every
+        # frame in an epsilon batch; residual training retains its original
+        # independent per-frame timestep sampling.
+        step_count = 1 if self.diffusion_target == "epsilon" else batch_size
+        timestep = torch.randint(len(alpha_bars), (step_count,), device=residual.device,
                                  generator=generator)
+        if step_count == 1 and batch_size > 1:
+            timestep = timestep.expand(batch_size)
         latent_frame_ids = conditions.hierarchy[-1][:, 0].long()
         alpha = alpha_bars[timestep[latent_frame_ids]][:, None]
         noise = torch.randn(residual.shape, device=residual.device,
                             dtype=residual.dtype, generator=generator)
         noisy = alpha.sqrt() * residual + (1 - alpha).sqrt() * noise
-        residual_hat = self.diffusion(
+        prediction = self.diffusion(
             noisy, faulty, conditions.radar_features,
             conditions.latent_probabilities, faulty_present,
             timestep, conditions.hierarchy[-1])
+        if self.diffusion_target == "epsilon":
+            noise_loss = _frame_mean((prediction - noise).square().mean(1),
+                                     latent_frame_ids, batch_size)
+            residual_hat = residual_from_epsilon(noisy, prediction, alpha)
+            task_weight = epsilon_task_weight(alpha_bars[timestep[0]])
+        else:
+            noise_loss = prediction.sum() * 0
+            residual_hat = prediction
+            task_weight = prediction.new_tensor(1.0)
         clean_hat = faulty + residual_hat
         # R2LDM predicts the clean latent (x0); L1 on the residual adds a
         # distinct faulty-to-clean signal instead of duplicating the x0 MSE.
@@ -591,14 +631,26 @@ class SparseResidualStage2(nn.Module):
             zero = addition["logits"].sum() * 0
             rays = {"hit": zero, "extra": zero, "hit_rays": 0,
                     "extra_sites": 0}
-        total = (clean_latent_loss + residual_weight * residual_loss
-                 + reconstruction_weight * reconstruction["loss"]
-                 + addition_weight * addition["final"]
-                 + healthy_weight * addition["healthy"]
-                 + ray_hit_weight * rays["hit"]
-                 + ray_extra_weight * rays["extra"])
+        if self.diffusion_target == "epsilon":
+            # The epsilon run has one primary denoising target. A residual
+            # L1 auxiliary is available but defaults to zero for this ablation.
+            decoded_tasks = (reconstruction_weight * reconstruction["loss"]
+                             + addition_weight * addition["final"]
+                             + healthy_weight * addition["healthy"]
+                             + ray_hit_weight * rays["hit"]
+                             + ray_extra_weight * rays["extra"])
+            total = noise_loss + task_weight * (
+                residual_weight * residual_loss + decoded_tasks)
+        else:
+            total = (clean_latent_loss + residual_weight * residual_loss
+                     + reconstruction_weight * reconstruction["loss"]
+                     + addition_weight * addition["final"]
+                     + healthy_weight * addition["healthy"]
+                     + ray_hit_weight * rays["hit"]
+                     + ray_extra_weight * rays["extra"])
         return {"loss": total, "clean_latent": clean_latent_loss,
-                "residual": residual_loss, "reconstruction": reconstruction,
+                "residual": residual_loss, "noise": noise_loss,
+                "task_weight": task_weight, "reconstruction": reconstruction,
                 "addition": addition, "rays": rays}
 
     @torch.no_grad()
@@ -616,17 +668,23 @@ class SparseResidualStage2(nn.Module):
             schedule = torch.linspace(len(alpha_bars) - 1, 0, steps,
                                       device=faulty.device).round().long()
             for index, timestep in enumerate(schedule):
-                residual_hat = self.diffusion(
+                prediction = self.diffusion(
                     residual, faulty, conditions.radar_features,
                     conditions.latent_probabilities, present, timestep,
                     conditions.hierarchy[-1])
+                alpha = alpha_bars[timestep]
+                if self.diffusion_target == "epsilon":
+                    noise_hat = prediction
+                    residual_hat = residual_from_epsilon(residual, noise_hat, alpha)
+                else:
+                    residual_hat = prediction
                 if index + 1 == len(schedule):
                     residual = residual_hat
                 else:
-                    alpha = alpha_bars[timestep]
                     next_alpha = alpha_bars[schedule[index + 1]]
-                    noise_hat = ((residual - alpha.sqrt() * residual_hat) /
-                                 (1 - alpha).sqrt().clamp_min(1e-6))
+                    if self.diffusion_target != "epsilon":
+                        noise_hat = ((residual - alpha.sqrt() * residual_hat) /
+                                     (1 - alpha).sqrt().clamp_min(1e-6))
                     residual = (next_alpha.sqrt() * residual_hat
                                 + (1 - next_alpha).sqrt() * noise_hat)
         additive = self.use_addition_head and missing_only

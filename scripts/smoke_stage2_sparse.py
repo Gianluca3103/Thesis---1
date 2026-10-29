@@ -14,7 +14,7 @@ from models.radar_lidar_stage2.sparse_geometry import (
     GRID, reconstruction_targets, voxelize_means,
 )
 from models.radar_lidar_stage2.sparse_residual import (
-    SparseResidualStage2, cosine_alpha_bars,
+    SparseResidualStage2, cosine_alpha_bars, residual_from_epsilon,
 )
 from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--check-ray-loss", action="store_true",
                         help="Exercise optional ray losses; skipped by default")
+    parser.add_argument("--check-epsilon", action="store_true",
+                        help="Exercise the separate epsilon objective and sampler")
     args = parser.parse_args()
     torch.manual_seed(3103)
     device = torch.device(args.device)
@@ -107,6 +109,37 @@ def main() -> None:
                 or model.addition_head.network[0].weight.grad is None
                 or not torch.isfinite(model.addition_head.network[0].weight.grad).all()):
             raise AssertionError("Optional ray loss or addition gradient is invalid")
+    if args.check_epsilon:
+        alpha = torch.tensor(0.4, device=device)
+        truth = torch.tensor([[0.3, -0.8]], device=device)
+        noise = torch.tensor([[0.2, 0.5]], device=device)
+        noisy = alpha.sqrt() * truth + (1 - alpha).sqrt() * noise
+        torch.testing.assert_close(residual_from_epsilon(noisy, noise, alpha), truth)
+        epsilon_model = SparseResidualStage2(diffusion_target="epsilon").to(device)
+        epsilon_model.lidar_encoder.requires_grad_(False)
+        epsilon_model.lpcr.requires_grad_(False)
+        epsilon_conditions = epsilon_model.conditions(stage1, 0.3)
+        epsilon_loss = epsilon_model.diffusion_loss(
+            faulty, clean, epsilon_conditions, cosine_alpha_bars(16, device=device),
+            residual_weight=0.0, ray_hit_weight=0.25, ray_extra_weight=0.25)
+        epsilon_loss["loss"].backward()
+        for name, grad in (
+                ("epsilon U-Net", epsilon_model.diffusion.residual_head.weight.grad),
+                ("epsilon radar adapter", epsilon_model.radar_adapter.weight.grad),
+                ("epsilon addition head", epsilon_model.addition_head.network[0].weight.grad)):
+            if grad is None or not torch.isfinite(grad).all() or not bool((grad != 0).any()):
+                raise AssertionError(f"{name} gradient is missing or invalid")
+        if (not torch.isfinite(epsilon_loss["noise"])
+                or not 0 < float(epsilon_loss["task_weight"]) <= 1):
+            raise AssertionError("Epsilon loss or task weight is invalid")
+        epsilon_sample = epsilon_model.sample(
+            faulty, epsilon_conditions, cosine_alpha_bars(16, device=device),
+            steps=4)
+        if (epsilon_sample["predicted_points"] > epsilon_sample["allowed_cells"]
+                or epsilon_sample["predicted_points"] !=
+                int(epsilon_sample["point_counts"].sum())
+                or bool((epsilon_sample["point_counts"] > 1).any())):
+            raise AssertionError("Epsilon sampler exceeded the one-point-per-voxel gate")
     sampled = model.sample(faulty, conditions, cosine_alpha_bars(16, device=device),
                            steps=4)
     if sampled["predicted_cells"] > sampled["allowed_cells"]:
@@ -171,6 +204,21 @@ def main() -> None:
             model.diffusion.residual_head.weight.grad is None or
             not torch.isfinite(model.diffusion.residual_head.weight.grad).all()):
         raise AssertionError("Batched diffusion loss or gradient is invalid")
+    if args.check_epsilon:
+        epsilon_model.zero_grad(set_to_none=True)
+        epsilon_twins = [epsilon_model.conditions(stage1, 0.3) for _ in range(2)]
+        for item in epsilon_twins:
+            item.cached_targets = reconstruction_targets(clean[:, :3], item.hierarchy[0])
+        epsilon_batched = epsilon_model.diffusion_loss(
+            batched_faulty, batched_clean, _combine_conditions(epsilon_twins),
+            cosine_alpha_bars(16, device=device), residual_weight=0.0,
+            ray_hit_weight=0.25, ray_extra_weight=0.25,
+            faulty_batch_ids=faulty_ids, clean_batch_ids=clean_ids, batch_size=2)
+        epsilon_batched["loss"].backward()
+        if (not torch.isfinite(epsilon_batched["loss"]) or
+                epsilon_model.diffusion.residual_head.weight.grad is None or
+                not torch.isfinite(epsilon_model.diffusion.residual_head.weight.grad).all()):
+            raise AssertionError("Batched epsilon loss or gradient is invalid")
     print({"lpcr_loss": float(first["loss"]),
            "full_region_lpcr_loss": float(full_loss["loss"]),
            "diffusion_loss": float(second["loss"]),
@@ -178,6 +226,10 @@ def main() -> None:
            "healthy_loss": float(second["addition"]["healthy"]),
            "missing_sites": second["addition"]["missing_sites"],
            "batched_diffusion_loss": float(batched["loss"]),
+           "epsilon_loss": (float(epsilon_loss["loss"])
+                            if args.check_epsilon else None),
+           "batched_epsilon_loss": (float(epsilon_batched["loss"])
+                                    if args.check_epsilon else None),
            "total_loss_diffusion_loss": float(total_loss["loss"]),
            "allowed": sampled["allowed_cells"],
            "predicted": sampled["predicted_cells"],

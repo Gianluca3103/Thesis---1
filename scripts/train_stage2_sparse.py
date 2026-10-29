@@ -25,7 +25,7 @@ from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
 from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    LPCR_REVISION, MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
+    EPSILON_MODEL_REVISION, LPCR_REVISION, MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
     SparseResidualStage2, Stage2Conditions,
     cosine_alpha_bars,
 )
@@ -193,6 +193,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 values = {"loss": result["loss"],
                           "clean_latent": result["clean_latent"],
                           "residual": result["residual"],
+                          "noise": result["noise"],
+                          "task_weight": result["task_weight"],
                           "reconstruction": reconstruction["loss"],
                           "occupancy": reconstruction["occupancy"],
                           "offset": reconstruction["offset"],
@@ -265,6 +267,9 @@ def _paper_metrics(model, dataset, args) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("lpcr", "diffusion"), required=True)
+    parser.add_argument("--diffusion-target", choices=("residual", "epsilon"),
+                        default="residual",
+                        help="Separate x0-residual or epsilon-prediction experiment")
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--stage2-cache-root", type=Path,
@@ -291,7 +296,8 @@ def main() -> None:
     parser.add_argument("--fault-cache-root", type=Path,
                         help="Required for synthetic severe faults; contains severity-5 fog")
     parser.add_argument("--fault-seed", type=int, default=3103)
-    parser.add_argument("--residual-weight", type=float, default=1.0)
+    parser.add_argument("--residual-weight", type=float,
+                        help="Defaults to 1 for residual prediction and 0 for epsilon prediction")
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--addition-weight", type=float, default=1.0)
     parser.add_argument("--healthy-weight", type=float, default=1.0)
@@ -310,14 +316,18 @@ def main() -> None:
         args.epochs = 30 if args.phase == "lpcr" else 50
     if args.lr is None:
         args.lr = 1e-3 if args.phase == "lpcr" else 2e-4
+    if args.residual_weight is None:
+        args.residual_weight = 0.0 if args.diffusion_target == "epsilon" else 1.0
     if (args.device != "cuda" or not torch.cuda.is_available() or
             not 0 < args.gate_threshold < 1 or args.epochs < 1 or
             args.batch_size < 1 or args.num_workers < 0 or args.lr <= 0 or
             args.lpcr_sites_per_frame < 7744 or
             args.paper_metrics_every < 1 or args.paper_metrics_frames < 1 or
             not 0 < args.paper_metrics_threshold < 1 or
-            min(args.addition_weight, args.healthy_weight,
+            min(args.residual_weight, args.reconstruction_weight,
+                args.addition_weight, args.healthy_weight,
                 args.ray_hit_weight, args.ray_extra_weight) < 0 or
+            args.phase == "lpcr" and args.diffusion_target != "residual" or
             args.ray_angular_tolerance_deg <= 0 or
             args.ray_lateral_tolerance_m <= 0 or
             args.ray_range_margin_m is not None and args.ray_range_margin_m < 0 or
@@ -347,14 +357,18 @@ def main() -> None:
         stage1, stage1_saved = load_stage1(args.stage1_checkpoint, args.device,
                                             args.radar_variant)
         radius_m = float(stage1_saved.get("radius_m", 3.2))
-    model = SparseResidualStage2().to(args.device)
+    model = SparseResidualStage2(diffusion_target=args.diffusion_target).to(args.device)
     identity = {"version": VERSION,
                 "model_revision": (LPCR_REVISION if args.phase == "lpcr"
+                                   else EPSILON_MODEL_REVISION
+                                   if args.diffusion_target == "epsilon"
                                    else MODEL_REVISION),
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
                 "occupancy_weight": 0.9, "offset_weight": 0.1,
                 "diffusion_objective": (
+                    "epsilon_mse_weighted_lpcr_addition_healthy"
+                    if args.diffusion_target == "epsilon" else
                     "clean_latent_mse_residual_l1_lpcr_addition_healthy"
                     if args.phase == "diffusion" else
                     "clean_latent_mse_residual_l1_lpcr"),
@@ -387,6 +401,11 @@ def main() -> None:
                          "addition_region_stride_zyx": REGION_STRIDE_ZYX,
                          "healthy_min_clean_cells": MIN_CLEAN_CELLS_IN_REGION,
                          "healthy_retained_fraction": HEALTHY_RETAINED_FRACTION})
+        if args.diffusion_target == "epsilon":
+            identity.update({"diffusion_target": "epsilon",
+                             "epsilon_task_weight": "min_1_sqrt_snr",
+                             "epsilon_residual_clip": 2.0,
+                             "epsilon_shared_timestep_per_batch": True})
         if args.ray_hit_weight or args.ray_extra_weight:
             identity.update({"ray_angular_tolerance_deg": args.ray_angular_tolerance_deg,
                              "ray_lateral_tolerance_m": args.ray_lateral_tolerance_m,
@@ -495,9 +514,14 @@ def main() -> None:
         _atomic_save(args.output_root / "last.ckpt", payload)
         if improved:
             _atomic_save(args.output_root / "best.ckpt", payload)
-        diffusion_terms = (f"clean latent MSE={val['clean_latent']:.5f}, "
-                           f"residual L1={val['residual']:.5f}, "
-                           if args.phase == "diffusion" else "")
+        diffusion_terms = (
+            (f"noise MSE={val['noise']:.5f}, "
+             f"derived residual L1={val['residual']:.5f}, "
+             f"task weight={val['task_weight']:.4f}, ")
+            if args.phase == "diffusion" and args.diffusion_target == "epsilon"
+            else (f"clean latent MSE={val['clean_latent']:.5f}, "
+                  f"residual L1={val['residual']:.5f}, ")
+            if args.phase == "diffusion" else "")
         if args.phase == "lpcr":
             print(f"Epoch {epoch:03d}: full-region patch val loss={val['loss']:.5f}, "
                   f"patch IoU={val['sample_iou']:.4f}, "

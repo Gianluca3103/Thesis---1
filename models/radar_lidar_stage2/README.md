@@ -205,6 +205,30 @@ L_addition + L_healthy` with default outer weights of one. R2LDM itself uses
 clean-latent MSE during diffusion; the other terms are this project's additions.
 The 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 
+### Separate epsilon-prediction ablation
+
+`bash scripts/train_stage2_epsilon_ablation.sh` reuses the radar Stage-I
+checkpoint, per-frame 0.25 gate cache, severity-5 fault cache, and full-region
+LPCR checkpoint from `radar_stage2_ray0_20261028`. It saves a separate
+`radar_stage2_epsilon_ray025_20261029` checkpoint; the residual run and its
+loader behavior remain unchanged. Set `SOURCE_RUN` and `OUT` to override these
+defaults. Both modes emit at most one reconstructed centroid per allowed voxel.
+
+For the epsilon mode, the sparse U-Net predicts the sampled Gaussian noise
+`epsilon_hat` instead of the clean-minus-faulty latent residual. The bounded
+residual estimate is recovered as
+`R_hat = clip((R_t - sqrt(1-alpha_bar_t)*epsilon_hat)/sqrt(alpha_bar_t), -2, 2)`;
+the shared LiDAR encoder's tanh output bounds the true residual to this range.
+Training uses `MSE(epsilon_hat, epsilon)` plus the LPCR, addition, healthy,
+and ray losses on `Z_F + R_hat`. Decoded losses are multiplied by
+`min(1, sqrt(alpha_bar_t/(1-alpha_bar_t)))` to control gradients at the noisiest
+steps. One timestep is sampled per epsilon batch so this weight applies to
+every frame in that batch. Direct residual L1 defaults to zero for this run.
+The launch script keeps the two ray weights at 0.25 and verifies the epsilon
+forward, backward, and one-point-per-voxel sampler before training. Epsilon
+checkpoints can be used with `scripts.predict_stage2_sparse` and the existing
+evaluation/export tools through `load_stage2`.
+
 Two optional ray terms are implemented for later ablations. `L_hit` rewards an
 addition at a missing clean return and penalizes earlier unobserved candidate
 cells on its matched ray; `L_extra` penalizes an addition clearly behind the

@@ -28,6 +28,7 @@ def refresh(path: Path, stage2_cache_root: Path | None = None) -> None:
     data.setdefault("overlap_observed_cells", 0)
     data.setdefault("missing_only", False)
     data.setdefault("zero_residual", False)
+    data.setdefault("diffusion_target", "residual")
     if stage2_cache_root is not None:
         split = data["split"]
         frame_id = data["frame"]
