@@ -38,10 +38,21 @@ command -v flock >/dev/null || fail "flock is required"
 mkdir -p "$OUT" "$OUT/matplotlib" "$STAGE2_CACHE"
 exec 9>"$OUT/run.lock"
 flock -n 9 || fail "Another process is using $OUT"
-export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8 MPLCONFIGDIR="$OUT/matplotlib" MPLBACKEND=Agg
 cd "$REPO"
+
+"$PY" -c '
+import sys
+from pathlib import Path
+import models.radar_lidar_stage2.stage2_io as stage2_io
+expected = Path(sys.argv[1]).resolve()
+loaded = Path(stage2_io.__file__).resolve()
+if not loaded.is_relative_to(expected):
+    raise RuntimeError(f"Loaded Stage-II code from {loaded}, expected {expected}")
+print(f"Stage-II code: {loaded}", flush=True)
+' "$REPO"
 
 "$PY" -c '
 import sys, torch
