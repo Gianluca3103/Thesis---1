@@ -47,6 +47,7 @@ class SurfaceStudentConfig:
     evaluation_tolerance_m: float = 0.2
     decoder_from_conditioned: bool = False  # False reloads earlier surface checkpoints.
     pointer_voxel_mode: bool = True  # Old checkpoints reload with this disabled.
+    spherical_offsets: bool = False  # Preserve older per-axis offset checkpoints.
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
@@ -76,6 +77,16 @@ class SurfaceProposals:
     @property
     def score(self) -> torch.Tensor:
         return torch.sigmoid(self.logits)
+
+
+def pointer_xyz_from_offsets(centers: torch.Tensor, raw_offsets: torch.Tensor,
+                             radius_m: float, spherical: bool) -> torch.Tensor:
+    direction = torch.tanh(raw_offsets)
+    if spherical:
+        # The legacy head clipped each axis independently. This norm cap is
+        # required for a true Euclidean association radius.
+        direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1.0)
+    return centers[:, None, :] + direction * radius_m
 
 
 class RadarSurfaceHead(nn.Module):
@@ -169,7 +180,9 @@ class RadarSurfaceHead(nn.Module):
             parts.append((weights[..., None] * values).sum(1))
         hidden = self.hidden(torch.cat(parts, -1))
         raw = self.slots(hidden).reshape(-1, self.config.proposals_per_anchor, 4)
-        xyz = centers[:, None, :] + torch.tanh(raw[..., :3]) * self.config.offset_limit_m
+        xyz = pointer_xyz_from_offsets(
+            centers, raw[..., :3], self.config.offset_limit_m,
+            self.config.spherical_offsets)
         guide = hidden if self.config.pointer_voxel_mode else self.guide(hidden)
         return SurfaceProposals(xyz, raw[..., 3], centers, batch,
                                 F.normalize(guide, dim=-1),
@@ -181,6 +194,7 @@ class RadarSurfaceHead(nn.Module):
 class SurfaceStudentOutput:
     conditioning: SparseSites
     surface: SurfaceProposals
+    full_confidence_field: bool = False
 
     def exported(self) -> dict:
         p = self.surface
@@ -201,6 +215,13 @@ class SurfaceStudentOutput:
         }
         if p.pointer_voxel_mode:
             field = merge_surface_pointers(p)
+            if self.full_confidence_field:
+                exported.update({"confidence_coords": field.coords,
+                                 "confidence_probabilities": field.confidence[:, None],
+                                 "confidence_logits": torch.logit(field.confidence.clamp(1e-6, 1 - 1e-6))[:, None],
+                                 "confidence_radar_support_count": field.source_count,
+                                 "interface_version": "crossmodal_fine_association_v1"})
+                return exported
             selected = field.confidence >= p.selection_threshold
             exported.update({"confidence_coords": field.coords[selected],
                              "confidence_scores": field.confidence[selected],

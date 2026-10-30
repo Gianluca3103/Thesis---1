@@ -8,6 +8,7 @@ import pytest
 from models.radar_lidar_crossmodal_v1.pointer_voxels import merge_surface_pointers
 from models.radar_lidar_crossmodal_v1.surface_student import (
     SurfaceProposals, SurfaceStudentConfig, SurfaceStudentOutput,
+    pointer_xyz_from_offsets,
 )
 from models.radar_lidar_crossmodal_v1.surface_student_loss import (
     SurfaceMetricCounts, surface_metric_counts, surface_student_objective,
@@ -36,6 +37,34 @@ def test_same_radar_source_counts_once_but_two_sources_raise_confidence():
     assert len(two_field.coords) == 1
     assert torch.allclose(two_field.confidence, torch.tensor([.75]))
     assert two_field.source_count.tolist() == [2]
+
+
+def test_fine_association_has_eight_slots_within_euclidean_three_metres():
+    config = SurfaceStudentConfig(proposals_per_anchor=8, anchor_stride=1,
+                                  offset_limit_m=3.0, spherical_offsets=True,
+                                  decoder_from_conditioned=True)
+    assert config.proposals_per_anchor == 8
+    centers = torch.tensor([[4.1, 0.1, 0.125], [8.1, 1.1, 0.125]])
+    raw = torch.full((2, 8, 3), 100.0)
+    xyz = pointer_xyz_from_offsets(centers, raw, config.offset_limit_m,
+                                   config.spherical_offsets)
+    assert xyz.shape == (2, 8, 3)
+    assert torch.all(torch.linalg.vector_norm(xyz - centers[:, None], dim=-1)
+                     <= 3.0 + 1e-6)
+
+
+def test_fine_association_exports_all_candidates_and_distinct_radar_votes():
+    center = [.1, .1, .125]
+    proposals = _proposals([[center], [center]], [[0.], [0.]], [0, 0])
+    conditioned = SimpleNamespace(features=torch.ones((1, 64)),
+                                  coords=torch.zeros((1, 4), dtype=torch.long))
+    exported = SurfaceStudentOutput(conditioned, proposals,
+                                    full_confidence_field=True).exported()
+    assert exported["interface_version"] == "crossmodal_fine_association_v1"
+    assert len(exported["confidence_coords"]) == 1
+    assert torch.allclose(exported["confidence_probabilities"],
+                          torch.tensor([[.75]]))
+    assert exported["confidence_radar_support_count"].tolist() == [2]
 
 
 def test_pointer_voxels_never_merge_across_batch_boundaries():

@@ -1,0 +1,19 @@
+{
+  "feature_dim": 64,
+  "pointer_voxel_mode": true,
+  "spherical_offsets": true,
+  "proposals_per_anchor": 8,
+  "anchor_stride": 1,
+  "offset_limit_m": 3.0,
+  "context_radii_m": [0.8, 1.6, 2.4, 3.0],
+  "context_neighbors": 16,
+  "target_radius_m": 3.0,
+  "target_neighbors": 8,
+  "decoder_from_conditioned": true,
+  "bce_weight": 1.0,
+  "dice_weight": 1.0,
+  "hit_weight": 0.5,
+  "hit_scale": 100.0,
+  "threshold": 0.25,
+  "evaluation_tolerance_m": 0.2
+}

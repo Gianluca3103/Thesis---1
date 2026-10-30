@@ -96,6 +96,25 @@ inside the VoD root and refuse to silently replace existing outputs. Set
 
 ## Training status
 
+### Fine radar-to-LiDAR association trial
+
+`scripts/run_fine_association_stage2.sh` initializes a separate Stage-I
+association model from the trained cross-modal radar student. Every active
+radar voxel on the 0.2 × 0.2 × 0.25 m grid has eight learned pointer slots
+within a **Euclidean 3 m radius**. During training, each slot has a nearest
+clean-LiDAR voxel target within that radius when one exists. The pointer
+confidence loss uses observed occupancy and verified free space. At inference
+the model receives radar only; clean LiDAR is never used to choose candidate
+coordinates. Duplicate slots from one radar voxel count once. Distinct radar
+voxels combine their probabilities with noisy OR, so repeated support raises
+the probability of a unique target voxel. Stage II reads the full merged map
+and applies its gate threshold before allocating active reconstruction sites.
+
+The trial writes new Stage-I weights, a checkpoint-specific Stage-II gate
+cache, and new diffusion weights. It reuses aligned raw frames, the full-region
+LiDAR LPCR checkpoint, and the existing severe-fault cache. The original
+cross-modal student and its checkpoints remain available for comparison.
+
 Phase 0 uses a masked child-distribution objective to train two independent
 native Stage-I encoders and their 128→64 adapters. The loss mask now matches
 the masked input's stride-8 cells. The teacher and student use only the saved
