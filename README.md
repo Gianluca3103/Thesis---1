@@ -100,14 +100,18 @@ inside the VoD root and refuse to silently replace existing outputs. Set
 
 `scripts/run_fine_association_stage2.sh` initializes a separate Stage-I
 association model from the trained cross-modal radar student. Every active
-radar voxel on the 0.2 × 0.2 × 0.25 m grid has eight learned pointer slots
+radar voxel on the 0.2 × 0.2 × 0.25 m grid has up to 32 learned pointer slots
 within a **Euclidean 3 m radius**. During training, each slot has a nearest
 clean-LiDAR voxel target within that radius when one exists. The pointer
 confidence loss uses observed occupancy and verified free space. At inference
 the model receives radar only; clean LiDAR is never used to choose candidate
 coordinates. Duplicate slots from one radar voxel count once. Distinct radar
 voxels combine their probabilities with noisy OR, so repeated support raises
-the probability of a unique target voxel. Stage II reads the full merged map
+the probability of a unique target voxel. If an earlier trained eight-slot
+checkpoint is available, the runner copies its radar representation and first
+eight slots before training the additional 24; otherwise it initializes from
+the cross-modal radar student. The eight-slot checkpoints remain loadable for
+comparison. Stage II reads the full merged map
 and applies its gate threshold before allocating active reconstruction sites.
 
 The trial writes new Stage-I weights, a checkpoint-specific Stage-II gate

@@ -51,7 +51,7 @@ class SurfaceStudentConfig:
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
-                or (self.pointer_voxel_mode and self.proposals_per_anchor > 24)
+                or (self.pointer_voxel_mode and self.proposals_per_anchor > 32)
                 or self.anchor_stride not in (1, 2, 4, 8) or self.context_neighbors < 1
                 or self.target_neighbors < 1 or len(self.context_radii_m) != 4
                 or min(self.context_radii_m) <= 0

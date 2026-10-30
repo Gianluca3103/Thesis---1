@@ -30,7 +30,7 @@ from models.radar_lidar_crossmodal_v1.train_teacher import _hash, _move
 
 
 def association_loss(output, clean, clean_valid, radius_m: float):
-    """Eight nearest clean voxel centers within 3 m supervise radar slots.
+    """Nearest clean voxel centers within 3 m supervise up to 32 radar slots.
 
     Correspondences exist during training only. Inference emits learned
     radar-only pointers and cannot inspect clean LiDAR coordinates.
@@ -126,11 +126,12 @@ def run_epoch(model, loader, device, *, optimizer=None, association_weight=0.2,
 
 
 def save(path, model, optimizer, scheduler, source, source_path, source_hash,
-         epoch, validation, association_weight, *, resumable=True):
+         epoch, validation, association_weight, warm_start_hash, *, resumable=True):
     payload = checkpoint_payload(model, source=source, source_path=source_path,
                                  epoch=epoch, validation=validation)
     payload["source_student_sha256"] = source_hash
     payload["association_weight"] = association_weight
+    payload["initial_eight_slot_sha256"] = warm_start_hash
     if resumable:
         payload["optimizer"] = optimizer.state_dict()
         payload["scheduler"] = scheduler.state_dict()
@@ -146,10 +147,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--source-student", type=Path, required=True)
+    parser.add_argument("--initialize-from-association", type=Path,
+                        help="Optional trained eight-slot checkpoint for a 32-slot warm start")
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path(
-        "configs/crossmodal_fine_association_3m8.json"))
+        "configs/crossmodal_fine_association_3m32.json"))
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -177,6 +180,15 @@ def main():
     source_hash = _hash(args.source_student)
     model = FineAssociationStudent(config)
     model.initialize_from_student(source)
+    warm_start_hash = None
+    if args.initialize_from_association and not args.resume:
+        prior = torch.load(args.initialize_from_association, map_location="cpu",
+                           weights_only=False)
+        model.initialize_from_eight_slot_checkpoint(prior, source_hash)
+        warm_start_hash = _hash(args.initialize_from_association)
+        del prior
+        print(f"Initialized first eight slots from {args.initialize_from_association}",
+              flush=True)
     source_meta = {"radar_variant": variant, "lidar_fov": source.get("lidar_fov")}
     del source  # Source checkpoint may also contain large optimizer states.
     model.to(args.device)
@@ -209,6 +221,7 @@ def main():
         model.load_state_dict(saved["model"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
         scheduler.load_state_dict(saved["scheduler"])
+        warm_start_hash = saved.get("initial_eight_slot_sha256")
         start = saved["epoch"] + 1
     elif history.exists():
         parser.error("Existing metrics require --resume or a new output directory")
@@ -229,18 +242,18 @@ def main():
         scheduler.step()
         record = {"epoch": epoch, "train": training, "val": validation,
                   "threshold": config.threshold, "radius_m": 3.0,
-                  "slots_per_radar_voxel": 8}
+                  "slots_per_radar_voxel": config.proposals_per_anchor}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         save(args.output_root / "last.ckpt", model, optimizer, scheduler,
              source_meta, args.source_student, source_hash, epoch, validation,
-             args.association_weight)
+             args.association_weight, warm_start_hash)
         score = validation["iou_exact"] or 0.0
         if score > best:
             best = score
             save(args.output_root / "best.ckpt", model, optimizer, scheduler,
                  source_meta, args.source_student, source_hash, epoch, validation,
-                 args.association_weight, resumable=False)
+                 args.association_weight, warm_start_hash, resumable=False)
         print(f"Epoch {epoch:03d}: train {training['loss_total']:.4f}, "
               f"val {validation['loss_total']:.4f}, IoU exact "
               f"{validation['iou_exact']}, recall "

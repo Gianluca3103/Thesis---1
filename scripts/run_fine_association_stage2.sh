@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# New Stage-I 3 m / eight-pointer trial and its own Stage-II gate/diffusion.
+# New Stage-I 3 m / 32-pointer trial and its own Stage-II gate/diffusion.
 # Reuses only the aligned raw frames, trained full-region LPCR, and fault cache.
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BASE=${BASE:-/mnt/3D10B36523559581/Gianluca}
@@ -13,7 +13,9 @@ RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SOURCE_STUDENT=${SOURCE_STUDENT:-$SOURCE_RUN/crossmodal/full/student/best_radar_iou.ckpt}
 LPCR_CKPT=${LPCR_CKPT:-$SOURCE_RUN/lpcr/best.ckpt}
 SOURCE_STAGE2=${SOURCE_STAGE2:-$SOURCE_RUN/stage2/diffusion/best.ckpt}
-OUT=${OUT:-$DATA/fine_association_3m8_20261030}
+OUT=${OUT:-$DATA/fine_association_3m32_20261030}
+CONFIG=${CONFIG:-$REPO/configs/crossmodal_fine_association_3m32.json}
+INITIAL_ASSOCIATION=${INITIAL_ASSOCIATION-$DATA/fine_association_3m8_20261030/stage1/best.ckpt}
 WORKERS=${WORKERS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
 DIFF_BATCH_SIZE=${DIFF_BATCH_SIZE:-16}
@@ -43,14 +45,20 @@ fi
 VARIANT=$("$PY" -c 'import sys,torch; print(torch.load(sys.argv[1],map_location="cpu",weights_only=False)["radar_variant"])' "$SOURCE_STUDENT")
 printf 'Radar: %s\nSource student: %s\nFog cache: %s\nOutput: %s\n' \
   "$VARIANT" "$SOURCE_STUDENT" "$FOG_CACHE" "$OUT"
+warm_start=()
+if [[ -n "$INITIAL_ASSOCIATION" && -s "$INITIAL_ASSOCIATION" ]]; then
+  warm_start=(--initialize-from-association "$INITIAL_ASSOCIATION")
+  printf 'Warm start: %s\n' "$INITIAL_ASSOCIATION"
+fi
 
 smoke=$OUT/smoke_stage1
 if [[ ! -s "$smoke/last.ckpt" ]]; then
   "$PY" -u -m scripts.train_fine_association_stage1 \
     --vod-root "$VOD" --source-student "$SOURCE_STUDENT" \
     --data-cache-root "$RAW" --output-root "$smoke" \
-    --epochs 1 --train-limit 2 --val-limit 2 \
-    --batch-size 2 --num-workers 2 --device cuda
+    --config "$CONFIG" --epochs 1 --train-limit "$BATCH_SIZE" \
+    --val-limit 1 --batch-size "$BATCH_SIZE" --num-workers 2 \
+    --device cuda "${warm_start[@]}"
 fi
 "$PY" - "$smoke/last.ckpt" "$VOD" "$RAW" "$VARIANT" <<'PY'
 import sys
@@ -70,7 +78,7 @@ with torch.no_grad():
     output = stage1_frame(model, radar, saved["radius_m"])
 distance = torch.linalg.vector_norm(
     proposals.xyz - proposals.anchor_xyz[:, None], dim=-1)
-assert proposals.xyz.shape[1] == 8
+assert proposals.xyz.shape[1] == 32
 assert not len(distance) or bool((distance <= 3.0 + 1e-5).all())
 assert len(output["confidence_coords"]) == len(output["confidence_probabilities"])
 assert output["interface_version"] == "crossmodal_fine_association_v1"
@@ -87,9 +95,9 @@ elif [[ -e "$stage1/metrics.jsonl" ]]; then
 fi
 "$PY" -u -m scripts.train_fine_association_stage1 \
   --vod-root "$VOD" --source-student "$SOURCE_STUDENT" \
-  --data-cache-root "$RAW" --output-root "$stage1" \
+  --data-cache-root "$RAW" --output-root "$stage1" --config "$CONFIG" \
   --epochs 25 --batch-size "$BATCH_SIZE" --num-workers "$WORKERS" \
-  --device cuda "${resume[@]}" 2>&1 | tee -a "$OUT/stage1.log"
+  --device cuda "${warm_start[@]}" "${resume[@]}" 2>&1 | tee -a "$OUT/stage1.log"
 [[ -s "$stage1/best.ckpt" ]] || fail "No best fine-association checkpoint"
 
 gate_cache=$OUT/stage2_gate

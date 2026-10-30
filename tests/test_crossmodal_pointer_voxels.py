@@ -39,18 +39,30 @@ def test_same_radar_source_counts_once_but_two_sources_raise_confidence():
     assert two_field.source_count.tolist() == [2]
 
 
-def test_fine_association_has_eight_slots_within_euclidean_three_metres():
-    config = SurfaceStudentConfig(proposals_per_anchor=8, anchor_stride=1,
+def test_fine_association_has_thirty_two_slots_within_euclidean_three_metres():
+    config = SurfaceStudentConfig(proposals_per_anchor=32, anchor_stride=1,
                                   offset_limit_m=3.0, spherical_offsets=True,
                                   decoder_from_conditioned=True)
-    assert config.proposals_per_anchor == 8
+    assert config.proposals_per_anchor == 32
     centers = torch.tensor([[4.1, 0.1, 0.125], [8.1, 1.1, 0.125]])
-    raw = torch.full((2, 8, 3), 100.0)
+    raw = torch.full((2, 32, 3), 100.0)
     xyz = pointer_xyz_from_offsets(centers, raw, config.offset_limit_m,
                                    config.spherical_offsets)
-    assert xyz.shape == (2, 8, 3)
+    assert xyz.shape == (2, 32, 3)
     assert torch.all(torch.linalg.vector_norm(xyz - centers[:, None], dim=-1)
                      <= 3.0 + 1e-6)
+
+
+def test_one_radar_voxel_can_select_thirty_two_distinct_lidar_voxels():
+    locations = [[5.1 + .2 * x, 5.1 + .2 * y, .125 + .25 * z]
+                 for z in range(2) for y in range(4) for x in range(4)]
+    proposal = SurfaceProposals(
+        torch.tensor([locations]), torch.zeros((1, 32)),
+        torch.tensor([[5.1, 5.1, .125]]), torch.zeros(1, dtype=torch.long),
+        torch.ones((1, 32)), max_voxel_center_distance_m=3.0)
+    field = merge_surface_pointers(proposal)
+    assert len(field.coords) == 32
+    assert field.source_count.tolist() == [1] * 32
 
 
 def test_fine_association_exports_all_candidates_and_distinct_radar_votes():
