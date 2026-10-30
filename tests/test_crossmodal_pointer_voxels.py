@@ -67,6 +67,18 @@ def test_fine_association_exports_all_candidates_and_distinct_radar_votes():
     assert exported["confidence_radar_support_count"].tolist() == [2]
 
 
+def test_fine_association_rejects_destination_voxel_center_beyond_three_metres():
+    anchor = torch.tensor([[.1, .1, .125]])
+    # The pointer is 2.97 m from its radar anchor; its destination cell
+    # center is 3.11 m away after voxelization.
+    pointer = torch.tensor([[[2.2, 2.2, .125]]])
+    proposal = SurfaceProposals(pointer, torch.zeros((1, 1)), anchor,
+                                torch.zeros(1, dtype=torch.long),
+                                torch.ones((1, 32)),
+                                max_voxel_center_distance_m=3.0)
+    assert len(merge_surface_pointers(proposal).coords) == 0
+
+
 def test_pointer_voxels_never_merge_across_batch_boundaries():
     center = [.1, .1, .125]
     field = merge_surface_pointers(_proposals([[center], [center]], [[0.], [0.]],

@@ -73,6 +73,7 @@ class SurfaceProposals:
     guide: torch.Tensor  # learned radar-only features for optional interpolation
     pointer_voxel_mode: bool = True
     selection_threshold: float = 0.25
+    max_voxel_center_distance_m: float | None = None
 
     @property
     def score(self) -> torch.Tensor:
@@ -187,7 +188,9 @@ class RadarSurfaceHead(nn.Module):
         return SurfaceProposals(xyz, raw[..., 3], centers, batch,
                                 F.normalize(guide, dim=-1),
                                 self.config.pointer_voxel_mode,
-                                self.config.threshold)
+                                self.config.threshold,
+                                self.config.offset_limit_m
+                                if self.config.spherical_offsets else None)
 
 
 @dataclass

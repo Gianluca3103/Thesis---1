@@ -40,6 +40,14 @@ def merge_surface_pointers(proposals) -> PointerVoxelField:
     cell_xyz = torch.floor((xyz - origin) / size).long()
     shape_xyz = cell_xyz.new_tensor(GRID.shape_zyx[::-1])
     inside = torch.isfinite(xyz).all(-1) & ((cell_xyz >= 0) & (cell_xyz < shape_xyz)).all(-1)
+    if proposals.max_voxel_center_distance_m is not None:
+        # The continuous pointer can be inside the support ball while its
+        # destination voxel center lies just outside it. Association is to
+        # the voxel, so enforce the radius on that center too.
+        voxel_centers = origin + (cell_xyz.to(xyz.dtype) + 0.5) * size
+        distance = torch.linalg.vector_norm(
+            voxel_centers - proposals.anchor_xyz[source], dim=-1)
+        inside &= distance <= proposals.max_voxel_center_distance_m + 1e-6
     xyz, strength, source, batch, cell_xyz = (
         item[inside] for item in (xyz, strength, source, batch, cell_xyz))
     if not len(xyz):
