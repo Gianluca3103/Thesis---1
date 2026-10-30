@@ -7,8 +7,10 @@ shows the decoder's full candidate domain. Clean LiDAR is display-only.
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import json
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
@@ -18,6 +20,8 @@ from models.radar_lidar_stage1.radar_fov import (
     RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M,
 )
 from models.radar_lidar_crossmodal_v1.meta_occupancy import radar_only_probability_map
+from models.radar_lidar_crossmodal_v1.fine_association import (
+    VERSION as FINE_ASSOCIATION_VERSION, load_fine_association)
 from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
     VERSION as META_VERSION, load_meta_student,
 )
@@ -49,7 +53,8 @@ def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None
 def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
                 *, checkpoint_uses_fov: bool,
-                support_radius_m: float | None = None) -> None:
+                support_radius_m: float | None = None,
+                support_basis: str = "radar point") -> None:
     clouds = [
         {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
         {"name": "Clean LiDAR in forward radar sector", "xyz": np.round(lidar, 3).tolist()},
@@ -64,6 +69,7 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                          "radar_max_range_m": RADAR_MAX_RANGE_M,
                          "checkpoint_uses_fov": checkpoint_uses_fov,
                          "support_radius_m": support_radius_m,
+                         "support_basis": support_basis,
                          "minimum": minimum, "maximum": maximum},
                         separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
@@ -93,7 +99,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 (() => {
 const data=JSON.parse(document.getElementById('data').textContent), panes=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${data.frame} · student epoch ${data.epoch}`;
-document.getElementById('map-note').textContent=`Raw radar-only confidence at fine voxel centers${data.support_radius_m===null?'':` within ${data.support_radius_m.toFixed(1)} m of a radar point`}. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.`;
+document.getElementById('map-note').textContent=`Raw radar-only confidence at fine voxel centers${data.support_radius_m===null?'':` within ${data.support_radius_m.toFixed(1)} m of a ${data.support_basis}`}. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.`;
 document.getElementById('range-note').textContent=`Clean LiDAR reference: ${data.clouds[1].xyz.length.toLocaleString()} points in the calibrated forward sector (±${data.radar_half_fov_deg.toFixed(0)}° azimuth, up to ${data.radar_max_range_m.toFixed(0)} m). This is a fixed crop, not measured free space or per-frame radar visibility.${data.checkpoint_uses_fov?'':' This checkpoint predates the training crop; the green reference is cropped for display only.'}`;
 const canvases=[], headings=[];
 for(const cloud of data.clouds){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');
@@ -143,6 +149,8 @@ def main() -> None:
     parser.add_argument("--frame-id", nargs="+")
     parser.add_argument("--limit", type=int, default=5,
                         help="Number of split frames to render when --frame-id is omitted")
+    parser.add_argument("--random-seed", type=int,
+                        help="Select random split frames rather than the first frames")
     parser.add_argument("--all-candidates", action="store_true",
                         help="Show every decoder candidate before the radar-support filter")
     parser.add_argument("--output-root", type=Path, required=True)
@@ -153,10 +161,11 @@ def main() -> None:
     version = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("version")
     meta = version in (META_VERSION, META_VERSION + "_student")
     auto = version in (RADAR_AUTO_VERSION, RADAR_AUTO_VERSION + "_student")
+    fine = version == FINE_ASSOCIATION_VERSION
     if args.all_candidates and not (meta or auto):
         parser.error("--all-candidates applies to meta or radar autoencoder checkpoints")
     loader = (load_meta_student if meta else load_radar_autoencoder if auto
-              else load_student)
+              else load_fine_association if fine else load_student)
     student, saved = loader(args.checkpoint, args.device)
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
@@ -164,16 +173,19 @@ def main() -> None:
                                lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
                                lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
     if args.frame_id is None:
-        dataset.frames = dataset.frames[:args.limit]
+        dataset.frames = (random.Random(args.random_seed).sample(
+            dataset.frames, min(args.limit, len(dataset.frames)))
+            if args.random_seed is not None else dataset.frames[:args.limit])
     args.output_root.mkdir(parents=True, exist_ok=True)
     found = {frame.frame_id for frame in dataset.frames}
     if args.frame_id and (missing := set(args.frame_id) - found):
         raise ValueError(f"Frames absent from {args.split}: {sorted(missing)}")
+    written = []
     for row in dataset:
         batch = collate_stage1([row])
         radar_input = batch["radar"].to(args.device)
         radar_valid = batch["radar_valid"].to(args.device)
-        supported_only = (meta or auto) and not args.all_candidates
+        supported_only = (meta or auto or fine) and not args.all_candidates
         if supported_only:
             output = radar_only_probability_map(
                 student, radar_input, radar_valid, saved["radius_m"])
@@ -196,14 +208,34 @@ def main() -> None:
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
                     centers, confidence,
                     checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
-                    support_radius_m=saved["radius_m"] if supported_only else None)
-        support_note = (f", radar support {saved['radius_m']:.1f} m"
+                    support_radius_m=saved["radius_m"] if supported_only else None,
+                    support_basis="radar voxel" if fine else "radar point")
+        support_note = (f", radar-voxel support {saved['radius_m']:.1f} m" if fine
+                        else f", radar support {saved['radius_m']:.1f} m"
                         if supported_only else ", all decoder candidates" if meta or auto else "")
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
               f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
               f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
               f"{support_note} | {html}",
               flush=True)
+        written.append((row["frame_id"], html.name))
+    if written:
+        links = "".join(
+            f'<li><a href="{html_lib.escape(name)}" target="sample">'
+            f'Frame {html_lib.escape(frame_id)}</a></li>'
+            for frame_id, name in written)
+        first = html_lib.escape(written[0][1])
+        index = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
+                 "<title>Stage I confidence samples</title>"
+                 "<style>body{margin:1rem;background:#101820;color:#edf4fa;"
+                 "font:16px system-ui}a{color:#88ceff}"
+                 "iframe{width:100%;height:85vh;border:1px solid #526474}"
+                 "</style><h1>Stage I confidence samples</h1>"
+                 f"<ul>{links}</ul><iframe name=\"sample\" src=\"{first}\" "
+                 "title=\"Confidence sample\"></iframe></html>")
+        index_path = args.output_root / "index.html"
+        index_path.write_text(index, encoding="utf-8")
+        print(f"Open {index_path}", flush=True)
 
 
 if __name__ == "__main__":
