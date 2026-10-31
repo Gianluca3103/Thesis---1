@@ -157,6 +157,21 @@ estimate of distillation quality. A low radar-only oracle recall points to
 candidate location/coverage rather than a confidence threshold. Use matched
 validation frame IDs, threshold, and top-K for the two paths.
 
+For a trained prediction comparison, use
+`scripts/run_fine_distillation_control.sh`. It freezes the source radar and
+teacher representations, then trains three independent 64-slot fine heads
+from identical initial weights: raw radar bottleneck before source-student
+training, radar-only distilled bottleneck, and clean-LiDAR-conditioned teacher
+bottleneck. All heads use the same radar pyramid, clean-LiDAR targets,
+association loss, optimizer, and frame order. Validation is split into a
+threshold-calibration half and a disjoint held-out half. The summary reports
+1 m and 1.6 m radar-region precision, recall, F1, IoU, and oracle candidate
+recall; the viewer shows same-frame raw-versus-distilled and
+teacher-versus-distilled predictions. The teacher is a privileged reference.
+The source student was trained with both distillation and occupancy losses,
+so raw-versus-distilled measures that combined source training, not the
+isolated effect of the distillation loss coefficient.
+
 `scripts.compare_fine_association_edge` is an inference-only Stage-I
 postprocessing comparison for 32- or 64-slot checkpoints. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
