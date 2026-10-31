@@ -39,13 +39,18 @@ def _quality(xyz: np.ndarray, score: np.ndarray, clean: np.ndarray,
 def _write_html(path: Path, frame: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, raw_xyz: np.ndarray, raw_score: np.ndarray,
                 edge_xyz: np.ndarray, edge_score: np.ndarray,
-                *, threshold: float, links: int,
-                audit_clouds: list[dict] | None = None) -> None:
+                *, threshold: float, links: int | None,
+                audit_clouds: list[dict] | None = None,
+                raw_label: str = "Raw predicted surfaces",
+                edge_label: str = "Edge-aware interpolation",
+                page_title: str = "Radar-only surface comparison",
+                description: str | None = None,
+                audit_note: str | None = None) -> None:
     clouds = [{"name": "Radar", "xyz": np.round(radar, 3).tolist()},
               {"name": "Clean LiDAR", "xyz": np.round(lidar, 3).tolist()},
-              {"name": "Raw predicted surfaces", "xyz": np.round(raw_xyz, 3).tolist(),
+              {"name": raw_label, "xyz": np.round(raw_xyz, 3).tolist(),
                "score": np.round(raw_score, 4).tolist()},
-              {"name": "Edge-aware interpolation", "xyz": np.round(edge_xyz, 3).tolist(),
+              {"name": edge_label, "xyz": np.round(edge_xyz, 3).tolist(),
                "score": np.round(edge_score, 4).tolist()}]
     if audit_clouds:
         clouds.extend(audit_clouds)
@@ -53,7 +58,11 @@ def _write_html(path: Path, frame: str, epoch: int, radar: np.ndarray,
     combined = np.concatenate(nonempty) if nonempty else np.zeros((1, 3))
     packed = json.dumps({"frame": frame, "epoch": epoch, "clouds": clouds,
                          "threshold": threshold, "links": links,
-                         "audit_note": ("Audit panels use the fixed export threshold. Green: one-to-one clean match within 0.2 m; red: unmatched prediction; blue: missed clean voxel. The slider changes only the raw and edge panels."
+                         "page_title": page_title,
+                         "description": (description if description is not None else
+                                         "Radar-only model output: predicted surface locations and scores. Pointer-decoder checkpoints merge duplicate fine voxels and combine radar support. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap."),
+                         "audit_note": (audit_note if audit_note is not None else
+                                        "Audit panels use the fixed export threshold. Green: one-to-one clean match within 0.2 m; red: unmatched prediction; blue: missed clean voxel. The slider changes only the raw and edge panels."
                                         if audit_clouds else ""),
                          "minimum": combined.min(0).tolist(),
                          "maximum": combined.max(0).tolist()},
@@ -68,13 +77,14 @@ input[type=range]{width:230px}button{background:#253847;color:inherit;border:1px
 section{min-width:0;background:#182633;border:1px solid #3b5164;padding:5px;border-radius:5px}
 h2{font-size:12px;margin:0 0 5px;min-height:30px}canvas{width:100%;height:69vh;min-height:420px;background:#0c1620;touch-action:none;cursor:grab}
 @media(max-width:1000px){.panels{grid-template-columns:repeat(2,minmax(0,1fr))}canvas{height:48vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only model output: predicted surface locations and scores. Pointer-decoder checkpoints merge duplicate fine voxels and combine radar support. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap.</p><p id="audit-note"></p>
+</style><h1 id="title"></h1><p id="description"></p><p id="audit-note"></p>
 <p id="links"></p><div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><p>Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one metric camera.</p>
 <script id="data" type="application/json">__DATA__</script><script>
 (()=>{const d=JSON.parse(document.getElementById('data').textContent),root=document.getElementById('panels');
-document.getElementById('title').textContent=`Frame ${d.frame} · surface student epoch ${d.epoch}`;
-document.getElementById('links').textContent=`Edge-aware accepted links: ${d.links.toLocaleString()}`;
+document.getElementById('title').textContent=`Frame ${d.frame} · ${d.page_title} · epoch ${d.epoch}`;
+document.getElementById('description').textContent=d.description;
+document.getElementById('links').textContent=d.links===null?'':`Edge-aware accepted links: ${d.links.toLocaleString()}`;
 document.getElementById('audit-note').textContent=d.audit_note;
 const panels=d.clouds.map(cloud=>{const s=document.createElement('section'),h=document.createElement('h2'),c=document.createElement('canvas');s.append(h,c);root.append(s);return {h,c,cloud};});
 const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.value=d.threshold;

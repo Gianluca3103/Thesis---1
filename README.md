@@ -146,6 +146,17 @@ fixed-frame cache, and exports a top/side overlay separating current from
 historical radar returns. The nearest-LiDAR distances are diagnostic only;
 radar detections can legitimately differ from LiDAR surfaces.
 
+Use `scripts.audit_fine_association_distillation` with the 64-slot checkpoint
+to compare a teacher-conditioned feature swap against the radar-only
+prediction through the **same trained surface head**. The JSON reports
+thresholded precision/recall and oracle candidate recall at 0.2 m, where the
+oracle ignores confidence but does not invent additional candidates. The
+teacher consumes clean LiDAR and has no independently trained fine-voxel head;
+its map is a feature-swap diagnostic, not a deployable prediction or a causal
+estimate of distillation quality. A low radar-only oracle recall points to
+candidate location/coverage rather than a confidence threshold. Use matched
+validation frame IDs, threshold, and top-K for the two paths.
+
 `scripts.compare_fine_association_edge` is an inference-only Stage-I
 postprocessing comparison for 32- or 64-slot checkpoints. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
