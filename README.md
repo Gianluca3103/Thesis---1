@@ -119,6 +119,14 @@ cache, and new diffusion weights. It reuses aligned raw frames, the full-region
 LiDAR LPCR checkpoint, and the existing severe-fault cache. The original
 cross-modal student and its checkpoints remain available for comparison.
 
+`scripts.compare_fine_association_edge` is an inference-only Stage-I
+postprocessing comparison for the 32-slot checkpoint. It interpolates between
+high-confidence candidate voxels only when nearby radar features and scores
+agree, then removes any resulting voxel more than 3 m from an active fine
+radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
+clean-scan IoU/F1 at the same confidence threshold and at matched predicted
+cell counts. It does not alter the Stage-II gate or diffusion checkpoint.
+
 Phase 0 uses a masked child-distribution objective to train two independent
 native Stage-I encoders and their 128→64 adapters. The loss mask now matches
 the masked input's stride-8 cells. The teacher and student use only the saved
