@@ -16,6 +16,8 @@ import random
 
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import maximum_bipartite_matching
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -24,11 +26,12 @@ from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.radar_fov import (
     RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M)
 from models.radar_lidar_stage1.sparse import voxelize
+from models.radar_lidar_stage2.candidate_domain import voxel_centers_xyz
 from models.radar_lidar_crossmodal_v1.edge_aware_surface import edge_aware_surface
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.fine_association import load_fine_association
 from models.radar_lidar_crossmodal_v1.meta_occupancy import (
-    scan_overlap_counts_observed, scan_overlap_rates)
+    SCAN_TOLERANCE_M, scan_overlap_counts_observed, scan_overlap_rates)
 from models.radar_lidar_crossmodal_v1.pointer_voxels import merge_surface_pointers
 from scripts.compare_crossmodal_surface import _write_html
 from scripts.visualize_crossmodal_student import _write_ply
@@ -102,6 +105,39 @@ def _metrics(coords: torch.Tensor, scores: np.ndarray, clean_coords: torch.Tenso
                                    if counts["predicted"] else None),
             "recall_at_0_2m": (counts["tp_at_0_2m"] / counts["observed"]
                                 if counts["observed"] else None)}
+
+
+def _audit_cloud(name: str, predicted: torch.Tensor, observed: torch.Tensor,
+                 expected_tp: int) -> dict:
+    """Color the same one-to-one 0.2 m voxel matches used by the sweep."""
+    pred_xyz = voxel_centers_xyz(predicted, GRID).numpy()
+    obs_xyz = voxel_centers_xyz(observed, GRID).numpy()
+    matched_pred = np.zeros(len(pred_xyz), dtype=np.bool_)
+    matched_obs = np.zeros(len(obs_xyz), dtype=np.bool_)
+    if len(pred_xyz) and len(obs_xyz):
+        edges = cKDTree(pred_xyz).sparse_distance_matrix(
+            cKDTree(obs_xyz), max_distance=SCAN_TOLERANCE_M + 1e-6,
+            output_type="coo_matrix")
+        if edges.nnz:
+            graph = csr_matrix((np.ones(edges.nnz, dtype=np.int8),
+                                (edges.row, edges.col)),
+                               shape=(len(pred_xyz), len(obs_xyz)))
+            assignment = maximum_bipartite_matching(graph, perm_type="column")
+            if len(assignment) != len(pred_xyz):
+                raise AssertionError("Expected one assignment per predicted voxel")
+            matched_pred = assignment >= 0
+            matched_obs[assignment[matched_pred]] = True
+    tp = int(matched_pred.sum())
+    if tp != expected_tp:
+        raise AssertionError("Audit overlay and sweep used different 0.2 m matches")
+    # Draw missed clean voxels first so red/green predictions stay visible.
+    xyz = np.concatenate((obs_xyz[~matched_obs], pred_xyz))
+    colors = (["#67aaff"] * int((~matched_obs).sum())
+              + ["#41d17d" if match else "#ff6868" for match in matched_pred])
+    return {"name": name, "xyz": np.round(xyz, 3).tolist(),
+            "color": colors,
+            "summary": (f"TP {tp:,} · FP {len(pred_xyz) - tp:,} · "
+                        f"FN {len(obs_xyz) - tp:,}")}
 
 
 def _aggregate(rows: list[dict]) -> dict:
@@ -251,6 +287,9 @@ def main() -> None:
     parser.add_argument("--min-affinity", type=float, default=0.20)
     parser.add_argument("--lattice-stride", type=int, default=2)
     parser.add_argument("--metrics-only", action="store_true")
+    parser.add_argument("--audit-scope", choices=("radar_1m", "radar_3m"),
+                        default="radar_1m",
+                        help="Radar neighborhood shown in the fixed-threshold error panels")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.report_only:
@@ -390,6 +429,8 @@ def _score_frame(frame: dict, args, saved: dict, radius_m: float,
     _add_sweep(sweep_totals, sweep)
     preview = sweep["radar_3m"][args.threshold]
     report = {"frame_id": frame["frame_id"],
+              "scope_preview": {scope: sweep[scope][args.threshold]
+                                for scope in SCOPES},
               "raw": preview["raw"],
               "edge_same_threshold": preview["edge_same_threshold"],
               "edge_matched_raw_count": preview["edge_matched_raw_count"],
@@ -403,10 +444,27 @@ def _score_frame(frame: dict, args, saved: dict, radius_m: float,
         _write_ply(stem.with_name(stem.name + "_raw.ply"), raw_xyz, raw_score)
         _write_ply(stem.with_name(stem.name + "_edge.ply"), edge_xyz, edge_score)
         viewer = stem.with_suffix(".html")
+        scope = args.audit_scope
+        mask = masks[scope]
+        observed = clean_coords[torch.from_numpy(mask["clean"])]
+        raw_selected = raw_coords[torch.from_numpy(
+            mask["raw"] & (raw_score >= args.threshold))]
+        edge_selected = edge_coords[torch.from_numpy(
+            mask["edge"] & (edge_score >= args.threshold))]
+        comparison = sweep[scope][args.threshold]
+        audit_clouds = [
+            _audit_cloud(f"Raw 0.2 m audit · {scope} · threshold {args.threshold:.2f}",
+                         raw_selected, observed,
+                         comparison["raw"]["tp_at_0_2m"]),
+            _audit_cloud(f"Edge 0.2 m audit · {scope} · threshold {args.threshold:.2f}",
+                         edge_selected, observed,
+                         comparison["edge_same_threshold"]["tp_at_0_2m"]),
+        ]
         _write_html(viewer, frame["frame_id"], saved["epoch"],
                     frame["radar"], clean,
                     raw_xyz, raw_score, edge_xyz, edge_score,
-                    threshold=args.threshold, links=edge.accepted_edges)
+                    threshold=args.threshold, links=edge.accepted_edges,
+                    audit_clouds=audit_clouds)
         report["viewer"] = viewer.name
 
 

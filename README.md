@@ -138,6 +138,11 @@ radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
   GPU inference accepts `--batch-size` (default 4) and `--num-workers`
   (default 2); postprocessing and metric matching remain frame-local to avoid
   matching points from different frames. The progress bar counts batches.
+  Visualized frames additionally show fixed-threshold 0.2 m audit panels for
+  raw and edge predictions within `--audit-scope` (1 m radar support by
+  default): green is a one-to-one clean match, red is an unmatched prediction,
+  and blue is a missed clean voxel. Set `--threshold` to the sweep-selected
+  value when comparing a visual sample with the reported score.
   It does not alter the Stage-II gate or diffusion checkpoint.
 
 Phase 0 uses a masked child-distribution objective to train two independent

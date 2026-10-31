@@ -5,7 +5,7 @@ import torch
 from types import SimpleNamespace
 
 from scripts.compare_fine_association_edge import (
-    _add_sweep, _aggregate_sweep, _best_thresholds, _metrics,
+    _add_sweep, _aggregate_sweep, _audit_cloud, _best_thresholds, _metrics,
     _near_radar_voxel, _new_sweep_totals, _print_best_results,
     _scope_masks, _split_batch_outputs, _sweep_frame)
 from models.radar_lidar_crossmodal_v1.encoder import GRID
@@ -55,6 +55,16 @@ def test_batched_forward_outputs_are_split_without_cross_frame_candidates():
     assert frames[1]["groups"].tolist() == [1]
     assert frames[0]["radar"].shape == (1, 3)
     assert frames[1]["clean_points"].shape == (1, 1, 4)
+
+
+def test_audit_overlay_uses_one_to_one_matches_and_shows_unmatched_voxels():
+    predicted = torch.tensor([[0, 8, 256, 256], [0, 8, 256, 257]])
+    observed = torch.tensor([[0, 8, 256, 256], [0, 8, 256, 260]])
+    cloud = _audit_cloud("Raw audit", predicted, observed, expected_tp=1)
+    assert cloud["summary"] == "TP 1 · FP 1 · FN 1"
+    assert cloud["color"].count("#41d17d") == 1
+    assert cloud["color"].count("#ff6868") == 1
+    assert cloud["color"].count("#67aaff") == 1
 
 
 def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):

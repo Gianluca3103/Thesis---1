@@ -172,6 +172,21 @@ def test_view_contains_only_raw_and_edge_confidence_panels(tmp_path):
     assert '"frame":"00405"' in page
 
 
+def test_view_can_show_fixed_threshold_voxel_error_panels(tmp_path):
+    from scripts.compare_crossmodal_surface import _write_html
+
+    path = tmp_path / "audit.html"
+    points = np.array([[0., 0., 0.]])
+    _write_html(path, "00405", 1, points, points, points, np.array([.7]),
+                points, np.array([.7]), threshold=.6, links=0,
+                audit_clouds=[{"name": "Raw audit", "xyz": points.tolist(),
+                               "color": ["#ff6868"], "summary": "TP 0 · FP 1 · FN 1"}])
+    page = path.read_text(encoding="utf-8")
+    assert "Raw audit" in page
+    assert "fixed export threshold" in page
+    assert "#ff6868" in page
+
+
 def test_end_to_end_student_inference_needs_only_radar(tmp_path):
     checkpoint = tmp_path / "radar_encoder.pth"
     torch.save(PreviousStage1Sparse(modality="radar").state_dict(), checkpoint)

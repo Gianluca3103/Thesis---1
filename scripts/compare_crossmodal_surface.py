@@ -39,17 +39,22 @@ def _quality(xyz: np.ndarray, score: np.ndarray, clean: np.ndarray,
 def _write_html(path: Path, frame: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, raw_xyz: np.ndarray, raw_score: np.ndarray,
                 edge_xyz: np.ndarray, edge_score: np.ndarray,
-                *, threshold: float, links: int) -> None:
+                *, threshold: float, links: int,
+                audit_clouds: list[dict] | None = None) -> None:
     clouds = [{"name": "Radar", "xyz": np.round(radar, 3).tolist()},
               {"name": "Clean LiDAR", "xyz": np.round(lidar, 3).tolist()},
               {"name": "Raw predicted surfaces", "xyz": np.round(raw_xyz, 3).tolist(),
                "score": np.round(raw_score, 4).tolist()},
               {"name": "Edge-aware interpolation", "xyz": np.round(edge_xyz, 3).tolist(),
                "score": np.round(edge_score, 4).tolist()}]
+    if audit_clouds:
+        clouds.extend(audit_clouds)
     nonempty = [xyz for xyz in (radar, lidar, raw_xyz, edge_xyz) if len(xyz)]
     combined = np.concatenate(nonempty) if nonempty else np.zeros((1, 3))
     packed = json.dumps({"frame": frame, "epoch": epoch, "clouds": clouds,
                          "threshold": threshold, "links": links,
+                         "audit_note": ("Audit panels use the fixed export threshold. Green: one-to-one clean match within 0.2 m; red: unmatched prediction; blue: missed clean voxel. The slider changes only the raw and edge panels."
+                                        if audit_clouds else ""),
                          "minimum": combined.min(0).tolist(),
                          "maximum": combined.max(0).tolist()},
                         separators=(",", ":")).replace("<", "\\u003c")
@@ -63,20 +68,21 @@ input[type=range]{width:230px}button{background:#253847;color:inherit;border:1px
 section{min-width:0;background:#182633;border:1px solid #3b5164;padding:5px;border-radius:5px}
 h2{font-size:12px;margin:0 0 5px;min-height:30px}canvas{width:100%;height:69vh;min-height:420px;background:#0c1620;touch-action:none;cursor:grab}
 @media(max-width:1000px){.panels{grid-template-columns:repeat(2,minmax(0,1fr))}canvas{height:48vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only model output: predicted surface locations and scores. Pointer-decoder checkpoints merge duplicate fine voxels and combine radar support. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap.</p>
+</style><h1 id="title"></h1><p>Radar-only model output: predicted surface locations and scores. Pointer-decoder checkpoints merge duplicate fine voxels and combine radar support. Edge-aware support uses only those predictions and learned radar features. Clean LiDAR is a reference. Every point is available; the slider filters by score, not a point cap.</p><p id="audit-note"></p>
 <p id="links"></p><div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><p>Drag to rotate; Shift-drag to pan; wheel to zoom. All panels share one metric camera.</p>
 <script id="data" type="application/json">__DATA__</script><script>
 (()=>{const d=JSON.parse(document.getElementById('data').textContent),root=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${d.frame} · surface student epoch ${d.epoch}`;
 document.getElementById('links').textContent=`Edge-aware accepted links: ${d.links.toLocaleString()}`;
+document.getElementById('audit-note').textContent=d.audit_note;
 const panels=d.clouds.map(cloud=>{const s=document.createElement('section'),h=document.createElement('h2'),c=document.createElement('canvas');s.append(h,c);root.append(s);return {h,c,cloud};});
 const slider=document.getElementById('threshold'),value=document.getElementById('value');slider.value=d.threshold;
 const center=d.minimum.map((a,i)=>(a+d.maximum[i])/2),extent=Math.hypot(...d.minimum.map((a,i)=>d.maximum[i]-a))||1;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
 function tint(score){const stops=[[40,98,190],[81,202,209],[255,225,115],[245,104,104]],q=Math.max(0,Math.min(.9999,score))*3,i=Math.floor(q),t=q-i;return `rgb(${stops[i].map((n,k)=>Math.round(n*(1-t)+stops[i+1][k]*t)).join(',')})`;}
 function project(p,w,h,scale){let x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch),u=cy*x-sy*y,depth=sy*x+cy*y;return [w/2+view.panX+u*scale,h/2+view.panY-(cp*z-sp*depth)*scale];}
-function draw(){value.textContent=Number(slider.value).toFixed(2);for(let index=0;index<panels.length;index++){const {h,c,cloud}=panels[index],w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);const ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);const scale=.88*Math.min(w,height)*view.zoom/extent;let shown=0;for(let i=0;i<cloud.xyz.length;i++){if(cloud.score&&cloud.score[i]<Number(slider.value))continue;shown++;const [x,y]=project(cloud.xyz[i],w,height,scale);if(x<0||x>w||y<0||y>height)continue;ctx.fillStyle=index===0?'#ffab40':index===1?'#45b975':tint(cloud.score[i]);let size=index<2?1.3:2;ctx.fillRect(x-size/2,y-size/2,size,size);}h.textContent=`${cloud.name}: ${shown.toLocaleString()} above score / ${cloud.xyz.length.toLocaleString()} total`;}}
+function draw(){value.textContent=Number(slider.value).toFixed(2);for(let index=0;index<panels.length;index++){const {h,c,cloud}=panels[index],w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);const ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);const scale=.88*Math.min(w,height)*view.zoom/extent;let shown=0;for(let i=0;i<cloud.xyz.length;i++){if(cloud.score&&cloud.score[i]<Number(slider.value))continue;shown++;const [x,y]=project(cloud.xyz[i],w,height,scale);if(x<0||x>w||y<0||y>height)continue;ctx.fillStyle=cloud.color?cloud.color[i]:index===0?'#ffab40':index===1?'#45b975':tint(cloud.score[i]);let size=index<2?1.3:2;ctx.fillRect(x-size/2,y-size/2,size,size);}h.textContent=cloud.score?`${cloud.name}: ${shown.toLocaleString()} above score / ${cloud.xyz.length.toLocaleString()} total`:`${cloud.name}: ${shown.toLocaleString()} points${cloud.summary?' · '+cloud.summary:''}`;}}
 let queued=false;function redraw(){if(queued)return;queued=true;requestAnimationFrame(()=>{queued=false;draw();});}
 const active=new Map();for(const {c} of panels){c.addEventListener('pointerdown',e=>{c.setPointerCapture(e.pointerId);active.set(e.pointerId,[e.clientX,e.clientY]);});c.addEventListener('pointermove',e=>{let old=active.get(e.pointerId);if(!old)return;let dx=e.clientX-old[0],dy=e.clientY-old[1];active.set(e.pointerId,[e.clientX,e.clientY]);if(e.shiftKey){view.panX+=dx;view.panY+=dy;}else{view.yaw+=dx*.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*.008));}redraw();});for(let name of ['pointerup','pointercancel'])c.addEventListener(name,e=>active.delete(e.pointerId));c.addEventListener('wheel',e=>{e.preventDefault();view.zoom=Math.max(.1,Math.min(80,view.zoom*Math.exp(-e.deltaY*.001)));redraw();},{passive:false});}
 slider.addEventListener('input',redraw);document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};window.addEventListener('resize',redraw);redraw();})();
