@@ -124,8 +124,15 @@ postprocessing comparison for the 32-slot checkpoint. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
 agree, then removes any resulting voxel more than 3 m from an active fine
 radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
-clean-scan IoU/F1 at the same confidence threshold and at matched predicted
-cell counts. It does not alter the Stage-II gate or diffusion checkpoint.
+  clean-scan precision, recall, IoU and F1 for 1 m and 3 m neighborhoods around
+  active radar voxel centers, plus the full forward-FOV grid as context. The
+  `threshold_sweep.csv` file reports exact and one-to-one 0.2 m tolerant scores
+  across confidence thresholds for raw candidates, edge-aware candidates at
+  the same threshold, and edge-aware candidates matched to the raw cell count
+  within each scope. Local recall counts every clean voxel in that radar
+  neighborhood, including voxels the model did not propose. The HTML preview
+  uses `--threshold` (0.25 by default). It does not alter the Stage-II gate or
+  diffusion checkpoint.
 
 Phase 0 uses a masked child-distribution objective to train two independent
 native Stage-I encoders and their 128→64 adapters. The loss mask now matches
