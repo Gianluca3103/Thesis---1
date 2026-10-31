@@ -51,7 +51,7 @@ class SurfaceStudentConfig:
 
     def __post_init__(self):
         if (self.feature_dim != BOTTLENECK_CHANNELS or self.proposals_per_anchor < 1
-                or (self.pointer_voxel_mode and self.proposals_per_anchor > 32)
+                or (self.pointer_voxel_mode and self.proposals_per_anchor > 64)
                 or self.anchor_stride not in (1, 2, 4, 8) or self.context_neighbors < 1
                 or self.target_neighbors < 1 or len(self.context_radii_m) != 4
                 or min(self.context_radii_m) <= 0
@@ -78,6 +78,21 @@ class SurfaceProposals:
     @property
     def score(self) -> torch.Tensor:
         return torch.sigmoid(self.logits)
+
+    def highest_confidence(self, count: int) -> SurfaceProposals:
+        """Select the strongest slots independently for each radar voxel."""
+        slots = self.logits.shape[1]
+        if count < 1 or count > slots:
+            raise ValueError(f"Requested {count} slots from {slots} per radar voxel")
+        if count == slots:
+            return self
+        chosen = self.logits.topk(count, dim=1, sorted=True).indices
+        xyz = self.xyz.gather(1, chosen[..., None].expand(-1, -1, 3))
+        logits = self.logits.gather(1, chosen)
+        return SurfaceProposals(
+            xyz, logits, self.anchor_xyz, self.anchor_batch, self.guide,
+            self.pointer_voxel_mode, self.selection_threshold,
+            self.max_voxel_center_distance_m)
 
 
 def pointer_xyz_from_offsets(centers: torch.Tensor, raw_offsets: torch.Tensor,
@@ -199,8 +214,9 @@ class SurfaceStudentOutput:
     surface: SurfaceProposals
     full_confidence_field: bool = False
 
-    def exported(self) -> dict:
-        p = self.surface
+    def exported(self, *, top_k_per_anchor: int | None = None) -> dict:
+        p = (self.surface if top_k_per_anchor is None else
+             self.surface.highest_confidence(top_k_per_anchor))
         exported = {
             "conditioning_features": self.conditioning.features,
             "conditioning_coords": self.conditioning.coords,

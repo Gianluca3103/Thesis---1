@@ -1,4 +1,4 @@
-"""Compare raw 32-slot Stage-I probability maps with edge-aware interpolation.
+"""Compare fine-association probability maps with edge-aware interpolation.
 
 This is an inference-only postprocessing experiment. Clean LiDAR is used for
 validation metrics and display, never for interpolation or candidate choice.
@@ -282,6 +282,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--top-k", type=int, choices=(32, 48, 64),
+                        help="Keep this many highest-confidence slots per radar voxel before merging")
     parser.add_argument("--thresholds", nargs="+", type=float,
                         default=DEFAULT_THRESHOLDS,
                         help="Confidence thresholds for the regional metric sweep")
@@ -315,8 +317,11 @@ def main() -> None:
     student, saved = load_fine_association(args.checkpoint, args.device)
     if saved.get("lidar_fov") != RADAR_FOV_SPEC:
         raise ValueError("Checkpoint and clean-LiDAR validation sector differ")
-    if saved["config"]["proposals_per_anchor"] != 32:
-        raise ValueError("Expected the 32-candidate fine-association checkpoint")
+    trained_slots = int(saved["config"]["proposals_per_anchor"])
+    if trained_slots not in (32, 64):
+        raise ValueError("Expected a 32- or 64-candidate fine-association checkpoint")
+    if args.top_k is not None and args.top_k > trained_slots:
+        parser.error(f"--top-k {args.top_k} exceeds the checkpoint's {trained_slots} slots")
     radius_m = float(saved["radius_m"])
     dataset = VoDStage1Dataset(
         args.vod_root, args.split, radar_variant=saved["radar_variant"],
@@ -341,7 +346,8 @@ def main() -> None:
                     dynamic_ncols=True):
         output = student(batch["radar"].to(args.device, non_blocking=True),
                          batch["radar_valid"].to(args.device, non_blocking=True))
-        surface = output.surface
+        surface = (output.surface if args.top_k is None else
+                   output.surface.highest_confidence(args.top_k))
         field = merge_surface_pointers(surface)
         for frame in _split_batch_outputs(batch, surface, field):
             _score_frame(frame, args, saved, radius_m, thresholds,
@@ -354,7 +360,9 @@ def main() -> None:
                "batch_size": args.batch_size, "num_workers": args.num_workers,
                "radius_m": radius_m,
                "primary_scope": ("radar_1_6m" if radius_m == 1.6 else "radar_3m"),
-               "slots_per_radar_voxel": 32,
+               "slots_per_radar_voxel": trained_slots,
+               "trained_slots_per_radar_voxel": trained_slots,
+               "selected_slots_per_radar_voxel": args.top_k or trained_slots,
                "threshold": args.threshold, "sweep_thresholds": thresholds,
                "edge_parameters": {"seed_threshold": args.edge_seed_threshold,
                                    "max_link_m": args.max_link_m,

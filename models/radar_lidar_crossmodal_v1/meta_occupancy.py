@@ -172,9 +172,16 @@ def scan_overlap_rates(counts: dict[str, int]) -> dict[str, float | None]:
 
 @torch.no_grad()
 def radar_only_probability_map(student: nn.Module, radar: torch.Tensor,
-                               radar_valid: torch.Tensor, radius_m: float = 3.2):
+                               radar_valid: torch.Tensor, radius_m: float = 3.2,
+                               *, top_k_per_anchor: int | None = None):
     """Inference output excludes unsupervised candidates outside radar support."""
-    output = student(radar, radar_valid).exported()
+    prediction = student(radar, radar_valid)
+    if top_k_per_anchor is None:
+        output = prediction.exported()
+    else:
+        if not getattr(prediction, "full_confidence_field", False):
+            raise ValueError("Top-K pointer filtering requires fine association")
+        output = prediction.exported(top_k_per_anchor=top_k_per_anchor)
     if output.get("interface_version") == "crossmodal_fine_association_v1":
         trained_radius_m = student.config.target_radius_m
         if abs(radius_m - trained_radius_m) > 1e-6:

@@ -79,6 +79,28 @@ def test_fine_association_exports_all_candidates_and_distinct_radar_votes():
     assert exported["confidence_radar_support_count"].tolist() == [2]
 
 
+def test_top_k_keeps_each_radar_voxels_strongest_slot_before_merging():
+    cells = [[.1, .1, .125], [.3, .1, .125], [.5, .1, .125]]
+    proposals = _proposals([cells, cells],
+                           [[-4., 4., -2.], [5., -3., 2.]], [0, 0])
+    top = proposals.highest_confidence(1)
+    assert top.xyz.shape == (2, 1, 3)
+    torch.testing.assert_close(top.xyz[0, 0], proposals.xyz[0, 1])
+    torch.testing.assert_close(top.xyz[1, 0], proposals.xyz[1, 0])
+    field = merge_surface_pointers(top)
+    assert len(field.coords) == 2
+    assert field.source_count.tolist() == [1, 1]
+    conditioned = SimpleNamespace(features=torch.ones((1, 64)),
+                                  coords=torch.zeros((1, 4), dtype=torch.long))
+    exported = SurfaceStudentOutput(conditioned, proposals,
+                                    full_confidence_field=True).exported(
+                                        top_k_per_anchor=1)
+    assert exported["surface_xyz"].shape == (2, 1, 3)
+    assert len(exported["confidence_coords"]) == 2
+    with pytest.raises(ValueError):
+        proposals.highest_confidence(4)
+
+
 def test_fine_association_rejects_destination_voxel_center_beyond_three_metres():
     anchor = torch.tensor([[.1, .1, .125]])
     # The pointer is 2.97 m from its radar anchor; its destination cell

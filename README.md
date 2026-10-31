@@ -130,8 +130,17 @@ frame cache, runs a full validation threshold sweep, and writes five audit
 viewers under a separate output directory. Its checkpoint does not replace
 the 3 m model or its Stage-II gate cache.
 
+For 64 slots within 1.6 m, run
+`scripts/run_fine_association_1p6m64_stage1.sh`. It trains one 64-slot
+checkpoint and evaluates its full map by default. Set `TOP_K=48` or
+`TOP_K=32` when running the script again to keep only the highest-confidence
+48 or 32 slots **per radar voxel**, before duplicate LiDAR voxels and
+multi-radar confidence votes are merged. The trained checkpoint stays the
+same; each filter writes its own sweep and viewer directory. The comparison
+command also accepts `--top-k 32`, `--top-k 48`, or `--top-k 64` directly.
+
 `scripts.compare_fine_association_edge` is an inference-only Stage-I
-postprocessing comparison for the 32-slot checkpoint. It interpolates between
+postprocessing comparison for 32- or 64-slot checkpoints. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
 agree, then removes any resulting voxel beyond the checkpoint's trained
 radius from an active fine

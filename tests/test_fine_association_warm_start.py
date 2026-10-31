@@ -61,6 +61,17 @@ def test_new_thirty_two_slot_trial_caps_pointers_at_one_point_six_metres():
         FineAssociationStudent(replace(config, target_radius_m=3.0))
 
 
+def test_sixty_four_slot_trial_keeps_the_one_point_six_metre_radius():
+    config = SurfaceStudentConfig(
+        proposals_per_anchor=64, target_neighbors=64,
+        anchor_stride=1, offset_limit_m=1.6, target_radius_m=1.6,
+        context_radii_m=(0.8, 1.6, 2.4, 3.0),
+        spherical_offsets=True, decoder_from_conditioned=True)
+    model = FineAssociationStudent(config)
+    assert model.surface_head.slots.out_features == 64 * 4
+    assert model.config.target_radius_m == 1.6
+
+
 def test_fine_association_inference_requires_its_trained_radius():
     class FakeFineStudent:
         config = type("Config", (), {"target_radius_m": 1.6})()
