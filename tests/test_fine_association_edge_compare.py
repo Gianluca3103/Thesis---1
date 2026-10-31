@@ -5,7 +5,8 @@ import torch
 
 from scripts.compare_fine_association_edge import (
     _add_sweep, _aggregate_sweep, _best_thresholds, _metrics,
-    _near_radar_voxel, _new_sweep_totals, _scope_masks, _sweep_frame)
+    _near_radar_voxel, _new_sweep_totals, _print_best_results,
+    _scope_masks, _sweep_frame)
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 
 
@@ -26,7 +27,7 @@ def test_equal_count_comparison_uses_only_selected_edge_cells():
     assert matched["iou_exact"] == 1.0
 
 
-def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood():
+def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):
     # The clean denominator includes unproposed voxels at 3 m and in the ROI.
     clean = torch.tensor([[0, 8, 256, x] for x in (256, 261, 271, 300)])
     raw = torch.tensor([[0, 8, 256, x] for x in (256, 261)])
@@ -57,3 +58,9 @@ def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood():
     assert next(row for row in rows if row["scope"] == "full_roi"
                 and row["variant"] == "raw"
                 and row["threshold"] == .25)["observed"] == 8
+    _print_best_results({"frames": 2, "split": "val", "sweep": rows,
+                         "best_thresholds": best})
+    printed = capsys.readouterr().out
+    assert "Best thresholds by F1 over 2 val frames" in printed
+    assert "radar_1m" in printed and "radar_3m" in printed
+    assert "full_roi" in printed and "0.2 m" in printed

@@ -131,8 +131,11 @@ radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
   the same threshold, and edge-aware candidates matched to the raw cell count
   within each scope. Local recall counts every clean voxel in that radar
   neighborhood, including voxels the model did not propose. The HTML preview
-  uses `--threshold` (0.25 by default). It does not alter the Stage-II gate or
-  diffusion checkpoint.
+  uses `--threshold` (0.25 by default). The sweep displays a frame progress bar
+  and then prints only F1-optimal thresholds with precision, recall, IoU, and
+  F1 for exact and 0.2 m matches. Use `--report-only path/to/summary.json` to
+  print the best results from a completed run without processing frames again.
+  It does not alter the Stage-II gate or diffusion checkpoint.
 
 Phase 0 uses a masked child-distribution objective to train two independent
 native Stage-I encoders and their 128→64 adapters. The loss mask now matches

@@ -17,6 +17,7 @@ import random
 import numpy as np
 from scipy.spatial import cKDTree
 import torch
+from tqdm import tqdm
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.radar_fov import (
@@ -175,12 +176,38 @@ def _best_thresholds(rows: list[dict]) -> dict:
     return best
 
 
+def _print_best_results(summary: dict) -> None:
+    """Show only F1-optimal thresholds and their precision/recall trade-off."""
+    rows = summary["sweep"]
+    best = summary["best_thresholds"]
+    print(f"Best thresholds by F1 over {summary['frames']} {summary['split']} frames")
+    print("scope      variant                   match    threshold  precision  recall     IoU       F1")
+    for scope in SCOPES:
+        for variant in VARIANTS:
+            for suffix, match in (("exact", "exact"), ("at_0_2m", "0.2 m")):
+                threshold = best[scope][variant][f"f1_{suffix}"]
+                values = next(row for row in rows if row["scope"] == scope
+                              and row["variant"] == variant
+                              and row["threshold"] == threshold)
+                def rate(name):
+                    value = values[name]
+                    return f"{value:.4f}" if value is not None else "n/a"
+                print(f"{scope:<10} {variant:<25} {match:<6} "
+                      f"{threshold:>9.3f}  "
+                      f"{rate('precision_' + suffix):>9}  "
+                      f"{rate('recall_' + suffix):>6}  "
+                      f"{rate('iou_' + suffix):>7}  "
+                      f"{rate('f1_' + suffix):>7}")
+
+
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vod-root", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--vod-root", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--report-only", type=Path,
+                        help="Print best thresholds from an existing summary.json without rerunning frames")
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--frame-id", nargs="+")
     parser.add_argument("--limit", type=int, default=5)
@@ -196,6 +223,12 @@ def main() -> None:
     parser.add_argument("--metrics-only", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.report_only:
+        summary = json.loads(args.report_only.read_text(encoding="utf-8"))
+        _print_best_results(summary)
+        return
+    if args.vod_root is None or args.checkpoint is None or args.output_root is None:
+        parser.error("--vod-root, --checkpoint, and --output-root are required for a sweep")
     if (args.limit < 1 or not 0 < args.threshold < 1
             or not args.thresholds or any(not 0 < t < 1 for t in args.thresholds)
             or len(set(args.thresholds)) != len(args.thresholds)
@@ -227,7 +260,9 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     reports = []
     sweep_totals = _new_sweep_totals(thresholds)
-    for row in dataset:
+    for row in tqdm(dataset, total=len(dataset.frames),
+                    desc="Stage I candidate sweep", unit="frame",
+                    dynamic_ncols=True):
         batch = collate_stage1([row])
         output = student(batch["radar"].to(args.device),
                          batch["radar_valid"].to(args.device))
@@ -279,12 +314,6 @@ def main() -> None:
                         raw_xyz, raw_score, edge_xyz, edge_score,
                         threshold=args.threshold, links=edge.accepted_edges)
             report["viewer"] = viewer.name
-        print(f"{row['frame_id']}: 1 m raw P/R "
-              f"{sweep['radar_1m'][args.threshold]['raw']['precision_exact']}/"
-              f"{sweep['radar_1m'][args.threshold]['raw']['recall_exact']}; "
-              f"3 m raw P/R {preview['raw']['precision_exact']}/"
-              f"{preview['raw']['recall_exact']}", flush=True)
-
     if not reports:
         raise RuntimeError("The selected split has no frames to compare")
     sweep_rows = _aggregate_sweep(sweep_totals, thresholds)
@@ -319,20 +348,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows({key: item[key] for key in columns}
                          for item in sweep_rows)
-    print("\nValidation scan agreement (same frames; exact voxels):", flush=True)
-    print("variant                 scope      threshold   precision     recall        IoU         F1", flush=True)
-    for scope in SCOPES:
-        for variant in VARIANTS:
-            threshold = summary["best_thresholds"][scope][variant]["f1_exact"]
-            values = next(item for item in sweep_rows if item["scope"] == scope
-                          and item["variant"] == variant
-                          and item["threshold"] == threshold)
-            def rate(name):
-                value = values[name]
-                return f"{value:.4f}" if value is not None else "n/a"
-            print(f"{variant:<23} {scope:<10} {threshold:>9.3f}  "
-                  f"{rate('precision_exact'):>10}  {rate('recall_exact'):>9}  "
-                  f"{rate('iou_exact'):>9}  {rate('f1_exact'):>9}", flush=True)
+    _print_best_results(summary)
     if not args.metrics_only and reports:
         links = "".join(
             f'<li><a target="viewer" href="{html.escape(item["viewer"])}">'
