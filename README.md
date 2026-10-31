@@ -119,13 +119,26 @@ cache, and new diffusion weights. It reuses aligned raw frames, the full-region
 LiDAR LPCR checkpoint, and the existing severe-fault cache. The original
 cross-modal student and its checkpoints remain available for comparison.
 
+For the **1.6 m / 32-slot Stage-I ablation**, run
+`scripts/run_fine_association_1p6m_stage1.sh`. It trains a new radar-only
+association head from the same source student, using clean LiDAR targets only
+within 1.6 m of each radar voxel. The 3 m radar feature context, 32 slots,
+optimizer rates, and training schedule stay the same. This trial initializes
+from the source radar student because the old eight-slot pointers were trained
+at 3 m. It reuses the existing aligned raw
+frame cache, runs a full validation threshold sweep, and writes five audit
+viewers under a separate output directory. Its checkpoint does not replace
+the 3 m model or its Stage-II gate cache.
+
 `scripts.compare_fine_association_edge` is an inference-only Stage-I
 postprocessing comparison for the 32-slot checkpoint. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
-agree, then removes any resulting voxel more than 3 m from an active fine
+agree, then removes any resulting voxel beyond the checkpoint's trained
+radius from an active fine
 radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
-  clean-scan precision, recall, IoU and F1 for 1 m and 3 m neighborhoods around
-  active radar voxel centers, plus the full forward-FOV grid as context. The
+clean-scan precision, recall, IoU and F1 for 1 m, 1.6 m and 3 m
+neighborhoods around active radar voxel centers, plus the full forward-FOV
+grid as context. The
   `threshold_sweep.csv` file reports exact and one-to-one 0.2 m tolerant scores
   across confidence thresholds for raw candidates, edge-aware candidates at
   the same threshold, and edge-aware candidates matched to the raw cell count

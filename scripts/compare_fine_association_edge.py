@@ -2,7 +2,7 @@
 
 This is an inference-only postprocessing experiment. Clean LiDAR is used for
 validation metrics and display, never for interpolation or candidate choice.
-Interpolated voxel centers must remain within 3 m of an active radar voxel.
+Interpolated voxel centers stay within the checkpoint's trained radar radius.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from scripts.compare_crossmodal_surface import _write_html
 from scripts.visualize_crossmodal_student import _write_ply
 
 
-SCOPES = ("radar_1m", "radar_3m", "full_roi")
+SCOPES = ("radar_1m", "radar_1_6m", "radar_3m", "full_roi")
 VARIANTS = ("raw", "edge_same_threshold", "edge_matched_raw_count")
 DEFAULT_THRESHOLDS = (0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
                       0.95, 0.975, 0.99)
@@ -157,7 +157,8 @@ def _aggregate(rows: list[dict]) -> dict:
 def _scope_masks(raw_xyz: np.ndarray, edge_xyz: np.ndarray,
                  clean_xyz: np.ndarray, anchors: np.ndarray) -> dict:
     masks = {}
-    for label, radius_m in (("radar_1m", 1.0), ("radar_3m", 3.0)):
+    for label, radius_m in (("radar_1m", 1.0),
+                            ("radar_1_6m", 1.6), ("radar_3m", 3.0)):
         masks[label] = {
             "raw": _near_radar_voxel(raw_xyz, anchors, radius_m),
             "edge": _near_radar_voxel(edge_xyz, anchors, radius_m),
@@ -247,6 +248,8 @@ def _print_best_results(summary: dict) -> None:
     print(f"Best thresholds by F1 over {summary['frames']} {summary['split']} frames")
     print("scope      variant                   match    threshold  precision  recall     IoU       F1")
     for scope in SCOPES:
+        if scope not in best:  # Older 3 m summaries predate the 1.6 m scope.
+            continue
         for variant in VARIANTS:
             for suffix, match in (("exact", "exact"), ("at_0_2m", "0.2 m")):
                 threshold = best[scope][variant][f"f1_{suffix}"]
@@ -287,7 +290,7 @@ def main() -> None:
     parser.add_argument("--min-affinity", type=float, default=0.20)
     parser.add_argument("--lattice-stride", type=int, default=2)
     parser.add_argument("--metrics-only", action="store_true")
-    parser.add_argument("--audit-scope", choices=("radar_1m", "radar_3m"),
+    parser.add_argument("--audit-scope", choices=SCOPES[:-1],
                         default="radar_1m",
                         help="Radar neighborhood shown in the fixed-threshold error panels")
     parser.add_argument("--device", default="cuda")
@@ -349,7 +352,9 @@ def main() -> None:
     summary = {"checkpoint": str(args.checkpoint), "epoch": saved["epoch"],
                "split": args.split, "frames": len(reports),
                "batch_size": args.batch_size, "num_workers": args.num_workers,
-               "radius_m": radius_m, "slots_per_radar_voxel": 32,
+               "radius_m": radius_m,
+               "primary_scope": ("radar_1_6m" if radius_m == 1.6 else "radar_3m"),
+               "slots_per_radar_voxel": 32,
                "threshold": args.threshold, "sweep_thresholds": thresholds,
                "edge_parameters": {"seed_threshold": args.edge_seed_threshold,
                                    "max_link_m": args.max_link_m,
@@ -357,6 +362,7 @@ def main() -> None:
                                    "lattice_stride": args.lattice_stride},
                "metric_scope": {
                    "radar_1m": "Predicted and all clean voxels with centers within 1 m of an active fine radar voxel center",
+                   "radar_1_6m": "Predicted and all clean voxels with centers within 1.6 m of an active fine radar voxel center",
                    "radar_3m": "Predicted and all clean voxels with centers within 3 m of an active fine radar voxel center",
                    "full_roi": "All predicted and clean voxels in the forward-FOV model grid; areas without predictions count as misses",
                },
@@ -427,7 +433,8 @@ def _score_frame(frame: dict, args, saved: dict, radius_m: float,
     sweep = _sweep_frame(raw_coords, raw_score, edge_coords, edge_score,
                          clean_coords, masks, thresholds)
     _add_sweep(sweep_totals, sweep)
-    preview = sweep["radar_3m"][args.threshold]
+    native_scope = "radar_1_6m" if radius_m == 1.6 else "radar_3m"
+    preview = sweep[native_scope][args.threshold]
     report = {"frame_id": frame["frame_id"],
               "scope_preview": {scope: sweep[scope][args.threshold]
                                 for scope in SCOPES},
@@ -435,7 +442,7 @@ def _score_frame(frame: dict, args, saved: dict, radius_m: float,
               "edge_same_threshold": preview["edge_same_threshold"],
               "edge_matched_raw_count": preview["edge_matched_raw_count"],
               "edge_accepted_links": edge.accepted_edges,
-              "edge_outside_3m_removed": int((~supported).sum()),
+              "edge_outside_support_removed": int((~supported).sum()),
               "raw_total_candidates": len(raw_xyz),
               "edge_total_candidates": len(edge_xyz)}
     reports.append(report)

@@ -91,6 +91,19 @@ def test_fine_association_rejects_destination_voxel_center_beyond_three_metres()
     assert len(merge_surface_pointers(proposal).coords) == 0
 
 
+def test_one_point_six_metre_support_checks_destination_voxel_center():
+    anchor = torch.tensor([[.1, .1, .125]])
+    # The continuous pointer lies inside 1.6 m, but its quantized voxel
+    # center lies beyond the support radius.
+    pointer = torch.tensor([[[1.65, .31, .125]]])
+    assert torch.linalg.vector_norm(pointer[0, 0] - anchor[0]) < 1.6
+    proposal = SurfaceProposals(pointer, torch.zeros((1, 1)), anchor,
+                                torch.zeros(1, dtype=torch.long),
+                                torch.ones((1, 32)),
+                                max_voxel_center_distance_m=1.6)
+    assert len(merge_surface_pointers(proposal).coords) == 0
+
+
 def test_pointer_voxels_never_merge_across_batch_boundaries():
     center = [.1, .1, .125]
     field = merge_surface_pointers(_proposals([[center], [center]], [[0.], [0.]],

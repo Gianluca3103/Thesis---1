@@ -1,7 +1,8 @@
 """Radar-only fine-voxel associations for the Stage-I probability map.
 
 Clean LiDAR supplies training targets only. At inference every active 0.2 x
-0.2 x 0.25 m radar voxel proposes at most 32 LiDAR voxels within 3 m.
+0.2 x 0.25 m radar voxel proposes at most 32 LiDAR voxels within its trained
+1.6 m or 3 m association radius.
 Distinct radar anchors voting for one target increase its probability.
 """
 
@@ -29,11 +30,11 @@ class FineAssociationStudent(nn.Module):
         if (not config.pointer_voxel_mode or not config.decoder_from_conditioned
                 or not config.spherical_offsets or config.anchor_stride != 1
                 or config.proposals_per_anchor not in (8, 32)
-                or config.offset_limit_m != 3.0
-                or config.target_radius_m != 3.0
+                or config.offset_limit_m not in (1.6, 3.0)
+                or config.target_radius_m != config.offset_limit_m
                 or config.target_neighbors != config.proposals_per_anchor
                 or max(config.context_radii_m) > 3.0):
-            raise ValueError("Fine association requires 8 or 32 fine radar pointers within 3 m")
+            raise ValueError("Fine association requires 8 or 32 pointers within a trained 1.6 m or 3 m radius")
         self.config = config
         self.radar_encoder = PreviousStage1Sparse(None, modality="radar")
         self.shared = ResidualAdapter(config.feature_dim)
@@ -108,6 +109,6 @@ def checkpoint_payload(model: FineAssociationStudent, *, source: dict,
             "source_student_checkpoint": str(source_path.resolve()),
             "radar_variant": source["radar_variant"],
             "lidar_fov": source.get("lidar_fov"),
-            "radius_m": 3.0, "validation": validation,
+            "radius_m": model.config.target_radius_m, "validation": validation,
             "grid": {"origin_xyz_m": GRID.minimum_xyz,
                      "voxel_xyz_m": GRID.size_xyz}}

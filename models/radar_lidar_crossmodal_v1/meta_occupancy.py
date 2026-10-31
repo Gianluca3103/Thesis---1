@@ -176,9 +176,10 @@ def radar_only_probability_map(student: nn.Module, radar: torch.Tensor,
     """Inference output excludes unsupervised candidates outside radar support."""
     output = student(radar, radar_valid).exported()
     if output.get("interface_version") == "crossmodal_fine_association_v1":
-        if abs(radius_m - 3.0) > 1e-6:
-            raise ValueError("Fine-association pointers require their trained 3 m radius")
-        # The pointer head already enforces a 3 m Euclidean radius from each
+        trained_radius_m = student.config.target_radius_m
+        if abs(radius_m - trained_radius_m) > 1e-6:
+            raise ValueError("Fine-association pointers require their trained radius")
+        # The pointer head already enforces its Euclidean radius from each
         # active radar voxel. A second raw-return radius filter would wrongly
         # discard boundary pointers because raw returns and voxel centers differ.
         output["radar_support_radius_m"] = radius_m

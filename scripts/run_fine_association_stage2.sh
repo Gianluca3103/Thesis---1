@@ -79,7 +79,7 @@ with torch.no_grad():
 distance = torch.linalg.vector_norm(
     proposals.xyz - proposals.anchor_xyz[:, None], dim=-1)
 assert proposals.xyz.shape[1] == 32
-assert not len(distance) or bool((distance <= 3.0 + 1e-5).all())
+assert not len(distance) or bool((distance <= saved["radius_m"] + 1e-5).all())
 assert len(output["confidence_coords"]) == len(output["confidence_probabilities"])
 assert output["interface_version"] == "crossmodal_fine_association_v1"
 print(f"Fine Stage-I interface OK: {len(proposals.anchor_xyz)} radar voxels, "

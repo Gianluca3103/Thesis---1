@@ -68,8 +68,8 @@ def test_audit_overlay_uses_one_to_one_matches_and_shows_unmatched_voxels():
 
 
 def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):
-    # The clean denominator includes unproposed voxels at 3 m and in the ROI.
-    clean = torch.tensor([[0, 8, 256, x] for x in (256, 261, 271, 300)])
+    # The clean denominator includes unproposed voxels at 1.6 m, 3 m and in the ROI.
+    clean = torch.tensor([[0, 8, 256, x] for x in (256, 261, 263, 271, 300)])
     raw = torch.tensor([[0, 8, 256, x] for x in (256, 261)])
     edge = torch.tensor([[0, 8, 256, x] for x in (256, 261, 266)])
     origin = np.asarray(GRID.minimum_xyz)
@@ -83,10 +83,12 @@ def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):
                          (.25, .85))
     assert frame["radar_1m"][.25]["raw"]["observed"] == 2
     assert frame["radar_1m"][.25]["raw"]["recall_exact"] == 1.0
-    assert frame["radar_3m"][.25]["raw"]["observed"] == 3
-    assert frame["radar_3m"][.25]["raw"]["recall_exact"] == 2 / 3
-    assert frame["full_roi"][.25]["raw"]["observed"] == 4
-    assert frame["full_roi"][.25]["raw"]["recall_exact"] == .5
+    assert frame["radar_1_6m"][.25]["raw"]["observed"] == 3
+    assert frame["radar_1_6m"][.25]["raw"]["recall_exact"] == 2 / 3
+    assert frame["radar_3m"][.25]["raw"]["observed"] == 4
+    assert frame["radar_3m"][.25]["raw"]["recall_exact"] == .5
+    assert frame["full_roi"][.25]["raw"]["observed"] == 5
+    assert frame["full_roi"][.25]["raw"]["recall_exact"] == .4
     assert frame["radar_3m"][.85]["raw"]["predicted"] == 1
     assert frame["radar_3m"][.25]["edge_matched_raw_count"]["predicted"] == 2
     totals = _new_sweep_totals((.25, .85))
@@ -97,10 +99,11 @@ def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):
     assert best["radar_1m"]["raw"]["f1_exact"] == .25
     assert next(row for row in rows if row["scope"] == "full_roi"
                 and row["variant"] == "raw"
-                and row["threshold"] == .25)["observed"] == 8
+                and row["threshold"] == .25)["observed"] == 10
     _print_best_results({"frames": 2, "split": "val", "sweep": rows,
                          "best_thresholds": best})
     printed = capsys.readouterr().out
     assert "Best thresholds by F1 over 2 val frames" in printed
-    assert "radar_1m" in printed and "radar_3m" in printed
+    assert "radar_1m" in printed and "radar_1_6m" in printed
+    assert "radar_3m" in printed
     assert "full_roi" in printed and "0.2 m" in printed

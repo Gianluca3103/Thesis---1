@@ -30,7 +30,7 @@ from models.radar_lidar_crossmodal_v1.train_teacher import _hash, _move
 
 
 def association_loss(output, clean, clean_valid, radius_m: float):
-    """Nearest clean voxel centers within 3 m supervise up to 32 radar slots.
+    """Nearest clean voxel centers within the trained radius supervise slots.
 
     Correspondences exist during training only. Inference emits learned
     radar-only pointers and cannot inspect clean LiDAR coordinates.
@@ -111,7 +111,8 @@ def run_epoch(model, loader, device, *, optimizer=None, association_weight=0.2,
             clean_coords, _, _, _ = voxelize(
                 batch["clean_lidar"], batch["clean_lidar_valid"], GRID)
             support = anchor_support(clean_coords, output.surface.anchor_xyz,
-                                     output.surface.anchor_batch, 3.0)
+                                     output.surface.anchor_batch,
+                                     model.config.target_radius_m)
             overlap = scan_overlap_counts_observed(selected, clean_coords[support])
             for name in ("predicted", "observed", "tp_exact", "tp_at_0_2m"):
                 counts[name] += overlap[name]
@@ -241,7 +242,8 @@ def main():
                                    threshold=config.threshold)
         scheduler.step()
         record = {"epoch": epoch, "train": training, "val": validation,
-                  "threshold": config.threshold, "radius_m": 3.0,
+                  "threshold": config.threshold,
+                  "radius_m": config.target_radius_m,
                   "slots_per_radar_voxel": config.proposals_per_anchor}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
