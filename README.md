@@ -139,6 +139,13 @@ multi-radar confidence votes are merged. The trained checkpoint stays the
 same; each filter writes its own sweep and viewer directory. The comparison
 command also accepts `--top-k 32`, `--top-k 48`, or `--top-k 64` directly.
 
+Use `scripts.audit_vod_sensor_alignment` to inspect a validation frame's
+actual radar and LiDAR inputs. It checks whether the age-0 stack rows equal
+VoD's released single radar scan, whether the calibrated clouds equal the
+fixed-frame cache, and exports a top/side overlay separating current from
+historical radar returns. The nearest-LiDAR distances are diagnostic only;
+radar detections can legitimately differ from LiDAR surfaces.
+
 `scripts.compare_fine_association_edge` is an inference-only Stage-I
 postprocessing comparison for 32- or 64-slot checkpoints. It interpolates between
 high-confidence candidate voxels only when nearby radar features and scores
