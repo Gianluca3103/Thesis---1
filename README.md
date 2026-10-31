@@ -135,6 +135,9 @@ radar voxel. It exports raw and edge-aware views plus exact and 0.2 m
   and then prints only F1-optimal thresholds with precision, recall, IoU, and
   F1 for exact and 0.2 m matches. Use `--report-only path/to/summary.json` to
   print the best results from a completed run without processing frames again.
+  GPU inference accepts `--batch-size` (default 4) and `--num-workers`
+  (default 2); postprocessing and metric matching remain frame-local to avoid
+  matching points from different frames. The progress bar counts batches.
   It does not alter the Stage-II gate or diffusion checkpoint.
 
 Phase 0 uses a masked child-distribution objective to train two independent

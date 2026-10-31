@@ -17,6 +17,7 @@ import random
 import numpy as np
 from scipy.spatial import cKDTree
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
@@ -55,6 +56,33 @@ def _rows(xyz_indices: np.ndarray) -> torch.Tensor:
     indices = torch.as_tensor(xyz_indices, dtype=torch.long)
     return torch.cat((torch.zeros((len(indices), 1), dtype=torch.long),
                       indices[:, [2, 1, 0]]), dim=1)
+
+
+def _split_batch_outputs(batch: dict, surface, field):
+    """Turn one batched forward pass into independent frame-local outputs."""
+    all_coords = field.coords.cpu()
+    all_batches = all_coords[:, 0].numpy()
+    all_xyz = GRID.centers_xyz(all_coords).numpy()
+    all_scores = field.confidence.cpu().numpy()
+    all_sources = field.representative_source.cpu().numpy()
+    all_guide = surface.guide[field.representative_source].cpu().numpy()
+    anchor_xyz = surface.anchor_xyz.cpu().numpy()
+    anchor_batches = surface.anchor_batch.cpu().numpy()
+    for index, frame_id in enumerate(batch["frame_id"]):
+        chosen = all_batches == index
+        anchors = anchor_xyz[anchor_batches == index]
+        groups = all_sources[chosen]
+        if len(groups) and not np.all(anchor_batches[groups] == index):
+            raise ValueError(f"Radar pointer sources crossed frame boundaries at {frame_id}")
+        coords = all_coords[torch.from_numpy(chosen)].clone()
+        coords[:, 0] = 0
+        radar = batch["radar"][index, batch["radar_valid"][index]]
+        clean = batch["clean_lidar"][index, batch["clean_lidar_valid"][index]]
+        yield {"frame_id": frame_id, "raw_coords": coords,
+               "raw_xyz": all_xyz[chosen], "raw_score": all_scores[chosen],
+               "anchors": anchors, "guide": all_guide[chosen],
+               "groups": groups, "radar": radar[:, :3].numpy(),
+               "clean": clean[:, :3].numpy(), "clean_points": clean[None]}
 
 
 def _metrics(coords: torch.Tensor, scores: np.ndarray, clean_coords: torch.Tensor,
@@ -211,6 +239,8 @@ def main() -> None:
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--frame-id", nargs="+")
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--threshold", type=float, default=0.25)
     parser.add_argument("--thresholds", nargs="+", type=float,
@@ -229,7 +259,8 @@ def main() -> None:
         return
     if args.vod_root is None or args.checkpoint is None or args.output_root is None:
         parser.error("--vod-root, --checkpoint, and --output-root are required for a sweep")
-    if (args.limit < 1 or not 0 < args.threshold < 1
+    if (args.limit < 1 or args.batch_size < 1 or args.num_workers < 0
+            or not 0 < args.threshold < 1
             or not args.thresholds or any(not 0 < t < 1 for t in args.thresholds)
             or len(set(args.thresholds)) != len(args.thresholds)
             or not 0 <= args.edge_seed_threshold <= 1
@@ -258,67 +289,27 @@ def main() -> None:
         dataset.frames = random.Random(args.random_seed).sample(
             dataset.frames, min(args.limit, len(dataset.frames)))
     args.output_root.mkdir(parents=True, exist_ok=True)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers, collate_fn=collate_stage1,
+                        pin_memory=args.device.startswith("cuda"))
     reports = []
     sweep_totals = _new_sweep_totals(thresholds)
-    for row in tqdm(dataset, total=len(dataset.frames),
-                    desc="Stage I candidate sweep", unit="frame",
+    for batch in tqdm(loader, total=len(loader),
+                    desc="Stage I candidate sweep", unit="batch",
                     dynamic_ncols=True):
-        batch = collate_stage1([row])
-        output = student(batch["radar"].to(args.device),
-                         batch["radar_valid"].to(args.device))
+        output = student(batch["radar"].to(args.device, non_blocking=True),
+                         batch["radar_valid"].to(args.device, non_blocking=True))
         surface = output.surface
         field = merge_surface_pointers(surface)
-        raw_coords = field.coords.cpu()
-        raw_xyz = GRID.centers_xyz(raw_coords).numpy()
-        raw_score = field.confidence.cpu().numpy()
-        anchors = surface.anchor_xyz.cpu().numpy()
-        guide = surface.guide[field.representative_source].cpu().numpy()
-        groups = field.representative_source.cpu().numpy()
-        edge = edge_aware_surface(
-            raw_xyz, raw_score, guide, groups,
-            seed_threshold=args.edge_seed_threshold,
-            lattice_stride=args.lattice_stride, max_link_m=args.max_link_m,
-            min_affinity=args.min_affinity)
-        edge_xyz_all = edge.centers_xyz()
-        supported = _near_radar_voxel(edge_xyz_all, anchors, radius_m)
-        edge_xyz = edge_xyz_all[supported]
-        edge_score = edge.scores[supported]
-        edge_coords = _rows(edge.coordinates_xyz[supported])
-
-        clean = row["clean_lidar"][:, :3].numpy()
-        clean_points = row["clean_lidar"][None]
-        clean_valid = torch.ones((1, len(clean)), dtype=torch.bool)
-        clean_coords, _, _, _ = voxelize(clean_points, clean_valid, GRID)
-        clean_centers = GRID.centers_xyz(clean_coords).numpy()
-        masks = _scope_masks(raw_xyz, edge_xyz, clean_centers, anchors)
-        sweep = _sweep_frame(raw_coords, raw_score, edge_coords, edge_score,
-                             clean_coords, masks, thresholds)
-        _add_sweep(sweep_totals, sweep)
-        preview = sweep["radar_3m"][args.threshold]
-        report = {"frame_id": row["frame_id"],
-                  "raw": preview["raw"],
-                  "edge_same_threshold": preview["edge_same_threshold"],
-                  "edge_matched_raw_count": preview["edge_matched_raw_count"],
-                  "edge_accepted_links": edge.accepted_edges,
-                  "edge_outside_3m_removed": int((~supported).sum()),
-                  "raw_total_candidates": len(raw_xyz),
-                  "edge_total_candidates": len(edge_xyz)}
-        reports.append(report)
-        if not args.metrics_only:
-            stem = args.output_root / f"{row['frame_id']}_edge_comparison"
-            _write_ply(stem.with_name(stem.name + "_raw.ply"), raw_xyz, raw_score)
-            _write_ply(stem.with_name(stem.name + "_edge.ply"), edge_xyz, edge_score)
-            viewer = stem.with_suffix(".html")
-            _write_html(viewer, row["frame_id"], saved["epoch"],
-                        row["radar"][:, :3].numpy(), clean,
-                        raw_xyz, raw_score, edge_xyz, edge_score,
-                        threshold=args.threshold, links=edge.accepted_edges)
-            report["viewer"] = viewer.name
+        for frame in _split_batch_outputs(batch, surface, field):
+            _score_frame(frame, args, saved, radius_m, thresholds,
+                         sweep_totals, reports)
     if not reports:
         raise RuntimeError("The selected split has no frames to compare")
     sweep_rows = _aggregate_sweep(sweep_totals, thresholds)
     summary = {"checkpoint": str(args.checkpoint), "epoch": saved["epoch"],
                "split": args.split, "frames": len(reports),
+               "batch_size": args.batch_size, "num_workers": args.num_workers,
                "radius_m": radius_m, "slots_per_radar_voxel": 32,
                "threshold": args.threshold, "sweep_thresholds": thresholds,
                "edge_parameters": {"seed_threshold": args.edge_seed_threshold,
@@ -368,6 +359,55 @@ def main() -> None:
     print(f"Sweep: {csv_path}", flush=True)
     if not args.metrics_only:
         print(f"Open: {args.output_root / 'index.html'}", flush=True)
+
+
+def _score_frame(frame: dict, args, saved: dict, radius_m: float,
+                 thresholds: tuple[float, ...], sweep_totals: dict,
+                 reports: list[dict]) -> None:
+    raw_coords = frame["raw_coords"]
+    raw_xyz = frame["raw_xyz"]
+    raw_score = frame["raw_score"]
+    anchors = frame["anchors"]
+    edge = edge_aware_surface(
+        raw_xyz, raw_score, frame["guide"], frame["groups"],
+        seed_threshold=args.edge_seed_threshold,
+        lattice_stride=args.lattice_stride, max_link_m=args.max_link_m,
+        min_affinity=args.min_affinity)
+    edge_xyz_all = edge.centers_xyz()
+    supported = _near_radar_voxel(edge_xyz_all, anchors, radius_m)
+    edge_xyz = edge_xyz_all[supported]
+    edge_score = edge.scores[supported]
+    edge_coords = _rows(edge.coordinates_xyz[supported])
+
+    clean = frame["clean"]
+    clean_coords, _, _, _ = voxelize(
+        frame["clean_points"],
+        torch.ones((1, len(clean)), dtype=torch.bool), GRID)
+    clean_centers = GRID.centers_xyz(clean_coords).numpy()
+    masks = _scope_masks(raw_xyz, edge_xyz, clean_centers, anchors)
+    sweep = _sweep_frame(raw_coords, raw_score, edge_coords, edge_score,
+                         clean_coords, masks, thresholds)
+    _add_sweep(sweep_totals, sweep)
+    preview = sweep["radar_3m"][args.threshold]
+    report = {"frame_id": frame["frame_id"],
+              "raw": preview["raw"],
+              "edge_same_threshold": preview["edge_same_threshold"],
+              "edge_matched_raw_count": preview["edge_matched_raw_count"],
+              "edge_accepted_links": edge.accepted_edges,
+              "edge_outside_3m_removed": int((~supported).sum()),
+              "raw_total_candidates": len(raw_xyz),
+              "edge_total_candidates": len(edge_xyz)}
+    reports.append(report)
+    if not args.metrics_only:
+        stem = args.output_root / f"{frame['frame_id']}_edge_comparison"
+        _write_ply(stem.with_name(stem.name + "_raw.ply"), raw_xyz, raw_score)
+        _write_ply(stem.with_name(stem.name + "_edge.ply"), edge_xyz, edge_score)
+        viewer = stem.with_suffix(".html")
+        _write_html(viewer, frame["frame_id"], saved["epoch"],
+                    frame["radar"], clean,
+                    raw_xyz, raw_score, edge_xyz, edge_score,
+                    threshold=args.threshold, links=edge.accepted_edges)
+        report["viewer"] = viewer.name
 
 
 if __name__ == "__main__":

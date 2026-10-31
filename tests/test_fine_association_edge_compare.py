@@ -2,11 +2,12 @@
 
 import numpy as np
 import torch
+from types import SimpleNamespace
 
 from scripts.compare_fine_association_edge import (
     _add_sweep, _aggregate_sweep, _best_thresholds, _metrics,
     _near_radar_voxel, _new_sweep_totals, _print_best_results,
-    _scope_masks, _sweep_frame)
+    _scope_masks, _split_batch_outputs, _sweep_frame)
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 
 
@@ -25,6 +26,35 @@ def test_equal_count_comparison_uses_only_selected_edge_cells():
     assert full["predicted"] == 2
     assert matched["predicted"] == 1
     assert matched["iou_exact"] == 1.0
+
+
+def test_batched_forward_outputs_are_split_without_cross_frame_candidates():
+    batch = {
+        "frame_id": ["a", "b"],
+        "radar": torch.tensor([[[1., 0., 0.], [0., 0., 0.]],
+                               [[2., 0., 0.], [0., 0., 0.]]]),
+        "radar_valid": torch.tensor([[True, False], [True, False]]),
+        "clean_lidar": torch.tensor([[[1., 0., 0., 0.], [0., 0., 0., 0.]],
+                                     [[2., 0., 0., 0.], [0., 0., 0., 0.]]]),
+        "clean_lidar_valid": torch.tensor([[True, False], [True, False]]),
+    }
+    surface = SimpleNamespace(
+        anchor_xyz=torch.tensor([[1., 0., 0.], [2., 0., 0.]]),
+        anchor_batch=torch.tensor([0, 1]),
+        guide=torch.tensor([[.1, .2], [.3, .4]]))
+    field = SimpleNamespace(
+        coords=torch.tensor([[0, 8, 256, 256], [1, 8, 256, 257]]),
+        confidence=torch.tensor([.8, .9]),
+        representative_source=torch.tensor([0, 1]))
+    frames = list(_split_batch_outputs(batch, surface, field))
+    assert [frame["frame_id"] for frame in frames] == ["a", "b"]
+    assert all(frame["raw_coords"][:, 0].tolist() == [0] for frame in frames)
+    assert frames[0]["raw_score"].tolist() == [float(field.confidence[0])]
+    assert frames[1]["raw_score"].tolist() == [float(field.confidence[1])]
+    assert frames[0]["groups"].tolist() == [0]
+    assert frames[1]["groups"].tolist() == [1]
+    assert frames[0]["radar"].shape == (1, 3)
+    assert frames[1]["clean_points"].shape == (1, 1, 4)
 
 
 def test_sweep_uses_all_clean_voxels_in_each_radar_neighborhood(capsys):
