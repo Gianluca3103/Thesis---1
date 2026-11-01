@@ -96,6 +96,22 @@ The dataset stores only XYZ as losslessly compressed `.npz` files, plus a
 manifest describing each frame's fault. Pass the output directory to
 `--faulty-root` when training Stage-II diffusion on this dataset.
 
+To inspect the cached mild inputs, run:
+
+```bash
+python -m scripts.visualize_stage2_mild_faults \
+  --mild-root /path/to/mild_cache \
+  --output-root /path/to/mild_views \
+  --split val --per-fault 2
+```
+
+Open `mild_views/index.html` in a browser. Each example has synchronized 3D
+views of the clean reference, faulty input, missing points, and their overlay.
+Full-resolution PLY files accompany the browser views. Use `--search-root`
+instead of `--mild-root` to find a single mild cache within an output directory;
+use repeated `--frame-id` options to inspect specific frames. The viewer does
+not run Stage I or Stage II predictions.
+
 ## Run on the professor machine
 
 For a new official five-scan radar-only Stage-I and selective-addition Stage-II
