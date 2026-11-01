@@ -108,12 +108,15 @@ def _stage2_centers(coords: torch.Tensor) -> torch.Tensor:
 
 
 def _radar_eligible(coords: torch.Tensor, radar_tree: cKDTree | None,
-                    radius_m: float) -> torch.Tensor:
-    """Fine cells within radius of an occupied Stage-I radar voxel center."""
+                    radius_m: float, min_points: int = 1) -> torch.Tensor:
+    """Fine cells with at least min_points tree entries inside radius."""
     if not len(coords) or radar_tree is None:
         return torch.zeros(len(coords), device=coords.device, dtype=torch.bool)
-    distance, _ = radar_tree.query(_stage2_centers(coords).cpu().numpy(), k=1)
-    return torch.as_tensor(distance <= radius_m + 1e-6,
+    distance, _ = radar_tree.query(_stage2_centers(coords).cpu().numpy(),
+                                   k=min_points,
+                                   distance_upper_bound=radius_m + 1e-6)
+    kth_distance = distance if min_points == 1 else distance[:, -1]
+    return torch.as_tensor(kth_distance <= radius_m + 1e-6,
                            device=coords.device, dtype=torch.bool)
 
 
@@ -133,7 +136,8 @@ def _select_budget(rows: dict, budgets: tuple[int, ...], minimum_precision: floa
 def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
               budgets: tuple[int, ...], fog_cache, score_mode: str,
               radar_radius_m: float | None = None,
-              thresholds: tuple[float, ...] = ()) -> dict:
+              thresholds: tuple[float, ...] = (),
+              radar_min_points: int | None = None) -> dict:
     totals = {name: {mode: _new_totals(budgets) for mode in modes}
               for name in models}
     parent_totals = {mode: {scale: {"tp": 0, "selected": 0, "target": 0}
@@ -152,6 +156,12 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                                      dtype=torch.bool), STAGE1_GRID)
         radar_centers = STAGE1_GRID.centers_xyz(radar_sites).cpu().numpy()
         radar_tree = cKDTree(radar_centers) if len(radar_centers) else None
+        if radar_min_points is None:
+            eligibility_tree = radar_tree
+        else:
+            eligibility_tree = (cKDTree(radar[:, :3].cpu().numpy())
+                                if len(radar) else None)
+        required_points = radar_min_points or 1
         baseline_field = None
         if "64_slot_baseline" in models:
             baseline = models["64_slot_baseline"]
@@ -170,7 +180,8 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                     _stage2_centers(all_target).cpu().numpy(), k=1)
                 radar_reach[mode]["within_radius"] += int((distance <= 1.6 + 1e-6).sum())
             radar_reach[mode]["target"] += len(all_target)
-            target = (all_target[_radar_eligible(all_target, radar_tree, radar_radius_m)]
+            target = (all_target[_radar_eligible(all_target, eligibility_tree,
+                                                radar_radius_m, required_points)]
                       if radar_radius_m is not None else all_target)
             scope_counts[mode]["all_missing"] += len(all_target)
             scope_counts[mode]["eligible_missing"] += len(target)
@@ -178,7 +189,8 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
             rank, probabilities = fine_ranking(generated, score_mode)
             fine_coords = generated["fine_coords"]
             if radar_radius_m is not None:
-                eligible = _radar_eligible(fine_coords, radar_tree, radar_radius_m)
+                eligible = _radar_eligible(fine_coords, eligibility_tree,
+                                           radar_radius_m, required_points)
                 fine_coords, rank = fine_coords[eligible], rank[eligible]
                 probabilities = probabilities[eligible]
             _accumulate(totals["hierarchical"][mode], fine_coords, rank,
@@ -197,8 +209,8 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
             if baseline_field is not None:
                 baseline_coords, scores = baseline_field, baseline_scores
                 if radar_radius_m is not None:
-                    eligible = _radar_eligible(baseline_coords, radar_tree,
-                                               radar_radius_m)
+                    eligible = _radar_eligible(baseline_coords, eligibility_tree,
+                                               radar_radius_m, required_points)
                     baseline_coords, scores = baseline_coords[eligible], scores[eligible]
                 _accumulate(totals["64_slot_baseline"][mode], baseline_coords,
                             scores, target, budgets)
@@ -242,7 +254,9 @@ def main() -> None:
     parser.add_argument("--score-mode", choices=("hierarchical", "fine_only"),
                         default="hierarchical")
     parser.add_argument("--radar-radius-m", type=float,
-                        help="Evaluate only fine cells within this many meters of an occupied radar voxel center; filter candidates before top-K ranking")
+                        help="Eligibility distance in meters; uses occupied radar voxel centers unless --radar-min-points requests raw radar returns")
+    parser.add_argument("--radar-min-points", type=int,
+                        help="Require at least this many raw radar returns inside --radar-radius-m instead of one occupied radar voxel center")
     parser.add_argument("--threshold-steps", type=int, default=0,
                         help="Sweep hierarchical score cutoffs from 0 to 1 inclusive; e.g. 1000 tests steps of 0.001")
     parser.add_argument("--coarse-parent-budget", type=int,
@@ -257,6 +271,8 @@ def main() -> None:
             or min(args.budgets) < 1 or not 0 < args.minimum_precision <= 1
             or (args.radar_radius_m is not None and
                 (not math.isfinite(args.radar_radius_m) or args.radar_radius_m <= 0))
+            or (args.radar_min_points is not None and
+                (args.radar_min_points < 1 or args.radar_radius_m is None))
             or (args.coarse_parent_budget is not None and args.coarse_parent_budget < 1)
             or (args.middle_parent_budget is not None and args.middle_parent_budget < 1)):
         parser.error("Invalid frame limit, worker count, budget, or precision")
@@ -321,11 +337,13 @@ def main() -> None:
     calibration = _evaluate(models, DataLoader(Subset(dataset, selected[:half]),
                                                **loader_args), args.device,
                             modes, budgets, fog, args.score_mode,
-                            args.radar_radius_m, thresholds)
+                            args.radar_radius_m, thresholds,
+                            args.radar_min_points)
     heldout = _evaluate(models, DataLoader(Subset(dataset, selected[half:]),
                                            **loader_args), args.device,
                         modes, budgets, fog, args.score_mode,
-                        args.radar_radius_m, thresholds)
+                        args.radar_radius_m, thresholds,
+                        args.radar_min_points)
     selected_budgets = {
         name: {mode: _select_budget(calibration[name][mode], budgets,
                                    args.minimum_precision) for mode in modes}
@@ -349,11 +367,21 @@ def main() -> None:
                      "heldout": {"threshold": selected_threshold["threshold"],
                                  **heldout_rows[f"{selected_threshold['threshold']:.6f}"]}}
                     if selected_threshold else None)
+    if args.radar_radius_m is None:
+        metric_scope = "full Stage-II ROI"
+    elif args.radar_min_points is None:
+        metric_scope = ("missing clean and predicted fine voxel centers within "
+                        "radar radius of an occupied radar voxel center")
+    else:
+        metric_scope = ("missing clean and predicted fine voxel centers with at least "
+                        f"{args.radar_min_points} raw radar returns within radar radius")
     result = {
         "metric": "exact missing clean voxel within Stage-II ROI",
-        "metric_scope": ("full Stage-II ROI" if args.radar_radius_m is None else
-                         "missing clean and predicted fine voxel centers within radar radius"),
+        "metric_scope": metric_scope,
         "radar_radius_m": args.radar_radius_m,
+        "radar_min_points": args.radar_min_points,
+        "radar_reference": ("raw radar return rows" if args.radar_min_points is not None
+                            else "occupied fine radar voxel centers"),
         "site_budget_policy": ("filter candidates by radar radius, then rank and select top K per frame"
                                if args.radar_radius_m is not None else
                                "rank and select top K per frame"),

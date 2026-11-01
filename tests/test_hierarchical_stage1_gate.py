@@ -101,6 +101,20 @@ def test_one_meter_radar_scope_filters_targets_and_candidates_before_budget():
     assert totals["pool"] == {"tp": 1, "selected": 2, "target": 1}
 
 
+def test_three_and_five_raw_radar_returns_define_nested_one_meter_scopes():
+    cells = torch.tensor([[8, 80, 50], [8, 80, 55], [8, 105, 50]])
+    xyz = _stage2_centers(cells)
+    raw_radar_points = torch.cat((xyz[:1].repeat(3, 1),
+                                  xyz[2:3].repeat(5, 1)))
+    tree = cKDTree(raw_radar_points.numpy())
+    at_least_three = _radar_eligible(cells, tree, 1.0, 3)
+    at_least_five = _radar_eligible(cells, tree, 1.0, 5)
+    assert at_least_three.tolist() == [True, True, True]
+    assert at_least_five.tolist() == [False, False, True]
+    assert not _radar_eligible(cells, cKDTree(raw_radar_points[:3].numpy()),
+                               1.0, 5).any()
+
+
 def test_threshold_sweep_counts_exact_matches_and_selects_on_calibration():
     coords = torch.tensor([[8, 80, 50], [8, 80, 51], [8, 80, 52]])
     probabilities = torch.tensor([0.2, 0.5, 0.8])
