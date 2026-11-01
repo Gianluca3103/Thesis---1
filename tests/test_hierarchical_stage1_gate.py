@@ -10,7 +10,8 @@ from models.radar_lidar_crossmodal_v1.hierarchical_gate import (
 from models.radar_lidar_stage2.sparse_geometry import select_allowed
 from scripts.train_hierarchical_stage1 import _validation_indices
 from scripts.compare_hierarchical_stage1 import (
-    _accumulate, _new_totals, _radar_eligible, _stage2_centers)
+    _accumulate, _best_threshold, _new_totals, _radar_eligible,
+    _stage2_centers, _threshold_counts, _threshold_rows)
 
 
 def _radar(xyz: torch.Tensor) -> torch.Tensor:
@@ -98,3 +99,20 @@ def test_one_meter_radar_scope_filters_targets_and_candidates_before_budget():
     _accumulate(totals, near[eligible], scores[eligible], near[1:2], (1,))
     assert totals["1"] == {"tp": 1, "selected": 1, "target": 1}
     assert totals["pool"] == {"tp": 1, "selected": 2, "target": 1}
+
+
+def test_threshold_sweep_counts_exact_matches_and_selects_on_calibration():
+    coords = torch.tensor([[8, 80, 50], [8, 80, 51], [8, 80, 52]])
+    probabilities = torch.tensor([0.2, 0.5, 0.8])
+    thresholds = (0.0, 0.5, 0.8, 1.0)
+    counts = _threshold_counts(coords, probabilities, coords[[0, 2]],
+                               torch.tensor(thresholds))
+    assert counts.tolist() == [[2, 3, 2], [1, 2, 2], [1, 1, 2], [0, 0, 2]]
+    rows = _threshold_rows(counts, thresholds)
+    assert _best_threshold(rows, "f1")["threshold"] == 0.0
+    assert _best_threshold(rows, "iou")["threshold"] == 0.0
+    assert _best_threshold(rows, "recall")["threshold"] == 0.0
+    assert _best_threshold(rows, "recall", 0.75)["threshold"] == 0.8
+    assert _best_threshold(rows, "recall", 1.01) is None
+    assert _threshold_counts(coords[:0], probabilities[:0], coords[:0],
+                             torch.tensor(thresholds)).shape == (4, 3)
