@@ -14,6 +14,9 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage1.sparse import encode_keys
+from models.radar_lidar_crossmodal_v1.radar_pruner import (
+    VERSION as RADAR_PRUNER_VERSION, radar_support_mask)
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
     load_faulty, severe_fault,
@@ -262,6 +265,9 @@ def main() -> None:
     if (saved2["stage1_sha256"] != sha256(args.stage1_checkpoint)
             or saved2["radar_variant"] != args.radar_variant):
         raise ValueError("Stage-II checkpoint was trained with a different Stage I")
+    if (saved1.get("version") == RADAR_PRUNER_VERSION and
+            args.stage2_cache_root and args.faulty_root is None):
+        parser.error("Cached radar-pruner inference requires --faulty-root")
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
                              include_clean=args.faulty_root is None,
                              data_cache_root=(args.data_cache_root
@@ -274,9 +280,13 @@ def main() -> None:
     if args.stage2_cache_root:
         expected = cache_identity(args.stage1_checkpoint, args.vod_root,
                                   args.radar_variant,
-                                  float(saved1.get("radius_m", 3.2)),
+                                  float(saved1.get("radius_m", saved1.get(
+                                      "support_radius_m", 3.2))),
                                   float(saved2["gate_threshold"]), args.split,
                                   [frame.frame_id for frame in dataset.frames])
+        if saved1.get("version") == RADAR_PRUNER_VERSION:
+            expected = bind_faulty_cache_identity(expected, args.faulty_root,
+                                                  args.split)
         cache = Stage2FixedCache(args.stage2_cache_root / args.split, expected)
         cache.check_complete()
     indices = random.Random(args.random_seed).sample(
@@ -287,9 +297,19 @@ def main() -> None:
     for index in indices:
         row = dataset[index]
         frame_id = row["frame_id"]
+        if args.faulty_root:
+            faulty, fault_type = load_faulty(args.faulty_root, args.split, frame_id), "real"
+        else:
+            faulty, fault_type = severe_fault(
+                row["clean_lidar"], frame_id, 0, fog_cache,
+                seed=int(saved2["fault_seed"]),
+                fault_type=None if args.fault_type == "auto" else args.fault_type)
+        faulty = faulty.to(args.device)
         if cache is None:
             radar = row["radar"].to(args.device)
-            output = stage1_frame(stage1, radar, float(saved1.get("radius_m", 3.2)))
+            output = stage1_frame(
+                stage1, radar, float(saved1.get("radius_m", saved1.get(
+                    "support_radius_m", 3.2))), faulty=faulty)
             targets = None
         else:
             output, targets = cache.load(frame_id, args.device)
@@ -299,14 +319,6 @@ def main() -> None:
             continue
         allowed_xyz, allowed_probabilities = _allowed_view(
             conditions.hierarchy[0], conditions.fine_probabilities)
-        if args.faulty_root:
-            faulty, fault_type = load_faulty(args.faulty_root, args.split, frame_id), "real"
-        else:
-            faulty, fault_type = severe_fault(
-                row["clean_lidar"], frame_id, 0, fog_cache,
-                seed=int(saved2["fault_seed"]),
-                fault_type=None if args.fault_type == "auto" else args.fault_type)
-        faulty = faulty.to(args.device)
         seed = int.from_bytes(hashlib.sha256(
             f"{args.random_seed}:{frame_id}".encode()).digest()[:8], "little")
         torch.manual_seed(seed)
@@ -315,6 +327,12 @@ def main() -> None:
                                  occupancy_threshold=args.occupancy_threshold,
                                  missing_only=not args.full_estimate,
                                  use_residual=not args.zero_residual)
+        if saved1.get("version") == RADAR_PRUNER_VERSION:
+            support = radar_support_mask(row["radar"])
+            chosen = predicted["occupied_coordinates"][:, 1:].cpu().numpy()
+            if len(chosen) and not bool(support[
+                    chosen[:, 0], chosen[:, 1], chosen[:, 2]].all()):
+                raise RuntimeError("Stage II emitted a voxel outside the 3-radar-voxel/3 m rule")
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())

@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
+from models.radar_lidar_crossmodal_v1.radar_pruner import RadarPruner
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
 from models.radar_lidar_stage2.addition import (
     HEALTHY_RETAINED_FRACTION, MIN_CLEAN_CELLS_IN_REGION,
     REGION_STRIDE_ZYX,
@@ -112,6 +114,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
         for rows in tqdm(loader, desc=f"Stage II {args.phase} {split} {epoch:03d}",
                          unit="batch", dynamic_ncols=True):
             active_rows, items, clean_clouds = [], [], []
+            preloaded_faults = {}
             for row in rows:
                 clean = row["clean_lidar"][:, :3].to(args.device, non_blocking=True)
                 if args.phase == "lpcr":
@@ -127,8 +130,24 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                         for value in stored[:3]) + (stored[3],)
                     else:
                         radar = row["radar"].to(args.device, non_blocking=True)
+                        stage1_faulty = None
+                        if isinstance(stage1, RadarPruner):
+                            if args.faulty_root:
+                                stage1_faulty = load_faulty(args.faulty_root, split,
+                                                            row["frame_id"])
+                                fault_name = "real"
+                            else:
+                                stage1_faulty, fault_name = severe_fault(
+                                    row["clean_lidar"], row["frame_id"],
+                                    epoch if training else 0, fog_cache,
+                                    seed=args.fault_seed)
+                            preloaded_faults[row["frame_id"]] = (stage1_faulty,
+                                                                  fault_name)
                         with torch.no_grad():
-                            output = stage1_frame(stage1, radar, radius_m)
+                            output = stage1_frame(
+                                stage1, radar, radius_m,
+                                faulty=(stage1_faulty.to(args.device)
+                                        if stage1_faulty is not None else None))
                         targets = None
                     item = model.conditions(output, args.gate_threshold)
                     item.cached_targets = targets
@@ -154,7 +173,9 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             else:
                 faulty_clouds = []
                 for row in active_rows:
-                    if args.faulty_root:
+                    if row["frame_id"] in preloaded_faults:
+                        faulty, fault_name = preloaded_faults[row["frame_id"]]
+                    elif args.faulty_root:
                         faulty = load_faulty(args.faulty_root, split,
                                              row["frame_id"])
                         fault_name = "real"
@@ -352,11 +373,17 @@ def main() -> None:
         if stage1_saved.get("radar_variant") != args.radar_variant:
             raise ValueError("Radar variant differs from Stage-I checkpoint")
         stage1 = None
-        radius_m = float(stage1_saved.get("radius_m", 3.2))
+        radius_m = float(stage1_saved.get("radius_m", stage1_saved.get(
+            "support_radius_m", 3.2)))
     else:
         stage1, stage1_saved = load_stage1(args.stage1_checkpoint, args.device,
                                             args.radar_variant)
-        radius_m = float(stage1_saved.get("radius_m", 3.2))
+        radius_m = float(stage1_saved.get("radius_m", stage1_saved.get(
+            "support_radius_m", 3.2)))
+    if (args.phase == "diffusion" and args.stage2_cache_root and
+            stage1_saved.get("version") == "radar3vox_3m_pruner_v1" and
+            args.faulty_root is None):
+        parser.error("Cached radar-pruner Stage II requires --faulty-root")
     model = SparseResidualStage2(diffusion_target=args.diffusion_target).to(args.device)
     identity = {"version": VERSION,
                 "model_revision": (LPCR_REVISION if args.phase == "lpcr"
@@ -449,6 +476,8 @@ def main() -> None:
                 args.stage1_checkpoint, args.vod_root, args.radar_variant,
                 radius_m, args.gate_threshold, split,
                 [frame.frame_id for frame in dataset.frames])
+            if stage1_saved.get("version") == "radar3vox_3m_pruner_v1":
+                expected = bind_faulty_cache_identity(expected, args.faulty_root, split)
             fixed_caches[split] = Stage2FixedCache(
                 args.stage2_cache_root / split, expected)
             fixed_caches[split].check_complete()

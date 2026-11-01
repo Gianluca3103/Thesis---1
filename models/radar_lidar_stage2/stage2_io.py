@@ -13,6 +13,9 @@ from models.radar_lidar_crossmodal_v1.fine_association import (
     VERSION as FINE_ASSOCIATION_VERSION, load_fine_association)
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import load_radar_autoencoder
 from models.radar_lidar_crossmodal_v1.train_student import load_student
+from models.radar_lidar_crossmodal_v1.radar_pruner import (
+    VERSION as RADAR_PRUNER_VERSION, RadarPruner, load_radar_pruner,
+    radar_support_mask)
 
 from .sparse_geometry import GRID
 from .sparse_residual import (
@@ -31,7 +34,9 @@ def sha256(path: Path) -> str:
 
 def load_stage1(path: Path, device: str, radar_variant: str):
     header = torch.load(path, map_location="cpu", weights_only=False)
-    if header.get("version") == FINE_ASSOCIATION_VERSION:
+    if header.get("version") == RADAR_PRUNER_VERSION:
+        model, saved = load_radar_pruner(path, device)
+    elif header.get("version") == FINE_ASSOCIATION_VERSION:
         model, saved = load_fine_association(path, device)
     elif header.get("version") == "crossmodal_student_v5_multiscale_refined_raw64":
         model, saved = load_student(path, device)
@@ -44,12 +49,22 @@ def load_stage1(path: Path, device: str, radar_variant: str):
 
 
 @torch.no_grad()
-def stage1_frame(model, radar: torch.Tensor, radius_m: float) -> dict:
+def stage1_frame(model, radar: torch.Tensor, radius_m: float,
+                 faulty: torch.Tensor | None = None,
+                 support_mask=None) -> dict:
     if radar.ndim != 2 or radar.shape[1] != 7:
         raise ValueError("Stage I expects calibrated seven-column radar points")
-    batch = radar[None]
-    valid = torch.ones((1, len(radar)), device=radar.device, dtype=torch.bool)
-    output = radar_only_probability_map(model, batch, valid, radius_m)
+    if isinstance(model, RadarPruner):
+        if faulty is None:
+            raise ValueError("Radar pruner requires the faulty LiDAR input")
+        if radius_m != 3.0:
+            raise ValueError("Radar pruner requires the exact 3 m support radius")
+        support = radar_support_mask(radar) if support_mask is None else support_mask
+        output = model.exported(model(radar, faulty, support))
+    else:
+        batch = radar[None]
+        valid = torch.ones((1, len(radar)), device=radar.device, dtype=torch.bool)
+        output = radar_only_probability_map(model, batch, valid, radius_m)
     if output["grid_metadata"]["voxel_xyz_m"] != GRID.voxel_xyz:
         raise ValueError("Stage-I and Stage-II fine voxel sizes differ")
     return output
