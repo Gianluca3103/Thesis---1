@@ -121,6 +121,17 @@ crops to the Stage-II radar sector, filters to original detectable returns,
 and writes interactive HTML and full-resolution PLY files. It creates a
 preview for inspection, not a replacement training cache.
 
+For a separate training-ready severity-2 mixed-fault cache and a fresh
+hierarchical Stage-I model, run
+`bash scripts/run_hierarchical_stage1_mild_fog2.sh` on the professor machine.
+It builds balanced train/validation assignments of severity-2 fog and 30/40/50%
+contiguous partial loss using the 20-frame radar fixed cache, verifies every
+saved entry, writes interactive examples, trains Stage I from scratch, and
+evaluates it on validation frames excluded from checkpoint selection. If the
+previous hierarchical checkpoint is present, it is evaluated on the same new
+fault set for a matched comparison. The new Stage-I training mode reads the
+saved faulty XYZ and targets clean fine voxels absent from that input.
+
 ## Run on the professor machine
 
 For a new official five-scan radar-only Stage-I and selective-addition Stage-II

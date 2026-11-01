@@ -10,7 +10,18 @@ import numpy as np
 MILD_FAULT_VERSION = "stage2_mild_fog5_partial_v1"
 MILD_FAULT_TYPES = ("fog_sim_5", "partial_loss_30", "partial_loss_40",
                     "partial_loss_50")
+MILD_FOG2_VERSION = "stage2_mild_fog2_partial_v1"
+MILD_FOG2_TYPES = ("fog_sim_2", "partial_loss_30", "partial_loss_40",
+                   "partial_loss_50")
 MILD_FAULT_ENCODING = "xyz_float32_byte_shuffle_v1"
+
+
+def fault_types_for_version(version: str) -> tuple[str, ...]:
+    if version == MILD_FAULT_VERSION:
+        return MILD_FAULT_TYPES
+    if version == MILD_FOG2_VERSION:
+        return MILD_FOG2_TYPES
+    raise ValueError(f"Unknown mild-fault dataset version: {version}")
 
 
 def frame_seed(seed: int, split: str, frame_id: str) -> int:
@@ -19,12 +30,13 @@ def frame_seed(seed: int, split: str, frame_id: str) -> int:
 
 
 def balanced_fault_assignment(frame_ids: list[str], split: str,
-                              seed: int) -> dict[str, str]:
+                              seed: int, *, fault_types: tuple[str, ...] = MILD_FAULT_TYPES
+                              ) -> dict[str, str]:
     """Assign one of four faults per frame, with counts differing by at most one."""
     shuffled = list(frame_ids)
     rng = np.random.default_rng(frame_seed(seed, split, "assignment"))
     rng.shuffle(shuffled)
-    return {frame_id: MILD_FAULT_TYPES[index % len(MILD_FAULT_TYPES)]
+    return {frame_id: fault_types[index % len(fault_types)]
             for index, frame_id in enumerate(shuffled)}
 
 

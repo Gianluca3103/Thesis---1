@@ -24,7 +24,9 @@ from models.radar_lidar_crossmodal_v1.hierarchical_gate import (
     missing_target, stage_loss, target_mask)
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.fault_data import (
-    SevereFogCache, retain_original_fog_returns, severe_fov_filter)
+    SevereFogCache, load_faulty, retain_original_fog_returns, severe_fov_filter)
+from models.radar_lidar_stage2.mild_fault_data import (
+    MILD_FOG2_TYPES, MILD_FOG2_VERSION)
 
 
 def _single(rows: list[dict]) -> dict:
@@ -34,7 +36,10 @@ def _single(rows: list[dict]) -> dict:
 
 
 def faulted(clean: torch.Tensor, name: str, *, frame_id: str,
-            fog_cache: SevereFogCache | None = None) -> torch.Tensor:
+            fog_cache: SevereFogCache | None = None,
+            faulty_root: Path | None = None, split: str = "val") -> torch.Tensor:
+    if name == "mild_dataset" and faulty_root is not None:
+        return load_faulty(faulty_root, split, frame_id)
     if name == "total_loss":
         return clean.new_empty((0, 3))
     if name == "fov_filter":
@@ -102,35 +107,62 @@ def _rates(counts: dict[str, int]) -> dict[str, float | int]:
 
 def evaluate(model: HierarchicalStage1Gate, loader, device: str,
              modes: tuple[str, ...], budgets: tuple[int, ...],
-             fog_cache: SevereFogCache | None = None) -> dict:
+             fog_cache: SevereFogCache | None = None,
+             faulty_root: Path | None = None) -> dict:
     model.eval()
     totals = {name: {budget: {"tp": 0, "predicted": 0, "target": 0}
                      for budget in budgets} for name in modes}
     pool = {name: {"tp": 0, "predicted": 0, "target": 0} for name in modes}
     frame_counts = {name: 0 for name in modes}
+    group_assignment = (json.loads((faulty_root / "val" / "manifest.json").read_text(
+        encoding="utf-8"))["frame_faults"] if faulty_root is not None else {})
+    group_totals = {name: {budget: {"tp": 0, "predicted": 0, "target": 0}
+                           for budget in budgets} for name in MILD_FOG2_TYPES}
+    group_pool = {name: {"tp": 0, "predicted": 0, "target": 0}
+                  for name in MILD_FOG2_TYPES}
+    group_frames = {name: 0 for name in MILD_FOG2_TYPES}
     with torch.no_grad():
         for row in tqdm(loader, desc="Hierarchical Stage-I validation", unit="frame"):
             radar = row["radar"].to(device)
             clean = row["clean_lidar"]
             for name in modes:
-                faulty = faulted(clean, name, frame_id=row["frame_id"], fog_cache=fog_cache)
+                faulty = faulted(clean, name, frame_id=row["frame_id"],
+                                 fog_cache=fog_cache, faulty_root=faulty_root,
+                                 split="val")
                 faulty = faulty.to(device)
                 truth = missing_target(clean[:, :3].to(device), faulty)
                 output = model(radar, faulty)
                 entire = output["fine_coords"]
-                pool[name]["tp"] += int(target_mask(entire, truth, 1).sum())
-                pool[name]["predicted"] += len(entire)
-                pool[name]["target"] += len(truth)
+                pool_counts = {"tp": int(target_mask(entire, truth, 1).sum()),
+                               "predicted": len(entire), "target": len(truth)}
+                for key, value in pool_counts.items():
+                    pool[name][key] += value
                 frame_counts[name] += 1
+                group = (group_assignment[row["frame_id"]]
+                         if name == "mild_dataset" else None)
+                if group is not None:
+                    for key, value in pool_counts.items():
+                        group_pool[group][key] += value
+                    group_frames[group] += 1
                 for budget in budgets:
                     counts = _counts(output, truth, budget)
                     for key in counts:
                         totals[name][budget][key] += counts[key]
-    return {name: {"frames": frame_counts[name],
-                   "pool_oracle": _rates(pool[name]),
-                   "budgets": {str(budget): _rates(totals[name][budget])
-                               for budget in budgets}}
-            for name in modes}
+                        if group is not None:
+                            group_totals[group][budget][key] += counts[key]
+    result = {name: {"frames": frame_counts[name],
+                     "pool_oracle": _rates(pool[name]),
+                     "budgets": {str(budget): _rates(totals[name][budget])
+                                 for budget in budgets}}
+              for name in modes}
+    if "mild_dataset" in modes:
+        result["mild_dataset"]["by_fault_type"] = {
+            group: {"frames": group_frames[group],
+                    "pool_oracle": _rates(group_pool[group]),
+                    "budgets": {str(budget): _rates(group_totals[group][budget])
+                                for budget in budgets}}
+            for group in MILD_FOG2_TYPES}
+    return result
 
 
 def _save(path: Path, model, optimizer, scheduler, *, epoch: int,
@@ -138,13 +170,15 @@ def _save(path: Path, model, optimizer, scheduler, *, epoch: int,
           validation: dict, selection_score: float,
           selection_frame_ids: tuple[str, ...],
           inherited_selection_frame_ids: tuple[str, ...] = (),
-          initialized_from: dict | None = None) -> None:
+          initialized_from: dict | None = None,
+          faulty_dataset_sha256: str | None = None) -> None:
     payload = checkpoint_payload(
         model, epoch=epoch, radar_variant=radar_variant, fault_modes=modes,
         seed=seed, validation=validation, selection_score=selection_score,
         selection_frame_ids=selection_frame_ids,
         inherited_selection_frame_ids=inherited_selection_frame_ids,
         initialized_from=initialized_from,
+        faulty_dataset_sha256=faulty_dataset_sha256,
         optimizer=optimizer.state_dict(),
         scheduler=scheduler.state_dict())
     temporary = path.with_name(path.name + ".tmp")
@@ -164,8 +198,11 @@ def main() -> None:
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--data-cache-root", type=Path)
     parser.add_argument("--fog-cache-root", type=Path)
+    parser.add_argument("--faulty-root", type=Path,
+                        help="Separate mild-fog2 mixed-fault training cache")
     parser.add_argument("--fault-modes", nargs="+", choices=(
-        "total_loss", "fov_filter", "fog_sim"), default=("total_loss", "fov_filter"))
+        "total_loss", "fov_filter", "fog_sim", "mild_dataset"),
+        default=("total_loss", "fov_filter"))
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -189,6 +226,13 @@ def main() -> None:
         parser.error("Invalid training, fault, or site-budget settings")
     if "fog_sim" in args.fault_modes and args.fog_cache_root is None:
         parser.error("fog_sim requires --fog-cache-root")
+    if "mild_dataset" in args.fault_modes:
+        if tuple(args.fault_modes) != ("mild_dataset",):
+            parser.error("Train mild_dataset as its own single fault mode")
+        if args.faulty_root is None or args.data_cache_root is None:
+            parser.error("mild_dataset requires --faulty-root and --data-cache-root")
+    elif args.faulty_root is not None:
+        parser.error("--faulty-root requires --fault-modes mild_dataset")
     raw = json.loads(args.config.read_text(encoding="utf-8"))
     config = HierarchicalGateConfig(**raw)
     torch.manual_seed(args.seed)
@@ -207,6 +251,29 @@ def main() -> None:
         train = Subset(train, sampled)
     val = paired_dataset(args.vod_root, "val", args.radar_variant,
                          data_cache_root=args.data_cache_root)
+    faulty_dataset_sha256 = None
+    if args.faulty_root is not None:
+        digest = hashlib.sha256()
+        for split, dataset in (("train", train.dataset if isinstance(train, Subset) else train),
+                               ("val", val)):
+            path = args.faulty_root / split / "manifest.json"
+            content = path.read_bytes()
+            manifest = json.loads(content)
+            if (manifest.get("version") != MILD_FOG2_VERSION
+                    or manifest.get("split") != split
+                    or manifest.get("seed") != args.seed
+                    or manifest.get("radar_variant") != args.radar_variant
+                    or manifest.get("fog_severity") != 2
+                    or manifest.get("fog_alpha") != 0.01
+                    or manifest.get("fault_types") != list(MILD_FOG2_TYPES)
+                    or manifest.get("frame_ids") != [frame.frame_id for frame in dataset.frames]
+                    or Path(manifest.get("vod_root", "")).resolve()
+                    != args.vod_root.resolve()
+                    or Path(manifest.get("data_cache_root", "")).resolve()
+                    != args.data_cache_root.resolve()):
+                raise ValueError(f"Incompatible mild-fog2 training manifest: {path}")
+            digest.update(content)
+        faulty_dataset_sha256 = digest.hexdigest()
     selected = _validation_indices(val.frames, args.val_limit, args.seed,
                                    args.val_selection)
     selection_frame_ids = tuple(val.frames[index].frame_id for index in selected)
@@ -231,6 +298,7 @@ def main() -> None:
                 or saved.get("radar_variant") != args.radar_variant
                 or tuple(saved.get("fault_modes", ())) != modes
                 or saved.get("seed") != args.seed
+                or saved.get("faulty_dataset_sha256") != faulty_dataset_sha256
                 or (saved.get("selection_frame_ids") is not None
                     and tuple(saved["selection_frame_ids"]) != selection_frame_ids)):
             raise ValueError("Resume checkpoint has incompatible geometry or fault modes")
@@ -273,7 +341,8 @@ def main() -> None:
             name = _train_fault(row["frame_id"], epoch, modes, args.seed)
             clean = row["clean_lidar"]
             faulty = faulted(clean, name, frame_id=row["frame_id"],
-                             fog_cache=caches.get("train")).to(args.device)
+                             fog_cache=caches.get("train"),
+                             faulty_root=args.faulty_root, split="train").to(args.device)
             truth = missing_target(clean[:, :3].to(args.device), faulty)
             radar = row["radar"].to(args.device)
             output = model(radar, faulty, target_fine=truth, teacher_forcing=True)
@@ -285,7 +354,8 @@ def main() -> None:
             loss_sum += float(loss.detach())
             frames += 1
         validation = evaluate(model, val_loader, args.device, modes,
-                              tuple(sorted(args.budgets)), caches.get("val"))
+                              tuple(sorted(args.budgets)), caches.get("val"),
+                              args.faulty_root)
         scheduler.step()
         # Select among precision-feasible budgets first. The graded fallback
         # only distinguishes checkpoints before any budget becomes feasible.
@@ -307,7 +377,8 @@ def main() -> None:
               seed=args.seed, validation=validation, selection_score=score,
               selection_frame_ids=selection_frame_ids,
               inherited_selection_frame_ids=inherited_selection_frame_ids,
-              initialized_from=initialized_from)
+              initialized_from=initialized_from,
+              faulty_dataset_sha256=faulty_dataset_sha256)
         if score > best:
             best = score
             _save(best_path, model, optimizer, scheduler,
@@ -315,7 +386,8 @@ def main() -> None:
                   seed=args.seed, validation=validation, selection_score=score,
                   selection_frame_ids=selection_frame_ids,
                   inherited_selection_frame_ids=inherited_selection_frame_ids,
-                  initialized_from=initialized_from)
+                  initialized_from=initialized_from,
+                  faulty_dataset_sha256=faulty_dataset_sha256)
         print(f"Epoch {epoch}: loss={record['train_loss']:.4f} score={score:.4f} "
               f"validation={json.dumps(validation)}", flush=True)
 

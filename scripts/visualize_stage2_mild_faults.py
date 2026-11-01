@@ -17,8 +17,8 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage2.mild_fault_data import (
-    MILD_FAULT_ENCODING, MILD_FAULT_TYPES, MILD_FAULT_VERSION, decode_mild_xyz,
-    frame_seed,
+    MILD_FAULT_ENCODING, MILD_FAULT_VERSION,
+    MILD_FOG2_VERSION, decode_mild_xyz, fault_types_for_version, frame_seed,
 )
 
 
@@ -31,7 +31,7 @@ def _find_mild_root(search_root: Path, split: str) -> Path:
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if manifest.get("version") == MILD_FAULT_VERSION:
+        if manifest.get("version") in (MILD_FAULT_VERSION, MILD_FOG2_VERSION):
             matches.append(path.parent.parent)
     if len(matches) != 1:
         found = "\n".join(str(path) for path in matches) or "none"
@@ -153,8 +153,10 @@ def render(mild_root: Path, output_root: Path, split: str, per_fault: int,
            frame_ids: list[str] | None, seed: int, max_display_points: int) -> list[dict]:
     manifest_path = mild_root / split / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") != MILD_FAULT_VERSION or manifest.get("split") != split:
-        raise ValueError(f"Not a {MILD_FAULT_VERSION} {split} manifest: {manifest_path}")
+    version = manifest.get("version")
+    fault_types = fault_types_for_version(version)
+    if manifest.get("split") != split:
+        raise ValueError(f"Wrong {split} manifest: {manifest_path}")
     assignment = manifest["frame_faults"]
     if frame_ids:
         unknown = set(frame_ids) - set(assignment)
@@ -164,7 +166,7 @@ def render(mild_root: Path, output_root: Path, split: str, per_fault: int,
     else:
         rng = random.Random(seed)
         selected = []
-        for fault_type in MILD_FAULT_TYPES:
+        for fault_type in fault_types:
             candidates = [frame_id for frame_id in manifest["frame_ids"]
                           if assignment[frame_id] == fault_type
                           and (mild_root / split / f"{frame_id}.npz").is_file()]
@@ -179,7 +181,7 @@ def render(mild_root: Path, output_root: Path, split: str, per_fault: int,
         cache_path = mild_root / split / f"{frame_id}.npz"
         with np.load(cache_path, allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata_json"].item()))
-            expected = {"version": MILD_FAULT_VERSION, "encoding": MILD_FAULT_ENCODING,
+            expected = {"version": version, "encoding": MILD_FAULT_ENCODING,
                         "frame_id": frame_id, "split": split, "fault_type": fault_type,
                         "source_manifest_sha256": manifest["source_manifest_sha256"]}
             if any(metadata.get(key) != value for key, value in expected.items()):

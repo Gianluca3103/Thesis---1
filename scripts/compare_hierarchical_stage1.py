@@ -137,9 +137,16 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
               budgets: tuple[int, ...], fog_cache, score_mode: str,
               radar_radius_m: float | None = None,
               thresholds: tuple[float, ...] = (),
-              radar_min_points: int | None = None) -> dict:
+              radar_min_points: int | None = None,
+              faulty_root: Path | None = None) -> dict:
     totals = {name: {mode: _new_totals(budgets) for mode in modes}
               for name in models}
+    group_assignment = (json.loads((faulty_root / "val" / "manifest.json").read_text(
+        encoding="utf-8"))["frame_faults"] if faulty_root is not None else {})
+    group_totals = {name: {group: _new_totals(budgets)
+                           for group in set(group_assignment.values())}
+                    for name in models}
+    group_frames = {group: 0 for group in set(group_assignment.values())}
     parent_totals = {mode: {scale: {"tp": 0, "selected": 0, "target": 0}
                             for scale in (4, 2)} for mode in modes}
     radar_reach = {mode: {"within_radius": 0, "target": 0} for mode in modes}
@@ -172,8 +179,13 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                 1e-7)
             baseline_field = baseline_coords[:, 1:]
         for mode in modes:
+            group = (group_assignment[row["frame_id"]]
+                     if mode == "mild_dataset" else None)
+            if group is not None:
+                group_frames[group] += 1
             faulty = faulted(clean, mode, frame_id=row["frame_id"],
-                             fog_cache=fog_cache).to(device)
+                             fog_cache=fog_cache, faulty_root=faulty_root,
+                             split="val").to(device)
             all_target = missing_target(clean[:, :3].to(device), faulty)
             if len(all_target) and radar_tree is not None:
                 distance, _ = radar_tree.query(
@@ -195,6 +207,9 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                 probabilities = probabilities[eligible]
             _accumulate(totals["hierarchical"][mode], fine_coords, rank,
                         target, budgets)
+            if group is not None:
+                _accumulate(group_totals["hierarchical"][group], fine_coords,
+                            rank, target, budgets)
             if thresholds:
                 threshold_totals[mode] += _threshold_counts(
                     fine_coords, probabilities, target, threshold_values).cpu()
@@ -214,9 +229,19 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                     baseline_coords, scores = baseline_coords[eligible], scores[eligible]
                 _accumulate(totals["64_slot_baseline"][mode], baseline_coords,
                             scores, target, budgets)
+                if group is not None:
+                    _accumulate(group_totals["64_slot_baseline"][group],
+                                baseline_coords, scores, target, budgets)
     result = {name: {mode: {budget: _rates(count) for budget, count in rows.items()}
                      for mode, rows in modes_rows.items()}
               for name, modes_rows in totals.items()}
+    if "mild_dataset" in modes:
+        for model_name in models:
+            result[model_name]["mild_dataset"]["by_fault_type"] = {
+                group: {"frames": group_frames[group],
+                        "budgets": {budget: _rates(count)
+                                    for budget, count in group_totals[model_name][group].items()}}
+                for group in group_totals[model_name]}
     for mode in modes:
         result["hierarchical"][mode]["parent_coverage"] = {
             str(scale): _rates(parent_totals[mode][scale]) for scale in (4, 2)}
@@ -241,6 +266,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--baseline-checkpoint", type=Path)
     parser.add_argument("--fog-cache-root", type=Path)
+    parser.add_argument("--faulty-root", type=Path,
+                        help="Mixed-fault cache for mild_dataset evaluation")
+    parser.add_argument("--evaluate-modes", nargs="+", choices=(
+        "total_loss", "fov_filter", "fog_sim", "mild_dataset"),
+        help="Override checkpoint training modes for this evaluation")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--model-selection-val-limit", type=int, default=0,
@@ -294,13 +324,28 @@ def main() -> None:
         if baseline_saved["radar_variant"] != saved["radar_variant"]:
             parser.error("Both checkpoints must use the same radar variant")
         models["64_slot_baseline"] = baseline
-    modes = tuple(saved["fault_modes"])
+    modes = tuple(args.evaluate_modes or saved["fault_modes"])
     if "fog_sim" in modes and args.fog_cache_root is None:
         parser.error("fog_sim comparison requires --fog-cache-root")
+    if "mild_dataset" in modes and args.faulty_root is None:
+        parser.error("mild_dataset comparison requires --faulty-root")
     fog = (SevereFogCache(args.fog_cache_root, "val", None,
                           seed=saved["seed"], check_complete=False)
            if args.fog_cache_root else None)
     dataset = paired_dataset(args.vod_root, "val", saved["radar_variant"])
+    if args.faulty_root is not None and "mild_dataset" in modes:
+        from models.radar_lidar_stage2.mild_fault_data import (
+            MILD_FOG2_TYPES, MILD_FOG2_VERSION)
+        manifest_path = args.faulty_root / "val" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("version") != MILD_FOG2_VERSION
+                or manifest.get("radar_variant") != saved["radar_variant"]
+                or manifest.get("fog_severity") != 2
+                or manifest.get("fog_alpha") != 0.01
+                or manifest.get("fault_types") != list(MILD_FOG2_TYPES)
+                or Path(manifest.get("vod_root", "")).resolve() != args.vod_root.resolve()
+                or manifest.get("frame_ids") != [frame.frame_id for frame in dataset.frames]):
+            parser.error(f"Incompatible mild-fog2 evaluation manifest: {manifest_path}")
     excluded = (set(saved.get("selection_frame_ids", ())) |
                 set(saved.get("inherited_selection_frame_ids", ())))
     if not excluded and args.model_selection_val_limit:
@@ -338,12 +383,12 @@ def main() -> None:
                                                **loader_args), args.device,
                             modes, budgets, fog, args.score_mode,
                             args.radar_radius_m, thresholds,
-                            args.radar_min_points)
+                            args.radar_min_points, args.faulty_root)
     heldout = _evaluate(models, DataLoader(Subset(dataset, selected[half:]),
                                            **loader_args), args.device,
                         modes, budgets, fog, args.score_mode,
                         args.radar_radius_m, thresholds,
-                        args.radar_min_points)
+                        args.radar_min_points, args.faulty_root)
     selected_budgets = {
         name: {mode: _select_budget(calibration[name][mode], budgets,
                                    args.minimum_precision) for mode in modes}
@@ -386,6 +431,8 @@ def main() -> None:
                                if args.radar_radius_m is not None else
                                "rank and select top K per frame"),
         "radar_variant": saved["radar_variant"],
+        "evaluated_fault_modes": modes,
+        "faulty_root": str(args.faulty_root.resolve()) if args.faulty_root else None,
         "hierarchical_checkpoint": str(args.checkpoint.resolve()),
         "hierarchical_sha256": _sha256(args.checkpoint),
         "inference_parent_budgets": {

@@ -204,15 +204,17 @@ def load_faulty(root: Path, split: str, frame_id: str) -> torch.Tensor:
             f"under {root}; found {len(matches)}")
     if matches[0].suffix == ".npz":
         from .mild_fault_data import (
-            MILD_FAULT_ENCODING, MILD_FAULT_TYPES, MILD_FAULT_VERSION,
-            decode_mild_xyz,
+            MILD_FAULT_ENCODING, decode_mild_xyz, fault_types_for_version,
         )
         with np.load(matches[0], allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata_json"].item()))
-            if (metadata.get("version") != MILD_FAULT_VERSION
-                    or metadata.get("frame_id") != frame_id
+            try:
+                fault_types = fault_types_for_version(metadata.get("version"))
+            except ValueError as error:
+                raise ValueError(f"Invalid mild-fault metadata: {matches[0]}") from error
+            if (metadata.get("frame_id") != frame_id
                     or metadata.get("split") != split
-                    or metadata.get("fault_type") not in MILD_FAULT_TYPES
+                    or metadata.get("fault_type") not in fault_types
                     or metadata.get("encoding") != MILD_FAULT_ENCODING):
                 raise ValueError(f"Invalid mild-fault metadata: {matches[0]}")
             points = decode_mild_xyz(

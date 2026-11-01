@@ -9,12 +9,24 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage2.mild_fault_data import (
-    MILD_FAULT_ENCODING, MILD_FAULT_TYPES, MILD_FAULT_VERSION, encode_mild_xyz,
+    MILD_FAULT_ENCODING, MILD_FAULT_TYPES, MILD_FAULT_VERSION,
+    MILD_FOG2_TYPES, MILD_FOG2_VERSION, balanced_fault_assignment,
+    encode_mild_xyz,
 )
 from scripts.visualize_stage2_mild_faults import _removed_mask, render
+from scripts.train_hierarchical_stage1 import faulted
 
 
 class MildFaultViewerTest(unittest.TestCase):
+    def test_new_assignment_is_balanced_and_deterministic(self):
+        ids = [f"{index:05d}" for index in range(101)]
+        first = balanced_fault_assignment(ids, "val", 3103,
+                                          fault_types=MILD_FOG2_TYPES)
+        self.assertEqual(first, balanced_fault_assignment(
+            ids, "val", 3103, fault_types=MILD_FOG2_TYPES))
+        counts = [list(first.values()).count(name) for name in MILD_FOG2_TYPES]
+        self.assertEqual(max(counts) - min(counts), 1)
+
     def test_removed_mask_respects_duplicates_and_rejects_new_points(self):
         clean = np.array([[1, 2, 3], [1, 2, 3], [4, 5, 6]], dtype=np.float32)
         faulty = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
@@ -70,6 +82,34 @@ class MildFaultViewerTest(unittest.TestCase):
                              "removed": "removed_points"}[name]
                     self.assertIn(f'element vertex {row[field]}',
                                   path.read_bytes().split(b"end_header")[0].decode("ascii"))
+
+    def test_renders_new_fog2_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "new" / "val"
+            cache.mkdir(parents=True)
+            clean_root = root / "fixed" / "val" / "clean_lidar"
+            clean_root.mkdir(parents=True)
+            manifest = {"version": MILD_FOG2_VERSION, "split": "val",
+                        "data_cache_root": str(root / "fixed"),
+                        "source_manifest_sha256": "new-source", "frame_ids": ["00000"],
+                        "frame_faults": {"00000": "fog_sim_2"}}
+            (cache / "manifest.json").write_text(json.dumps(manifest))
+            clean = torch.tensor([[1., 0., 0., 1.], [2., 0., 0., 1.]])
+            torch.save({"frame_id": "00000", "points": clean}, clean_root / "00000.pt")
+            metadata = {"version": MILD_FOG2_VERSION, "encoding": MILD_FAULT_ENCODING,
+                        "frame_id": "00000", "split": "val", "fault_type": "fog_sim_2",
+                        "source_manifest_sha256": "new-source", "clean_points": 2,
+                        "retained_points": 1}
+            np.savez_compressed(cache / "00000.npz",
+                                points_bytes=encode_mild_xyz(clean[:1, :3].numpy()),
+                                metadata_json=np.asarray(json.dumps(metadata)))
+            rows = render(root / "new", root / "views", "val", 1, None, 3103, 10)
+            self.assertEqual(rows[0]["fault_type"], "fog_sim_2")
+            self.assertEqual(rows[0]["removed_points"], 1)
+            loaded = faulted(clean, "mild_dataset", frame_id="00000",
+                             faulty_root=root / "new", split="val")
+            self.assertTrue(torch.equal(loaded, clean[:1, :3]))
 
 
 if __name__ == "__main__":
