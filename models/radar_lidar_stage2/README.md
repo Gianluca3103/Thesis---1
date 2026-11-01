@@ -112,6 +112,15 @@ instead of `--mild-root` to find a single mild cache within an output directory;
 use repeated `--frame-id` options to inspect specific frames. The viewer does
 not run Stage I or Stage II predictions.
 
+To compare a lighter fog input against the current severity-5 input on the
+same validation frames, run `python -m scripts.preview_stage2_milder_fog` with
+`--search-root` (or `--mild-root`), `--fog-simulator-root`, and `--output-root`.
+The default lighter setting is severity 2 (alpha 0.01); `--severity 3` uses
+alpha 0.02. The script applies the original fog simulator to raw VoD LiDAR,
+crops to the Stage-II radar sector, filters to original detectable returns,
+and writes interactive HTML and full-resolution PLY files. It creates a
+preview for inspection, not a replacement training cache.
+
 ## Run on the professor machine
 
 For a new official five-scan radar-only Stage-I and selective-addition Stage-II
