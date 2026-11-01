@@ -89,10 +89,11 @@ def _threshold_rows(counts: torch.Tensor, thresholds: tuple[float, ...]) -> dict
 
 
 def _best_threshold(rows: dict, metric: str,
-                    minimum_precision: float | None = None) -> dict | None:
+                    minimum_precision: float | None = None,
+                    minimum_recall: float | None = None) -> dict | None:
     feasible = ((threshold, row) for threshold, row in rows.items()
-                if minimum_precision is None or
-                row["precision"] >= minimum_precision)
+                if (minimum_precision is None or row["precision"] >= minimum_precision)
+                and (minimum_recall is None or row["recall"] >= minimum_recall))
     chosen = max(feasible,
                  key=lambda item: (item[1][metric], item[1]["precision"],
                                    float(item[0])), default=None)
@@ -394,24 +395,30 @@ def main() -> None:
                                    args.minimum_precision) for mode in modes}
         for name in models}
     threshold_selection = {}
+    heldout_operating_points = {}
     if thresholds:
         for mode in modes:
             calibration_rows = calibration["hierarchical"][mode]["threshold_sweep"]
             heldout_rows = heldout["hierarchical"][mode]["threshold_sweep"]
             threshold_selection[mode] = {}
-            for label, metric, precision_floor in (
-                    ("best_f1", "f1", None),
-                    ("best_iou", "iou", None),
-                    ("best_recall", "recall", None),
+            heldout_operating_points[mode] = {}
+            for label, metric, precision_floor, recall_floor in (
+                    ("best_f1", "f1", None, None),
+                    ("best_iou", "iou", None, None),
+                    ("best_recall", "recall", None, None),
                     ("best_recall_at_minimum_precision", "recall",
-                     args.minimum_precision)):
+                     args.minimum_precision, None),
+                    ("precision_at_90_percent_recall", "precision", None, 0.90),
+                    ("precision_at_95_percent_recall", "precision", None, 0.95)):
                 selected_threshold = _best_threshold(calibration_rows, metric,
-                                                     precision_floor)
+                                                     precision_floor, recall_floor)
                 threshold_selection[mode][label] = (
                     {"calibration": selected_threshold,
                      "heldout": {"threshold": selected_threshold["threshold"],
                                  **heldout_rows[f"{selected_threshold['threshold']:.6f}"]}}
                     if selected_threshold else None)
+                heldout_operating_points[mode][label] = _best_threshold(
+                    heldout_rows, metric, precision_floor, recall_floor)
     if args.radar_radius_m is None:
         metric_scope = "full Stage-II ROI"
     elif args.radar_min_points is None:
@@ -459,6 +466,7 @@ def main() -> None:
             name: {mode: heldout[name][mode][str(selected_budgets[name][mode])]
                    for mode in modes} for name in models},
         "threshold_selection": threshold_selection,
+        "heldout_operating_points": heldout_operating_points,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -467,6 +475,8 @@ def main() -> None:
         print("Hierarchical threshold sweep (calibration choice, held-out result):",
               flush=True)
         print(json.dumps(threshold_selection, indent=2), flush=True)
+        print("Descriptive operating points on held-out frames:", flush=True)
+        print(json.dumps(heldout_operating_points, indent=2), flush=True)
     print(f"Report: {args.output}", flush=True)
 
 

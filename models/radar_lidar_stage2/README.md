@@ -131,6 +131,14 @@ evaluates it on validation frames excluded from checkpoint selection. If the
 previous hierarchical checkpoint is present, it is evaluated on the same new
 fault set for a matched comparison. The new Stage-I training mode reads the
 saved faulty XYZ and targets clean fine voxels absent from that input.
+After training, `bash scripts/run_hierarchical_mild_fog2_threshold_sweep.sh`
+compares old and new Stage I on the same 256 held-out validation frames (about
+20% of the validation split), using a separate 256-frame calibration subset.
+It sweeps score thresholds at 0.0001 intervals over the full candidate pool,
+both for the full ROI and for the 1 m radar eligibility rules requiring 3 or
+5 raw returns. Reports include maximum recall at 20% precision and maximum
+precision at 90% and 95% recall, with calibrated and descriptive held-out
+operating points clearly separated.
 
 ## Run on the professor machine
 

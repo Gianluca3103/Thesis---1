@@ -128,5 +128,11 @@ def test_threshold_sweep_counts_exact_matches_and_selects_on_calibration():
     assert _best_threshold(rows, "recall")["threshold"] == 0.0
     assert _best_threshold(rows, "recall", 0.75)["threshold"] == 0.8
     assert _best_threshold(rows, "recall", 1.01) is None
+    operating_rows = {"0.000000": {"precision": 0.10, "recall": 1.00},
+                      "0.500000": {"precision": 0.25, "recall": 0.95},
+                      "0.800000": {"precision": 0.50, "recall": 0.89}}
+    assert _best_threshold(operating_rows, "precision", minimum_recall=0.95)["threshold"] == 0.5
+    assert _best_threshold(operating_rows, "precision", minimum_recall=0.90)["threshold"] == 0.5
+    assert _best_threshold(operating_rows, "precision", minimum_recall=1.01) is None
     assert _threshold_counts(coords[:0], probabilities[:0], coords[:0],
                              torch.tensor(thresholds)).shape == (4, 3)
