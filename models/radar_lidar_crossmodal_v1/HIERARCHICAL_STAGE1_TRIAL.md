@@ -137,3 +137,44 @@ Stage I checkpoint. End-to-end Stage II use requires a fresh gate cache and
 retraining after this trial meets the coordinate criterion. Fault-dependent
 gates also require cache generation per fault rather than the present fixed
 radar-only gate cache.
+
+## Interactive sample views
+
+`scripts.visualize_hierarchical_stage1` writes an `index.html` with the same
+rotatable point-cloud panels as earlier Stage I viewers. It shows radar,
+clean LiDAR, the selected gate, missing clean target cells, surviving faulty
+LiDAR, and an exact TP/FP/FN audit. Gate points are **voxel centers available
+to Stage II**, not reconstructed LiDAR returns. Each frame/fault also gets
+gate and missing-target PLY files plus counts in `summary.json`.
+
+While training is running, use CPU inference in a second terminal so the
+viewer does not take training GPU memory. The checkpoint is saved atomically:
+
+```bash
+SRC=/media/arrubuntu20/EA0A117F0A114A49/Thesis-1-hierarchical-stage1-20261101
+DATA=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs
+OUT="$DATA/hierarchical_stage1_expanded_full_20261101"
+VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
+PY=/mnt/3D10B36523559581/Gianluca/Sensor-Fusion/.venv_model_v2/bin/python
+cd "$SRC"
+export PYTHONPATH="$SRC"
+"$PY" -u -m scripts.visualize_hierarchical_stage1 \
+  --vod-root "$VOD" --checkpoint "$OUT/last.ckpt" \
+  --output-root "$OUT/views_current_top10000" \
+  --limit 5 --temporal-gap 20 --budget 10000 --device cpu
+```
+
+After training and matched comparison complete, use the selected checkpoint
+and the comparison's actual held-out frame IDs:
+
+```bash
+"$PY" -u -m scripts.visualize_hierarchical_stage1 \
+  --vod-root "$VOD" --checkpoint "$OUT/best.ckpt" \
+  --comparison "$OUT/matched_heldout.json" \
+  --output-root "$OUT/views_best_heldout_top10000" \
+  --limit 5 --budget 10000 --device cuda
+```
+
+Open the printed `index.html` in a browser. For a chosen validation frame,
+`--frame-id 08236 00405` can replace automatic sampling; manually chosen
+frames are qualitative examples and may have influenced checkpoint selection.
