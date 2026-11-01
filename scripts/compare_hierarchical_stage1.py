@@ -1,7 +1,9 @@
 """Matched Stage-I gate evaluation on disjoint calibration and held-out frames.
 
 Both models are scored on the same Stage-II ROI and the same fault-specific
-missing clean voxels. Exact voxel matches are the primary Stage-II gate metric.
+missing clean voxels. An optional radar-radius scope filters both targets and
+candidate sites before budget ranking. Exact voxel matches are the primary
+Stage-II gate metric.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ import argparse
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 
@@ -61,6 +64,24 @@ def _new_totals(budgets: tuple[int, ...]) -> dict:
             for key in ("pool", *(str(b) for b in budgets))}
 
 
+def _stage2_centers(coords: torch.Tensor) -> torch.Tensor:
+    """Physical centers of local [z,y,x] Stage-II fine cells."""
+    xyz = coords[:, [2, 1, 0]].to(torch.float32)
+    origin = xyz.new_tensor(STAGE2_GRID.minimum_xyz)
+    size = xyz.new_tensor(STAGE2_GRID.voxel_xyz)
+    return origin + (xyz + 0.5) * size
+
+
+def _radar_eligible(coords: torch.Tensor, radar_tree: cKDTree | None,
+                    radius_m: float) -> torch.Tensor:
+    """Fine cells within radius of an occupied Stage-I radar voxel center."""
+    if not len(coords) or radar_tree is None:
+        return torch.zeros(len(coords), device=coords.device, dtype=torch.bool)
+    distance, _ = radar_tree.query(_stage2_centers(coords).cpu().numpy(), k=1)
+    return torch.as_tensor(distance <= radius_m + 1e-6,
+                           device=coords.device, dtype=torch.bool)
+
+
 def _select_budget(rows: dict, budgets: tuple[int, ...], minimum_precision: float) -> int:
     feasible = [budget for budget in budgets
                 if rows[str(budget)]["precision"] >= minimum_precision]
@@ -75,12 +96,15 @@ def _select_budget(rows: dict, budgets: tuple[int, ...], minimum_precision: floa
 
 @torch.no_grad()
 def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
-              budgets: tuple[int, ...], fog_cache, score_mode: str) -> dict:
+              budgets: tuple[int, ...], fog_cache, score_mode: str,
+              radar_radius_m: float | None = None) -> dict:
     totals = {name: {mode: _new_totals(budgets) for mode in modes}
               for name in models}
     parent_totals = {mode: {scale: {"tp": 0, "selected": 0, "target": 0}
                             for scale in (4, 2)} for mode in modes}
     radar_reach = {mode: {"within_radius": 0, "target": 0} for mode in modes}
+    scope_counts = {mode: {"all_missing": 0, "eligible_missing": 0}
+                    for mode in modes}
     for row in tqdm(loader, desc="Matched Stage-I gate comparison", unit="frame"):
         radar = row["radar"].to(device)
         clean = row["clean_lidar"]
@@ -101,20 +125,24 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
         for mode in modes:
             faulty = faulted(clean, mode, frame_id=row["frame_id"],
                              fog_cache=fog_cache).to(device)
-            target = missing_target(clean[:, :3].to(device), faulty)
-            if len(target) and radar_tree is not None:
-                origin = target.new_tensor(STAGE2_GRID.minimum_xyz,
-                                           dtype=torch.float32)
-                size = target.new_tensor(STAGE2_GRID.voxel_xyz,
-                                         dtype=torch.float32)
-                target_xyz = (origin + (target[:, [2, 1, 0]].float() + 0.5) * size)
-                distance, _ = radar_tree.query(target_xyz.cpu().numpy(), k=1)
+            all_target = missing_target(clean[:, :3].to(device), faulty)
+            if len(all_target) and radar_tree is not None:
+                distance, _ = radar_tree.query(
+                    _stage2_centers(all_target).cpu().numpy(), k=1)
                 radar_reach[mode]["within_radius"] += int((distance <= 1.6 + 1e-6).sum())
-            radar_reach[mode]["target"] += len(target)
+            radar_reach[mode]["target"] += len(all_target)
+            target = (all_target[_radar_eligible(all_target, radar_tree, radar_radius_m)]
+                      if radar_radius_m is not None else all_target)
+            scope_counts[mode]["all_missing"] += len(all_target)
+            scope_counts[mode]["eligible_missing"] += len(target)
             generated = models["hierarchical"](radar, faulty)
             rank, _ = fine_ranking(generated, score_mode)
-            _accumulate(totals["hierarchical"][mode], generated["fine_coords"],
-                        rank, target, budgets)
+            fine_coords = generated["fine_coords"]
+            if radar_radius_m is not None:
+                eligible = _radar_eligible(fine_coords, radar_tree, radar_radius_m)
+                fine_coords, rank = fine_coords[eligible], rank[eligible]
+            _accumulate(totals["hierarchical"][mode], fine_coords, rank,
+                        target, budgets)
             for scale, generated_coords in (
                     (4, torch.unique(generated["middle_coords"] // 2, dim=0)),
                     (2, generated["middle_coords"])):
@@ -124,8 +152,13 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
                 parent_totals[mode][scale]["target"] += len(torch.unique(
                     target // scale, dim=0))
             if baseline_field is not None:
-                _accumulate(totals["64_slot_baseline"][mode], baseline_field,
-                            baseline_scores, target, budgets)
+                baseline_coords, scores = baseline_field, baseline_scores
+                if radar_radius_m is not None:
+                    eligible = _radar_eligible(baseline_coords, radar_tree,
+                                               radar_radius_m)
+                    baseline_coords, scores = baseline_coords[eligible], scores[eligible]
+                _accumulate(totals["64_slot_baseline"][mode], baseline_coords,
+                            scores, target, budgets)
     result = {name: {mode: {budget: _rates(count) for budget, count in rows.items()}
                      for mode, rows in modes_rows.items()}
               for name, modes_rows in totals.items()}
@@ -136,6 +169,11 @@ def _evaluate(models: dict, loader, device: str, modes: tuple[str, ...],
             **radar_reach[mode],
             "recall": (radar_reach[mode]["within_radius"] / radar_reach[mode]["target"]
                        if radar_reach[mode]["target"] else 1.0)}
+        result["hierarchical"][mode]["target_scope"] = {
+            **scope_counts[mode],
+            "eligible_fraction": (scope_counts[mode]["eligible_missing"] /
+                                  scope_counts[mode]["all_missing"]
+                                  if scope_counts[mode]["all_missing"] else 1.0)}
     return result
 
 
@@ -157,6 +195,8 @@ def main() -> None:
     parser.add_argument("--minimum-precision", type=float, default=0.20)
     parser.add_argument("--score-mode", choices=("hierarchical", "fine_only"),
                         default="hierarchical")
+    parser.add_argument("--radar-radius-m", type=float,
+                        help="Evaluate only fine cells within this many meters of an occupied radar voxel center; filter candidates before top-K ranking")
     parser.add_argument("--coarse-parent-budget", type=int,
                         help="Inference-only parent-budget ablation")
     parser.add_argument("--middle-parent-budget", type=int,
@@ -167,6 +207,8 @@ def main() -> None:
             or args.temporal_gap < 0
             or not args.budgets
             or min(args.budgets) < 1 or not 0 < args.minimum_precision <= 1
+            or (args.radar_radius_m is not None and
+                (not math.isfinite(args.radar_radius_m) or args.radar_radius_m <= 0))
             or (args.coarse_parent_budget is not None and args.coarse_parent_budget < 1)
             or (args.middle_parent_budget is not None and args.middle_parent_budget < 1)):
         parser.error("Invalid frame limit, worker count, budget, or precision")
@@ -227,16 +269,24 @@ def main() -> None:
                        collate_fn=_single)
     calibration = _evaluate(models, DataLoader(Subset(dataset, selected[:half]),
                                                **loader_args), args.device,
-                            modes, budgets, fog, args.score_mode)
+                            modes, budgets, fog, args.score_mode,
+                            args.radar_radius_m)
     heldout = _evaluate(models, DataLoader(Subset(dataset, selected[half:]),
                                            **loader_args), args.device,
-                        modes, budgets, fog, args.score_mode)
+                        modes, budgets, fog, args.score_mode,
+                        args.radar_radius_m)
     selected_budgets = {
         name: {mode: _select_budget(calibration[name][mode], budgets,
                                    args.minimum_precision) for mode in modes}
         for name in models}
     result = {
         "metric": "exact missing clean voxel within Stage-II ROI",
+        "metric_scope": ("full Stage-II ROI" if args.radar_radius_m is None else
+                         "missing clean and predicted fine voxel centers within radar radius"),
+        "radar_radius_m": args.radar_radius_m,
+        "site_budget_policy": ("filter candidates by radar radius, then rank and select top K per frame"
+                               if args.radar_radius_m is not None else
+                               "rank and select top K per frame"),
         "radar_variant": saved["radar_variant"],
         "hierarchical_checkpoint": str(args.checkpoint.resolve()),
         "hierarchical_sha256": _sha256(args.checkpoint),
