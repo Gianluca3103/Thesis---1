@@ -31,16 +31,34 @@ for scope in full_roi radar3_1m radar5_1m; do
   for label in new old; do
     checkpoint=$NEW
     if [[ "$label" == old ]]; then checkpoint=$OLD; fi
+    report="$OUT/${scope}_${label}.json"
+    if [[ -s "$report" ]] && "$PY" -c '
+import json, sys
+try:
+    row = json.load(open(sys.argv[1]))
+    expected = {"full_roi": (None, None), "radar3_1m": (1.0, 3), "radar5_1m": (1.0, 5)}[sys.argv[2]]
+    valid = (row.get("threshold_steps") == 10000 and row.get("sampled_frames") == 512
+             and (row.get("radar_radius_m"), row.get("radar_min_points")) == expected
+             and "heldout_operating_points" in row)
+except (OSError, ValueError, KeyError):
+    valid = False
+sys.exit(0 if valid else 1)
+' "$report" "$scope" 2>/dev/null; then
+      printf 'Reusing completed %s %s sweep: %s\n' "$scope" "$label" "$report"
+      continue
+    fi
+    printf 'Starting %s %s sweep (512 frames, 10,001 thresholds). Log: %s\n' \
+      "$scope" "$label" "$OUT/${scope}_${label}.log"
     "$PY" -u -m scripts.compare_hierarchical_stage1 \
       --vod-root "$VOD" --checkpoint "$checkpoint" \
       --faulty-root "$MILD" --evaluate-modes mild_dataset \
-      --output "$OUT/${scope}_${label}.json" \
+      --output "$report" \
       --limit 512 --seed 3103 --temporal-gap 0 \
       --budgets 250 500 1000 2000 5000 10000 15000 20000 30000 \
       --minimum-precision 0.20 --threshold-steps 10000 \
       --device cuda "${scope_args[@]}" \
-      > "$OUT/${scope}_${label}.log" 2>&1
-    printf '%s %s complete: %s\n' "$scope" "$label" "$OUT/${scope}_${label}.json"
+      2>&1 | tee "$OUT/${scope}_${label}.log"
+    printf '%s %s complete: %s\n' "$scope" "$label" "$report"
   done
 done
 
