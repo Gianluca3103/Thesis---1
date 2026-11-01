@@ -1,0 +1,8 @@
+{
+  "channels": 64,
+  "coarse_parent_budget": 3200,
+  "middle_parent_budget": 20000,
+  "negative_loss_weight": 0.35,
+  "tversky_weight": 0.5,
+  "hard_negative_weight": 0.5
+}
