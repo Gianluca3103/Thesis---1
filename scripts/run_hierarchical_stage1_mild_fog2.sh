@@ -15,10 +15,26 @@ OUT=${OUT:-$DATA/hierarchical_stage1_mild_fog2_20261101}
 OLD=${OLD:-$DATA/hierarchical_stage1_expanded_full_20261101/best.ckpt}
 WORKERS=${WORKERS:-4}
 VARIANT=radar_20frames_verified_doppler_radial
+LOOKUP="$FOG_SIM/integral_lookup_tables/original/integral_0m_to_200m_stepsize_0.1m_tau_h_20ns_alpha_0.01.pickle"
+LOOKUP_SHA256=cc35d0a4809c2e44a738afb9e9e13c5f7926cddc295970214a7f61b38b99c1d8
+LOOKUP_URL=https://raw.githubusercontent.com/MartinHahner/LiDAR_fog_sim/1cb9e072976047a7d11f859797d939676d37d88f/integral_lookup_tables/original/integral_0m_to_200m_stepsize_0.1m_tau_h_20ns_alpha_0.01.pickle
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
+[[ -s "$PY" && -s "$FOG_SIM/fog_simulation.py" ]] || fail "Missing Python or fog simulator source"
+if [[ ! -s "$LOOKUP" ]]; then
+  mkdir -p "$(dirname "$LOOKUP")"
+  temporary="$LOOKUP.$$.tmp"
+  trap 'rm -f "$temporary"' EXIT
+  curl -fL --retry 3 "$LOOKUP_URL" -o "$temporary"
+  actual=$(sha256sum "$temporary")
+  [[ "${actual%% *}" == "$LOOKUP_SHA256" ]] || fail "Downloaded severity-2 fog lookup checksum differs"
+  mv "$temporary" "$LOOKUP"
+  trap - EXIT
+fi
+actual=$(sha256sum "$LOOKUP")
+[[ "${actual%% *}" == "$LOOKUP_SHA256" ]] || fail "Severity-2 fog lookup checksum differs: $LOOKUP"
 for required in "$PY" "$CONFIG" "$FOG_SIM/fog_simulation.py" \
-  "$FOG_SIM/integral_lookup_tables/original/integral_0m_to_200m_stepsize_0.1m_tau_h_20ns_alpha_0.01.pickle" \
+  "$LOOKUP" \
   "$RAW/train/manifest.json" "$RAW/val/manifest.json" \
   "$REPO/scripts/cache_stage2_mild_fog2.py" \
   "$REPO/scripts/train_hierarchical_stage1.py"; do
