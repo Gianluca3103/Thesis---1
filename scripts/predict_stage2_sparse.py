@@ -15,7 +15,7 @@ import torch
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
-    VERSION as RADAR_PRUNER_VERSION, radar_support_mask)
+    PRUNER_VERSIONS, radar_support_mask)
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
@@ -265,7 +265,7 @@ def main() -> None:
     if (saved2["stage1_sha256"] != sha256(args.stage1_checkpoint)
             or saved2["radar_variant"] != args.radar_variant):
         raise ValueError("Stage-II checkpoint was trained with a different Stage I")
-    if (saved1.get("version") == RADAR_PRUNER_VERSION and
+    if (saved1.get("version") in PRUNER_VERSIONS and
             args.stage2_cache_root and args.faulty_root is None):
         parser.error("Cached radar-pruner inference requires --faulty-root")
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
@@ -284,7 +284,7 @@ def main() -> None:
                                       "support_radius_m", 3.2))),
                                   float(saved2["gate_threshold"]), args.split,
                                   [frame.frame_id for frame in dataset.frames])
-        if saved1.get("version") == RADAR_PRUNER_VERSION:
+        if saved1.get("version") in PRUNER_VERSIONS:
             expected = bind_faulty_cache_identity(expected, args.faulty_root,
                                                   args.split)
         cache = Stage2FixedCache(args.stage2_cache_root / args.split, expected)
@@ -327,12 +327,13 @@ def main() -> None:
                                  occupancy_threshold=args.occupancy_threshold,
                                  missing_only=not args.full_estimate,
                                  use_residual=not args.zero_residual)
-        if saved1.get("version") == RADAR_PRUNER_VERSION:
-            support = radar_support_mask(row["radar"])
+        if saved1.get("version") in PRUNER_VERSIONS:
+            support = radar_support_mask(
+                row["radar"], float(saved1["support_radius_m"]))
             chosen = predicted["occupied_coordinates"][:, 1:].cpu().numpy()
             if len(chosen) and not bool(support[
                     chosen[:, 0], chosen[:, 1], chosen[:, 2]].all()):
-                raise RuntimeError("Stage II emitted a voxel outside the 3-radar-voxel/3 m rule")
+                raise RuntimeError("Stage II emitted a voxel outside its radar-support rule")
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())

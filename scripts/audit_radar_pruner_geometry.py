@@ -45,6 +45,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--radius-m", type=float, choices=(1.6, 3.0), default=3.0)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
@@ -53,7 +54,8 @@ def main() -> None:
     ids = [frame.frame_id for frame in dataset.frames]
     cache = RadarSupportCache(args.support_cache_root / args.split,
                               identity(args.split, ids, args.radar_variant,
-                                       data_cache_root=args.data_cache_root))
+                                       data_cache_root=args.data_cache_root,
+                                       radius_m=args.radius_m))
     cache.check_complete()
     manifest = json.loads((args.faulty_root / args.split / "manifest.json").read_text(
         encoding="utf-8"))
@@ -83,7 +85,8 @@ def main() -> None:
             group["addition_candidates"] += len(coords) - int(observed.sum())
             group["all_missing"] += len(missing)
             group["eligible_missing"] += eligible
-    report = {"geometry_rule": "3 distinct radar voxel centres within 3.0 m",
+    report = {"geometry_rule": ("3 distinct radar voxel centres within "
+                                f"{args.radius_m:.1f} m"),
               "split": args.split,
               "fault_types": {name: _rates(group) for name, group in groups.items()}}
     args.output.parent.mkdir(parents=True, exist_ok=True)

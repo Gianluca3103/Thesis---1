@@ -68,7 +68,8 @@ def main() -> None:
             args.support_cache_root / split,
             radar_support_identity(split, [frame.frame_id for frame in dataset.frames],
                                    args.radar_variant,
-                                   data_cache_root=args.data_cache_root))
+                                   data_cache_root=args.data_cache_root,
+                                   radius_m=radius_m))
             if args.support_cache_root else None)
         if support_cache is not None:
             support_cache.check_complete()

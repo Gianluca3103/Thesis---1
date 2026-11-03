@@ -1,4 +1,4 @@
-"""Calibrate the 3-radar-voxel/3 m pruner and score disjoint held-out frames."""
+"""Calibrate a three-radar-voxel pruner on disjoint held-out frames."""
 
 from __future__ import annotations
 
@@ -143,13 +143,16 @@ def main() -> None:
     if args.limit < 2:
         parser.error("At least two validation frames are needed")
     model, saved = load_radar_pruner(args.checkpoint, args.device)
+    radius_m = float(saved["support_radius_m"])
+    target_recall = float(saved.get("target_eligible_recall", 0.95))
     dataset = paired_dataset(args.vod_root, "val", saved["radar_variant"],
                              include_clean=True,
                              data_cache_root=args.data_cache_root)
     ids = [frame.frame_id for frame in dataset.frames]
     cache = RadarSupportCache(args.support_cache_root / "val",
                               identity("val", ids, saved["radar_variant"],
-                                       data_cache_root=args.data_cache_root))
+                                       data_cache_root=args.data_cache_root,
+                                       radius_m=radius_m))
     cache.check_complete()
     manifest = json.loads((args.faulty_root / "val" / "manifest.json").read_text(
         encoding="utf-8"))
@@ -167,7 +170,9 @@ def main() -> None:
                              args.device, manifest["frame_faults"])
               for name, indices in splits.items()}
     report = {"checkpoint": str(args.checkpoint),
-              "geometry_rule": "3 distinct radar voxel centres within 3.0 m",
+              "geometry_rule": ("3 distinct radar voxel centres within "
+                                f"{radius_m:.1f} m"),
+              "target_eligible_recall": target_recall,
               "sampled_frames": len(selected),
               "calibration_frames": midpoint,
               "heldout_frames": len(selected) - midpoint,
@@ -184,6 +189,10 @@ def main() -> None:
         report["fault_types"][fault] = {
             "calibration": calibration,
             "heldout": _describe(held, indices)}
+        key = f"max_precision_at_{int(round(target_recall * 100))}pct_eligible_recall"
+        report["fault_types"][fault]["primary_heldout"] = (
+            report["fault_types"][fault]["heldout"]
+            ["calibrated_operating_points"][key])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Report: {args.output}; {len(selected)} frames = {midpoint} calibration "
@@ -193,12 +202,13 @@ def main() -> None:
         print(f"{fault}: geometry ceiling={held['geometry_full_recall_ceiling']:.2%}, "
               f"keep-all precision={held['keep_all']['precision']:.2%}, "
               f"mean candidates/frame={held['mean_candidate_cells']:,.0f}")
-        for label, row in held["calibrated_operating_points"].items():
-            if row is not None:
-                print(f"  {label}: P={row['precision']:.2%}, "
-                      f"R_eligible={row['eligible_recall']:.2%}, "
-                      f"R_full={row['full_recall']:.2%}, "
-                      f"cells/frame={row['selected'] / max(held['frames'], 1):,.0f}")
+        row = results["primary_heldout"]
+        if row is not None:
+            print(f"  calibration-selected at {target_recall:.0%} eligible recall: "
+                  f"P={row['precision']:.2%}, "
+                  f"R_eligible={row['eligible_recall']:.2%}, "
+                  f"R_full={row['full_recall']:.2%}, "
+                  f"cells/frame={row['selected'] / max(held['frames'], 1):,.0f}")
 
 
 if __name__ == "__main__":

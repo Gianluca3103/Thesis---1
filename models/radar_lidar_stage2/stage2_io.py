@@ -14,7 +14,7 @@ from models.radar_lidar_crossmodal_v1.fine_association import (
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import load_radar_autoencoder
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
-    VERSION as RADAR_PRUNER_VERSION, RadarPruner, load_radar_pruner,
+    PRUNER_VERSIONS, RadarPruner, load_radar_pruner,
     radar_support_mask)
 
 from .sparse_geometry import GRID
@@ -34,7 +34,7 @@ def sha256(path: Path) -> str:
 
 def load_stage1(path: Path, device: str, radar_variant: str):
     header = torch.load(path, map_location="cpu", weights_only=False)
-    if header.get("version") == RADAR_PRUNER_VERSION:
+    if header.get("version") in PRUNER_VERSIONS:
         model, saved = load_radar_pruner(path, device)
     elif header.get("version") == FINE_ASSOCIATION_VERSION:
         model, saved = load_fine_association(path, device)
@@ -57,9 +57,10 @@ def stage1_frame(model, radar: torch.Tensor, radius_m: float,
     if isinstance(model, RadarPruner):
         if faulty is None:
             raise ValueError("Radar pruner requires the faulty LiDAR input")
-        if radius_m != 3.0:
-            raise ValueError("Radar pruner requires the exact 3 m support radius")
-        support = radar_support_mask(radar) if support_mask is None else support_mask
+        if radius_m != model.config.support_radius_m:
+            raise ValueError("Radar pruner checkpoint and support radii differ")
+        support = (radar_support_mask(radar, radius_m)
+                   if support_mask is None else support_mask)
         output = model.exported(model(radar, faulty, support))
     else:
         batch = radar[None]

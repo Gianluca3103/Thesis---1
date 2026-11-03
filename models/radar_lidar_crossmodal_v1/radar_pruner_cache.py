@@ -12,14 +12,16 @@ import numpy as np
 
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from .radar_pruner import (CELL_COUNT, SHAPE, SUPPORT_MIN_VOXELS,
-                           SUPPORT_RADIUS_M, VERSION)
+                           SUPPORT_RADIUS_M, version_for_radius)
 
 
 def identity(split: str, frame_ids: list[str], radar_variant: str,
-             *, data_cache_root: Path | None = None) -> dict:
-    result = {"version": VERSION + "_support_cache_v1", "split": split,
+             *, data_cache_root: Path | None = None,
+             radius_m: float = SUPPORT_RADIUS_M) -> dict:
+    result = {"version": version_for_radius(radius_m) + "_support_cache_v1",
+            "split": split,
             "frame_ids": frame_ids, "radar_variant": radar_variant,
-            "grid": asdict(GRID), "radius_m": SUPPORT_RADIUS_M,
+            "grid": asdict(GRID), "radius_m": radius_m,
             "min_distinct_radar_voxels": SUPPORT_MIN_VOXELS}
     if data_cache_root is not None:
         manifest = Path(data_cache_root) / split / "manifest.json"

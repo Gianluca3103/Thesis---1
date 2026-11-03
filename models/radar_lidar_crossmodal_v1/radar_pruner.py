@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import math
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -22,6 +23,8 @@ from models.radar_lidar_stage2.sparse_geometry import GRID as GRID
 
 
 VERSION = "radar3vox_3m_pruner_v1"
+VERSION_1P6M = "radar3vox_1p6m_pruner_v1"
+PRUNER_VERSIONS = (VERSION, VERSION_1P6M)
 SUPPORT_RADIUS_M = 3.0
 SUPPORT_MIN_VOXELS = 3
 SHAPE = GRID.shape_zyx
@@ -64,8 +67,19 @@ def unique_radar_voxel_centers(radar_xyz: torch.Tensor | np.ndarray) -> np.ndarr
     return low + (indices.astype(np.float64) + 0.5) * size
 
 
-def radar_support_mask(radar_xyz: torch.Tensor | np.ndarray) -> np.ndarray:
-    """True precisely where >=3 distinct radar voxel centres lie within 3 m."""
+def version_for_radius(radius_m: float) -> str:
+    if radius_m == 3.0:
+        return VERSION
+    if radius_m == 1.6:
+        return VERSION_1P6M
+    raise ValueError("Pruner radius must be exactly 1.6 m or 3.0 m")
+
+
+def radar_support_mask(radar_xyz: torch.Tensor | np.ndarray,
+                       radius_m: float = SUPPORT_RADIUS_M) -> np.ndarray:
+    """True where >=3 distinct radar voxel centres lie within radius_m."""
+    if not math.isfinite(radius_m) or radius_m <= 0:
+        raise ValueError("Radar support radius must be positive and finite")
     radar_centers = unique_radar_voxel_centers(radar_xyz)
     if len(radar_centers) < SUPPORT_MIN_VOXELS:
         return np.zeros(SHAPE, dtype=np.bool_)
@@ -74,9 +88,9 @@ def radar_support_mask(radar_xyz: torch.Tensor | np.ndarray) -> np.ndarray:
     for start in range(0, CELL_COUNT, 65536):
         stop = min(start + 65536, CELL_COUNT)
         distance, _ = tree.query(_CENTERS[start:stop], k=SUPPORT_MIN_VOXELS,
-                                 distance_upper_bound=SUPPORT_RADIUS_M + 1e-9,
+                                 distance_upper_bound=radius_m + 1e-9,
                                  workers=1)
-        mask[start:stop] = distance[:, -1] <= SUPPORT_RADIUS_M + 1e-9
+        mask[start:stop] = distance[:, -1] <= radius_m + 1e-9
     return mask.reshape(SHAPE)
 
 
@@ -137,10 +151,12 @@ def _block(inputs: int, outputs: int, *, stride: int = 1) -> nn.Sequential:
 class RadarPrunerConfig:
     channels: int = 16
     negative_loss_weight: float = 0.35
+    support_radius_m: float = SUPPORT_RADIUS_M
 
     def __post_init__(self) -> None:
         if self.channels < 8 or self.channels % 4 or self.negative_loss_weight < 0:
             raise ValueError("Invalid radar pruner configuration")
+        version_for_radius(self.support_radius_m)
 
 
 class RadarPruner(nn.Module):
@@ -188,8 +204,7 @@ class RadarPruner(nn.Module):
                 "conditioning_coords": source_coords,
                 "conditioning_features": source}
 
-    @staticmethod
-    def exported(output: dict) -> dict:
+    def exported(self, output: dict) -> dict:
         coords = output["coords"]
         global_coords = coords + coords.new_tensor((0, 176, 256))
         global_coords = torch.cat((global_coords.new_zeros((len(coords), 1)),
@@ -202,22 +217,26 @@ class RadarPruner(nn.Module):
                                   "voxel_xyz_m": RADAR_GRID.size_xyz,
                                   "conditioning_stride": 8,
                                   "coordinate_order": "batch,z,y,x"},
-                "interface_version": VERSION}
+                "interface_version": version_for_radius(self.config.support_radius_m)}
 
 
 def checkpoint_payload(model: RadarPruner, **metadata) -> dict:
-    return {"version": VERSION, "config": asdict(model.config),
-            "support_radius_m": SUPPORT_RADIUS_M,
+    return {"version": version_for_radius(model.config.support_radius_m),
+            "config": asdict(model.config),
+            "support_radius_m": model.config.support_radius_m,
             "support_min_distinct_radar_voxels": SUPPORT_MIN_VOXELS,
             "model": model.state_dict(), **metadata}
 
 
 def load_radar_pruner(path: str | Path, device: str = "cuda") -> tuple[RadarPruner, dict]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if (saved.get("version") != VERSION or
-            saved.get("support_radius_m") != SUPPORT_RADIUS_M or
+    radius_m = saved.get("support_radius_m")
+    if (radius_m not in (1.6, 3.0) or
+            saved.get("version") != version_for_radius(radius_m) or
             saved.get("support_min_distinct_radar_voxels") != SUPPORT_MIN_VOXELS):
-        raise ValueError("Checkpoint is not the exact three-voxel/3 m pruner")
+        raise ValueError("Checkpoint has another radar-support policy")
     model = RadarPruner(RadarPrunerConfig(**saved["config"]))
+    if model.config.support_radius_m != radius_m:
+        raise ValueError("Pruner model and checkpoint radii differ")
     model.load_state_dict(saved["model"], strict=True)
     return model.to(device).eval(), saved

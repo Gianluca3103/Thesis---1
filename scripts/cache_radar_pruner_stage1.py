@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--radius-m", type=float, choices=(1.6, 3.0), default=3.0)
     parser.add_argument("--split", choices=("train", "val", "both"), default="both")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -38,7 +39,8 @@ def main() -> None:
         ids = [frame.frame_id for frame in dataset.frames]
         cache = RadarSupportCache(args.output_root / split,
                                   identity(split, ids, args.radar_variant,
-                                           data_cache_root=args.data_cache_root),
+                                           data_cache_root=args.data_cache_root,
+                                           radius_m=args.radius_m),
                                   create=True)
         loader = DataLoader(dataset, batch_size=1, shuffle=False,
                             collate_fn=_one,
@@ -50,7 +52,7 @@ def main() -> None:
                 mask = cache.load(frame_id)
                 reused += 1
             else:
-                mask = radar_support_mask(row["radar"])
+                mask = radar_support_mask(row["radar"], args.radius_m)
                 cache.write(frame_id, mask)
                 written += 1
             supported += int(mask.sum())

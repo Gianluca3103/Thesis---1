@@ -6,7 +6,8 @@ import numpy as np
 import torch
 
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
-    RadarPruner, checkpoint_payload, radar_support_mask, supported_coordinates)
+    RadarPruner, RadarPrunerConfig, VERSION_1P6M, checkpoint_payload,
+    radar_support_mask, supported_coordinates)
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity)
 from models.radar_lidar_stage2.sparse_geometry import select_allowed
@@ -40,6 +41,29 @@ def test_radar_outside_roi_can_support_boundary_voxel():
     assert radar_support_mask(radar)[15, 80, 52]
 
 
+def test_1p6m_support_checkpoint_and_stage2_bridge(tmp_path):
+    radar = _radar([(10.0, 0.0, 0.0), (10.6, 0.0, 0.0),
+                    (11.2, 0.0, 0.0)])
+    near = radar_support_mask(radar, 1.6)
+    far = radar_support_mask(radar, 3.0)
+    assert near.any() and int(near.sum()) < int(far.sum())
+    assert bool((~near | far).all())
+    assert identity("val", ["00001"], "radar20", radius_m=1.6) != identity(
+        "val", ["00001"], "radar20", radius_m=3.0)
+    model = RadarPruner(RadarPrunerConfig(support_radius_m=1.6)).eval()
+    checkpoint = tmp_path / "pruner_1p6.ckpt"
+    torch.save(checkpoint_payload(model, radar_variant="radar20"), checkpoint)
+    loaded, saved = load_stage1(checkpoint, "cpu", "radar20")
+    assert saved["version"] == VERSION_1P6M
+    with torch.no_grad():
+        exported = stage1_frame(loaded, radar, 1.6,
+                                faulty=torch.empty((0, 3)), support_mask=near)
+    allowed, _ = select_allowed(exported["confidence_coords"],
+                                exported["confidence_probabilities"], 1e-6)
+    coords = allowed[:, 1:].numpy()
+    assert bool(near[coords[:, 0], coords[:, 1], coords[:, 2]].all())
+
+
 def test_pruner_never_exports_outside_support_or_observed(tmp_path):
     radar = _radar([(10.0, 0.0, 0.0), (10.6, 0.0, 0.0),
                     (11.2, 0.0, 0.0)])
@@ -64,7 +88,9 @@ def test_pruner_never_exports_outside_support_or_observed(tmp_path):
     np.testing.assert_array_equal(cache.load("00001"), mask)
 
     checkpoint = tmp_path / "pruner.ckpt"
-    torch.save(checkpoint_payload(model, radar_variant="radar20"), checkpoint)
+    legacy = checkpoint_payload(model, radar_variant="radar20")
+    legacy["config"].pop("support_radius_m")
+    torch.save(legacy, checkpoint)
     loaded, _ = load_stage1(checkpoint, "cpu", "radar20")
     bridged = stage1_frame(loaded, radar, 3.0, faulty=faulty, support_mask=mask)
     bridge_coords, _ = select_allowed(bridged["confidence_coords"],
@@ -82,8 +108,9 @@ def test_one_frame_train_and_validation_step(tmp_path):
     (faulty_root / "val").mkdir(parents=True)
     clean[:1].numpy().tofile(faulty_root / "val" / "00001.bin")
     cache = RadarSupportCache(tmp_path / "support",
-                              identity("val", ["00001"], "radar20"), create=True)
-    cache.write("00001", radar_support_mask(radar))
+                              identity("val", ["00001"], "radar20", radius_m=1.6),
+                              create=True)
+    cache.write("00001", radar_support_mask(radar, 1.6))
 
     class OneFrame:
         def __len__(self):
@@ -92,14 +119,17 @@ def test_one_frame_train_and_validation_step(tmp_path):
         def __getitem__(self, index):
             return {"frame_id": "00001", "radar": radar, "clean_lidar": clean}
 
-    model = RadarPruner()
+    model = RadarPruner(RadarPrunerConfig(support_radius_m=1.6))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     expected = {"00001": "partial_loss_50"}
     train = _epoch(model, OneFrame(), None, cache, faulty_root, "val", "cpu",
-                   optimizer, workers=0, epoch=1, frame_faults=expected)
+                   optimizer, workers=0, epoch=1, frame_faults=expected,
+                   desired_recall=0.90)
     val = _epoch(model, OneFrame(), None, cache, faulty_root, "val", "cpu",
-                 None, workers=0, epoch=1, frame_faults=expected)
+                 None, workers=0, epoch=1, frame_faults=expected,
+                 desired_recall=0.90)
     assert train["frames"] == val["frames"] == 1
     assert train["eligible_missing"] == val["eligible_missing"] == 1
     assert train["all_missing"] == val["all_missing"] == 1
-    assert val["precision_at_95pct_eligible_recall"]["tp"] == 1
+    assert val["precision_at_target_eligible_recall"]["tp"] == 1
+    assert val["target_eligible_recall"] == 0.90

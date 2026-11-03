@@ -27,6 +27,7 @@ def test_distinct_voxels_and_nested_radii():
     near = distances <= 1.6 + 1e-9
     far = distances <= 3.2 + 1e-9
     assert near.any()
+    np.testing.assert_array_equal(near, radar_support_mask(radar, 1.6))
     assert np.all(~near | far)
     old = radar_support_mask(radar)
     assert np.all(~near | old)

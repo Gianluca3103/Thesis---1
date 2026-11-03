@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -18,8 +19,8 @@ from models.radar_lidar_crossmodal_v1.hierarchical_gate import (
     missing_target, target_mask)
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
-    RadarPruner, RadarPrunerConfig, SUPPORT_MIN_VOXELS, SUPPORT_RADIUS_M,
-    VERSION, checkpoint_payload)
+    RadarPruner, RadarPrunerConfig, SUPPORT_MIN_VOXELS,
+    checkpoint_payload, version_for_radius)
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity)
 from models.radar_lidar_stage2.fault_data import load_faulty
@@ -64,7 +65,7 @@ def _operating_point(positive_bins: np.ndarray, negative_bins: np.ndarray,
 def _epoch(model: RadarPruner, dataset, indices: list[int] | None,
            support_cache: RadarSupportCache, faulty_root: Path, split: str,
            device: str, optimizer, *, workers: int, epoch: int,
-           frame_faults: dict[str, str]) -> dict:
+           frame_faults: dict[str, str], desired_recall: float = 0.95) -> dict:
     training = optimizer is not None
     model.train(training)
     selected = Subset(dataset, indices) if indices is not None else dataset
@@ -123,8 +124,10 @@ def _epoch(model: RadarPruner, dataset, indices: list[int] | None,
                                                 if totals["all_missing"] else 1.0),
               "by_fault": by_fault}
     if not training:
-        point = _operating_point(bins_pos, bins_neg)
-        report["precision_at_95pct_eligible_recall"] = point
+        point = _operating_point(bins_pos, bins_neg,
+                                 desired_recall=desired_recall)
+        report["target_eligible_recall"] = desired_recall
+        report["precision_at_target_eligible_recall"] = point
         report["full_recall_at_selected_threshold"] = (
             point["tp"] / totals["all_missing"] if totals["all_missing"] else 1.0)
     return report
@@ -138,6 +141,9 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--radius-m", type=float, choices=(1.6, 3.0), default=3.0)
+    parser.add_argument("--target-eligible-recall", type=float,
+                        choices=(0.90, 0.95), default=0.95)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--channels", type=int, default=16)
@@ -149,7 +155,8 @@ def main() -> None:
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     if (args.epochs < 1 or args.learning_rate <= 0 or args.val_limit < 1
-            or args.num_workers < 0 or args.negative_loss_weight < 0):
+            or args.num_workers < 0 or args.negative_loss_weight < 0 or
+            not 0 < args.target_eligible_recall <= 1):
         parser.error("Invalid training settings")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA is unavailable")
@@ -161,7 +168,8 @@ def main() -> None:
     support = {split: RadarSupportCache(
         args.support_cache_root / split,
         identity(split, [f.frame_id for f in dataset.frames], args.radar_variant,
-                 data_cache_root=args.data_cache_root))
+                 data_cache_root=args.data_cache_root,
+                 radius_m=args.radius_m))
         for split, dataset in datasets.items()}
     for cache in support.values():
         cache.check_complete()
@@ -184,19 +192,21 @@ def main() -> None:
         if set(f.frame_id for f in dataset.frames) - set(fault_maps[split]):
             raise ValueError(f"Mild faulty dataset is incomplete for {split}")
     config = RadarPrunerConfig(channels=args.channels,
-                               negative_loss_weight=args.negative_loss_weight)
+                               negative_loss_weight=args.negative_loss_weight,
+                               support_radius_m=args.radius_m)
     model = RadarPruner(config).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     start_epoch = 1
     best = -1.0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if (saved.get("version") != VERSION or
-                saved.get("support_radius_m") != SUPPORT_RADIUS_M or
+        saved_config = RadarPrunerConfig(**saved.get("config", {}))
+        if (saved.get("version") != version_for_radius(args.radius_m) or
+                saved.get("support_radius_m") != args.radius_m or
                 saved.get("support_min_distinct_radar_voxels") != SUPPORT_MIN_VOXELS or
                 saved.get("data_policy") != data_policy or
-                saved.get("config") != {"channels": config.channels,
-                                        "negative_loss_weight": config.negative_loss_weight} or
+                saved.get("target_eligible_recall", 0.95) != args.target_eligible_recall or
+                asdict(saved_config) != asdict(config) or
                 saved.get("radar_variant") != args.radar_variant):
             raise ValueError("Resume checkpoint uses another pruner policy")
         model.load_state_dict(saved["model"], strict=True)
@@ -210,17 +220,20 @@ def main() -> None:
         train = _epoch(model, datasets["train"], None, support["train"],
                        args.faulty_root, "train", args.device, optimizer,
                        workers=args.num_workers, epoch=epoch,
-                       frame_faults=fault_maps["train"])
+                       frame_faults=fault_maps["train"],
+                       desired_recall=args.target_eligible_recall)
         val = _epoch(model, datasets["val"], val_indices, support["val"],
                      args.faulty_root, "val", args.device, None,
                      workers=args.num_workers, epoch=epoch,
-                     frame_faults=fault_maps["val"])
-        score = val["precision_at_95pct_eligible_recall"]["precision"]
+                     frame_faults=fault_maps["val"],
+                     desired_recall=args.target_eligible_recall)
+        score = val["precision_at_target_eligible_recall"]["precision"]
         best = max(best, score)
         payload = checkpoint_payload(
             model, epoch=epoch, radar_variant=args.radar_variant,
             optimizer=optimizer.state_dict(), best_score=best,
             data_policy=data_policy,
+            target_eligible_recall=args.target_eligible_recall,
             validation=val, validation_frame_ids=[
                 datasets["val"].frames[i].frame_id for i in val_indices])
         temporary = args.output_root / "last.ckpt.tmp"

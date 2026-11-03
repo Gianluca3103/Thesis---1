@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
-from models.radar_lidar_crossmodal_v1.radar_pruner import RadarPruner
+from models.radar_lidar_crossmodal_v1.radar_pruner import (
+    PRUNER_VERSIONS, RadarPruner)
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
 from models.radar_lidar_stage2.addition import (
     HEALTHY_RETAINED_FRACTION, MIN_CLEAN_CELLS_IN_REGION,
@@ -381,7 +382,7 @@ def main() -> None:
         radius_m = float(stage1_saved.get("radius_m", stage1_saved.get(
             "support_radius_m", 3.2)))
     if (args.phase == "diffusion" and args.stage2_cache_root and
-            stage1_saved.get("version") == "radar3vox_3m_pruner_v1" and
+            stage1_saved.get("version") in PRUNER_VERSIONS and
             args.faulty_root is None):
         parser.error("Cached radar-pruner Stage II requires --faulty-root")
     model = SparseResidualStage2(diffusion_target=args.diffusion_target).to(args.device)
@@ -476,7 +477,7 @@ def main() -> None:
                 args.stage1_checkpoint, args.vod_root, args.radar_variant,
                 radius_m, args.gate_threshold, split,
                 [frame.frame_id for frame in dataset.frames])
-            if stage1_saved.get("version") == "radar3vox_3m_pruner_v1":
+            if stage1_saved.get("version") in PRUNER_VERSIONS:
                 expected = bind_faulty_cache_identity(expected, args.faulty_root, split)
             fixed_caches[split] = Stage2FixedCache(
                 args.stage2_cache_root / split, expected)
