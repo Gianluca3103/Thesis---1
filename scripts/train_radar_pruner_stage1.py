@@ -147,6 +147,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--channels", type=int, default=16)
+    parser.add_argument("--dropout-p", type=float, default=0.0,
+                        help="Channel dropout at the deepest 3D feature map")
     parser.add_argument("--negative-loss-weight", type=float, default=0.35)
     parser.add_argument("--val-limit", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -156,6 +158,7 @@ def main() -> None:
     args = parser.parse_args()
     if (args.epochs < 1 or args.learning_rate <= 0 or args.val_limit < 1
             or args.num_workers < 0 or args.negative_loss_weight < 0 or
+            not 0 <= args.dropout_p < 1 or
             not 0 < args.target_eligible_recall <= 1):
         parser.error("Invalid training settings")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -193,7 +196,8 @@ def main() -> None:
             raise ValueError(f"Mild faulty dataset is incomplete for {split}")
     config = RadarPrunerConfig(channels=args.channels,
                                negative_loss_weight=args.negative_loss_weight,
-                               support_radius_m=args.radius_m)
+                               support_radius_m=args.radius_m,
+                               dropout_p=args.dropout_p)
     model = RadarPruner(config).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     start_epoch = 1

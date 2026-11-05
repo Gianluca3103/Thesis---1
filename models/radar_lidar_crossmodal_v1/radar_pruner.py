@@ -152,9 +152,11 @@ class RadarPrunerConfig:
     channels: int = 16
     negative_loss_weight: float = 0.35
     support_radius_m: float = SUPPORT_RADIUS_M
+    dropout_p: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.channels < 8 or self.channels % 4 or self.negative_loss_weight < 0:
+        if (self.channels < 8 or self.channels % 4 or self.negative_loss_weight < 0
+                or not math.isfinite(self.dropout_p) or not 0 <= self.dropout_p < 1):
             raise ValueError("Invalid radar pruner configuration")
         version_for_radius(self.support_radius_m)
 
@@ -169,6 +171,7 @@ class RadarPruner(nn.Module):
         self.stem = _block(6, c)
         self.down1 = _block(c, 2 * c, stride=2)
         self.down2 = _block(2 * c, 4 * c, stride=2)
+        self.bottleneck_dropout = nn.Dropout3d(self.config.dropout_p)
         self.up1 = _block(6 * c, 2 * c)
         self.up0 = _block(3 * c, c)
         self.score = nn.Conv3d(c, 1, 1)
@@ -183,7 +186,7 @@ class RadarPruner(nn.Module):
             coords = coords[~torch.isin(flat, torch.unique(observed_flat))]
         x0 = self.stem(_input_volume(radar, faulty))
         x1 = self.down1(x0)
-        x2 = self.down2(x1)
+        x2 = self.bottleneck_dropout(self.down2(x1))
         x = self.up1(torch.cat((F.interpolate(x2, size=x1.shape[-3:],
                                              mode="trilinear", align_corners=False), x1), 1))
         x = self.up0(torch.cat((F.interpolate(x, size=x0.shape[-3:],
