@@ -16,6 +16,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as support_identity)
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_stage2.fault_data import load_faulty
+from models.radar_lidar_stage2.fault_region import (
+    FaultRegionCache, cache_identity as fault_region_identity)
 from models.radar_lidar_stage2.geometry_gate import (
     RADIUS_M, VERSION, geometry_gate_output, offset_targets)
 from models.radar_lidar_stage2.sparse_geometry import GRID, voxelize_means
@@ -85,6 +87,7 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
+    parser.add_argument("--fault-region-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=512,
@@ -119,6 +122,16 @@ def main() -> None:
                                 radius_m=RADIUS_M)
     support = RadarSupportCache(args.support_cache_root / "val", expected)
     support.check_complete()
+    region_expected = fault_region_identity(
+        "val", frame_ids, args.faulty_root / "val" / "manifest.json",
+        args.data_cache_root / "val" / "manifest.json")
+    regions = FaultRegionCache(args.fault_region_root / "val", region_expected)
+    if (regions.regions is None
+            or saved.get("region_val_manifest_sha256") != sha256(
+                args.fault_region_root / "val" / "manifest.json")
+            or saved.get("region_val_data_sha256") != sha256(
+                args.fault_region_root / "val" / "regions.json")):
+        raise ValueError("Injector footprint cache differs from checkpoint")
     available = len(dataset) - 64
     if available < 2:
         raise ValueError("No validation frames remain after model selection")
@@ -142,7 +155,7 @@ def main() -> None:
         faulty = load_faulty(args.faulty_root, "val", frame_id).to(args.device)
         clean = row["clean_lidar"][:, :3].to(args.device)
         mask = support.load(frame_id)
-        output = geometry_gate_output(radar, faulty, mask)
+        output = geometry_gate_output(radar, faulty, regions.get(frame_id), mask)
         conditions = model.conditions(output, float(saved["gate_threshold"]))
         fine = conditions.hierarchy[0]
         clean_coords, _ = voxelize_means(clean, grid=GRID)
@@ -183,6 +196,7 @@ def main() -> None:
     report = {"checkpoint": str(args.checkpoint), "checkpoint_epoch": saved["epoch"],
               "objective": saved["diffusion_objective"], "radar_variant": variant,
               "sampling_steps": args.sampling_steps, "histogram_bins": args.bins,
+              "injector_footprint_oracle": True,
               "model_selection_frames_excluded": 64,
               "splits": {}, "by_fault": {}, "calibration_choices": {}}
     for split, values in hist.items():

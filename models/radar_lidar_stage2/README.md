@@ -265,11 +265,16 @@ The 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 `bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh` trains Stage II
 without a learned Stage I checkpoint. It reuses the existing 1.6 m support
 cache: a candidate must have at least three **distinct radar voxels** within
-1.6 m of its center. Voxels already occupied by the faulty LiDAR are removed
-from the addition domain before Stage II sees them. All other supported cells
-are scored; no learned gate threshold prunes them. The trainable radar adapter
+1.6 m of its center. A second cache records where the synthetic fault injector
+acted. For partial-loss faults, this is its removed azimuth sector across the
+ROI, including a one-voxel boundary halo; for fog, the full scan was exposed.
+The gate excludes the larger untouched, reliable sector and voxels already
+occupied by the faulty LiDAR. All remaining cells are scored; no learned gate
+threshold prunes them. The trainable radar adapter
 receives deterministic pooled radar count, RCS, Doppler, age, and position
-statistics, not a learned Stage I feature map.
+statistics, not a learned Stage I feature map. The footprint is an **oracle
+synthetic-fault input** cached from the injector's seed and clean input. It is
+unavailable for a real unknown fault without a separate fault detector.
 
 This run reuses the frozen full-region LPCR LiDAR encoder and decoder, and
 trains the Stage-II radar adapter, sparse epsilon U-Net and addition head on
@@ -283,7 +288,8 @@ targets and rays only, never inference inputs. The ray labels use direction
 matching as a proxy because exact LiDAR firing IDs are unavailable.
 
 The launcher uses the existing 20-frame radar variant, 1.6 m support cache,
-and 64 validation frames for checkpoint selection. It then evaluates 512
+injector-region cache, and 64 validation frames for checkpoint selection. It
+then evaluates 512
 different validation frames, alternating 256 calibration and 256 held-out
 frames; the first 64 are excluded. The evaluation samples with 64 diffusion
 steps and reports the geometry ceiling, keep-all precision, and held-out
@@ -291,15 +297,25 @@ metrics at thresholds selected on calibration. `EVAL=0` skips this expensive
 second pass. A two-frame GPU smoke run can use a **new** output directory:
 
 ```bash
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/stage2_geometry1p6m_smoke \
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/stage2_geometry1p6m_injector_region_smoke \
 EPOCHS=1 TRAIN_LIMIT=2 VAL_LIMIT=2 EVAL=0 \
 bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh
 ```
 
 The default full run writes a separate checkpoint and validation report under
-`stage2_geometry1p6m_epsilon_ray_offset_mild_20261106`. GPU memory and speed
+`stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106`.
+Build the footprint sidecar with `scripts.cache_stage2_fault_regions` after
+the fixed-frame and mild-fault caches; it verifies the partial-fault outputs
+against the deterministic injector. GPU memory and speed
 must be verified by the smoke run: the full rule often exposes about 120,000
 fine candidates per frame, substantially more than an old learned gate.
+
+```bash
+python -m scripts.cache_stage2_fault_regions \
+  --vod-root "$VOD" --data-cache-root "$RAW" \
+  --faulty-root "$MILD" --output-root "$REGIONS" \
+  --radar-variant radar_20frames_verified_doppler_radial --split both
+```
 
 ### Separate epsilon-prediction ablation
 

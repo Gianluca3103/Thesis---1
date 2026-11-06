@@ -40,7 +40,7 @@ VERSION = "stage2_sparse_residual_v1"
 LPCR_REVISION = "stage2_full_region_lpcr_residual_v9"
 MODEL_REVISION = "stage2_full_region_lpcr_additive_v10"
 EPSILON_MODEL_REVISION = "stage2_full_region_lpcr_additive_epsilon_v1"
-GEOMETRY_EPSILON_REVISION = "stage2_geometry_1p6m_epsilon_ray_offset_v1"
+GEOMETRY_EPSILON_REVISION = "stage2_geometry_1p6m_injector_region_epsilon_ray_offset_v2"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 1
 

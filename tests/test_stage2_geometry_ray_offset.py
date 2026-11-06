@@ -1,6 +1,8 @@
 """Contracts for the fixed Stage-II gate and the ray/offset-only objective."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
@@ -8,6 +10,9 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.radar_pruner import SHAPE
 from models.radar_lidar_stage2.geometry_gate import geometry_gate_output, offset_targets
+from models.radar_lidar_stage2.fault_region import (
+    FaultRegionCache, footprint_mask, partial_azimuth_region)
+from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
 from models.radar_lidar_stage2.sparse_geometry import GRID, select_allowed
 from models.radar_lidar_stage2.sparse_residual import (
     SparseResidualStage2, Stage2Conditions,
@@ -25,7 +30,7 @@ class GeometryGateTest(unittest.TestCase):
         # be added and unsupported cells must never enter the gate.
         faulty = torch.tensor([[16.3, 0.1, 0.1], [16.9, 0.1, 0.1]],
                               dtype=torch.float32)
-        output = geometry_gate_output(radar, faulty, mask)
+        output = geometry_gate_output(radar, faulty, {"kind": "full_scan"}, mask)
         fine, scores = select_allowed(output["confidence_coords"],
                                       output["confidence_probabilities"], 0.5)
         self.assertEqual(fine[:, 1:].tolist(), [[8, 80, 80], [8, 80, 82]])
@@ -34,9 +39,72 @@ class GeometryGateTest(unittest.TestCase):
 
     def test_empty_radar_has_no_learned_fallback(self):
         output = geometry_gate_output(torch.empty((0, 7)), torch.empty((0, 3)),
+                                      {"kind": "full_scan"},
                                       np.zeros(SHAPE, dtype=bool))
         self.assertEqual(len(output["confidence_coords"]), 0)
         self.assertEqual(len(output["conditioning_coords"]), 0)
+
+    def test_partial_injector_sector_keeps_removed_and_excludes_untouched(self):
+        angles = np.linspace(-1.1, 1.1, 101, dtype=np.float32)
+        clean = np.stack((10 * np.cos(angles), 10 * np.sin(angles),
+                          np.zeros_like(angles)), axis=1)
+        seed = 4
+        retained = partial_azimuth_loss(clean, 0.30, seed)
+        region = partial_azimuth_region(clean, 0.30, seed)
+        self.assertEqual(region["removed_points"], len(clean) - len(retained))
+        order = np.argsort(np.arctan2(clean[:, 1], clean[:, 0]), kind="stable")
+        start = int(np.random.default_rng(seed).integers(len(clean)))
+        removed_ids = order[(start + np.arange(region["removed_points"])) % len(clean)]
+        coords_xyz = np.floor((clean - np.asarray(GRID.minimum_xyz)) /
+                              np.asarray(GRID.voxel_xyz)).astype(np.int64)
+        fine = torch.from_numpy(np.column_stack((np.zeros(len(clean), dtype=np.int64),
+                                                 coords_xyz[:, [2, 1, 0]])))
+        inside = footprint_mask(fine, region).numpy()
+        self.assertTrue(inside[removed_ids].all())
+        self.assertGreater(int((~inside).sum()), 20)
+        reliable = int(np.flatnonzero(~inside)[0])
+        touched = int(removed_ids[0])
+        mask = np.zeros(SHAPE, dtype=bool)
+        for index in (reliable, touched):
+            z, y, x = fine[index, 1:].tolist()
+            mask[z, y, x] = True
+        output = geometry_gate_output(
+            torch.tensor([[10.0, 0.0, 0.0, 1, 1, 1, 1]]),
+            torch.empty((0, 3)), region, mask)
+        local, _ = select_allowed(output["confidence_coords"],
+                                  output["confidence_probabilities"], 0.5)
+        self.assertEqual(local[:, 1:].tolist(), [fine[touched, 1:].tolist()])
+
+    def test_wrapped_partial_sector_covers_removed_voxels(self):
+        angles = np.linspace(-np.pi, np.pi, 721, endpoint=False,
+                             dtype=np.float32)
+        clean = np.stack((12 * np.cos(angles), 12 * np.sin(angles),
+                          np.zeros_like(angles)), axis=1)
+        indices = np.floor((clean - np.asarray(GRID.minimum_xyz)) /
+                           np.asarray(GRID.voxel_xyz)).astype(np.int64)
+        fine = torch.from_numpy(np.column_stack((
+            np.zeros(len(clean), dtype=np.int64), indices[:, [2, 1, 0]])))
+        # The random start crosses the -pi/pi seam for some seeds.
+        for seed in range(20):
+            region = partial_azimuth_region(clean, 0.40, seed)
+            count = region["removed_points"]
+            order = np.argsort(np.arctan2(clean[:, 1], clean[:, 0]),
+                               kind="stable")
+            start = int(np.random.default_rng(seed).integers(len(clean)))
+            removed = order[(start + np.arange(count)) % len(clean)]
+            self.assertTrue(footprint_mask(fine, region)[removed].all().item())
+
+    def test_fault_region_cache_rejects_incomplete_data(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory)
+            expected = {"version": "test", "frame_ids": ["1", "2"]}
+            cache = FaultRegionCache(root, expected, create=True)
+            with self.assertRaises(ValueError):
+                cache.write({"1": {"kind": "full_scan"}})
+            cache.write({"1": {"kind": "full_scan"},
+                         "2": {"kind": "empty"}})
+            self.assertEqual(FaultRegionCache(root, expected).get("2")["kind"],
+                             "empty")
 
     def test_offset_target_is_centroid_relative_to_eligible_cell(self):
         fine = torch.tensor([[0, 8, 80, 80], [0, 8, 80, 81]])

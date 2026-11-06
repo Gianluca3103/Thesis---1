@@ -27,6 +27,8 @@ from models.radar_lidar_stage2.fault_data import (
     FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
 )
 from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
+from models.radar_lidar_stage2.fault_region import (
+    FaultRegionCache, cache_identity as fault_region_identity)
 from models.radar_lidar_stage2.geometry_gate import (
     RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
     geometry_gate_output)
@@ -138,9 +140,11 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                         preloaded_faults[row["frame_id"]] = (
                             stage1_faulty, args.fault_names[split][row["frame_id"]])
                         support = args.support_caches[split].load(row["frame_id"])
+                        region = args.region_caches[split].get(row["frame_id"])
                         with torch.no_grad():
                             output = geometry_gate_output(
-                                radar, stage1_faulty.to(args.device), support)
+                                radar, stage1_faulty.to(args.device), region,
+                                support)
                         targets = None
                     elif fixed_cache is not None:
                         output = {key: value.to(args.device, non_blocking=True)
@@ -329,6 +333,8 @@ def main() -> None:
                         help="Fixed 3-radar-voxel/1.6 m gate; epsilon MSE, rays, offsets only")
     parser.add_argument("--support-cache-root", type=Path,
                         help="Precomputed 3-radar-voxel/1.6 m support masks")
+    parser.add_argument("--fault-region-root", type=Path,
+                        help="Cached synthetic injector footprint; required for geometry baseline")
     parser.add_argument("--offset-weight", type=float, default=1.0)
     parser.add_argument("--lpcr-checkpoint", type=Path,
                         help="Required for diffusion; best LPCR checkpoint")
@@ -392,6 +398,8 @@ def main() -> None:
                 or args.stage1_checkpoint is not None
                 or args.stage2_cache_root is not None
                 or args.support_cache_root is None
+                or args.fault_region_root is None
+                or args.data_cache_root is None
                 or args.faulty_root is None or args.batch_size != 1
                 or not (args.ray_hit_weight > 0 and args.ray_extra_weight > 0
                         and args.offset_weight > 0)
@@ -499,6 +507,7 @@ def main() -> None:
             identity.update({"ray_offset_baseline": True,
                              "min_distinct_radar_voxels": 3,
                              "observed_faulty_cells_excluded": True,
+                             "untouched_injector_region_excluded": True,
                              "healthy_region_loss_enabled": False,
                              "addition_classification_loss_enabled": False,
                              "lpcr_occupancy_loss_enabled": False,
@@ -509,7 +518,15 @@ def main() -> None:
                              "support_train_manifest_sha256": sha256(
                                  args.support_cache_root / "train" / "manifest.json"),
                              "support_val_manifest_sha256": sha256(
-                                 args.support_cache_root / "val" / "manifest.json")})
+                                 args.support_cache_root / "val" / "manifest.json"),
+                             "region_train_manifest_sha256": sha256(
+                                 args.fault_region_root / "train" / "manifest.json"),
+                             "region_val_manifest_sha256": sha256(
+                                 args.fault_region_root / "val" / "manifest.json"),
+                             "region_train_data_sha256": sha256(
+                                 args.fault_region_root / "train" / "regions.json"),
+                             "region_val_data_sha256": sha256(
+                                 args.fault_region_root / "val" / "regions.json")})
         if args.ray_hit_weight or args.ray_extra_weight:
             identity.update({"ray_angular_tolerance_deg": args.ray_angular_tolerance_deg,
                              "ray_lateral_tolerance_m": args.ray_lateral_tolerance_m,
@@ -556,6 +573,7 @@ def main() -> None:
                 raise ValueError(f"Mild-fault cache differs from {split} dataset")
             args.fault_names[split] = manifest["frame_faults"]
     args.support_caches = {}
+    args.region_caches = {}
     if args.ray_offset_baseline:
         for split, dataset in full_datasets.items():
             expected = radar_support_identity(
@@ -565,6 +583,14 @@ def main() -> None:
             cache = RadarSupportCache(args.support_cache_root / split, expected)
             cache.check_complete()
             args.support_caches[split] = cache
+            region_expected = fault_region_identity(
+                split, [frame.frame_id for frame in dataset.frames],
+                args.faulty_root / split / "manifest.json",
+                args.data_cache_root / split / "manifest.json")
+            args.region_caches[split] = FaultRegionCache(
+                args.fault_region_root / split, region_expected)
+            if args.region_caches[split].regions is None:
+                raise FileNotFoundError(f"Missing {split} injector footprint cache")
     fixed_caches = {}
     fog_caches = {}
     for split, dataset in full_datasets.items():

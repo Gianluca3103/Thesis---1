@@ -12,17 +12,19 @@ from models.radar_lidar_crossmodal_v1.radar_pruner import (
 from models.radar_lidar_stage1.sparse import encode_keys
 
 from .addition import _voxel_coords
+from .fault_region import footprint_mask
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import GRID, voxelize_means
 
 
-VERSION = "stage2_geometry_3radarvox_1p6m_v1"
+VERSION = "stage2_geometry_3radarvox_1p6m_injector_region_v2"
 RADIUS_M = 1.6
 
 
 def geometry_gate_output(radar: torch.Tensor, faulty_xyz: torch.Tensor,
+                         region: dict,
                          support_mask: np.ndarray | None = None) -> dict:
-    """All supported cells except measured faulty cells; no learned Stage I.
+    """Supported cells inside the injector footprint, excluding observed cells.
 
     Radar features are simple pooled measurements on the old stride-8 grid.
     The trainable Stage-II radar adapter maps these fixed features to its
@@ -37,6 +39,7 @@ def geometry_gate_output(radar: torch.Tensor, faulty_xyz: torch.Tensor,
     fine = supported_coordinates(support_mask, radar.device)
     fine = torch.cat((torch.zeros((len(fine), 1), device=radar.device,
                                   dtype=torch.long), fine), dim=1)
+    fine = fine[footprint_mask(fine, region)]
     observed = _voxel_coords(faulty_xyz, None, GRID)
     if len(fine) and len(observed):
         keep = ~torch.isin(encode_keys(fine, GRID.shape_zyx),

@@ -22,6 +22,9 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 from models.radar_lidar_stage2.geometry_gate import (
     RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
     geometry_gate_output)
+from models.radar_lidar_stage2.fault_region import (
+    FaultRegionCache, cache_identity as fault_region_identity,
+    footprint_mask)
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
     load_faulty, severe_fault,
@@ -223,6 +226,8 @@ def main() -> None:
     parser.add_argument("--stage1-checkpoint", type=Path)
     parser.add_argument("--support-cache-root", type=Path,
                         help="Required for a geometry-only Stage-II checkpoint")
+    parser.add_argument("--fault-region-root", type=Path,
+                        help="Synthetic injector footprint cache for geometry baseline")
     parser.add_argument("--stage2-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path,
@@ -259,8 +264,10 @@ def main() -> None:
     geometry_only = saved2.get("geometry_gate_version") == GEOMETRY_GATE_VERSION
     if geometry_only:
         if (args.stage1_checkpoint is not None or args.stage2_cache_root is not None
-                or args.support_cache_root is None or args.faulty_root is None):
-            parser.error("Geometry-only Stage II needs a support cache and faulty root, without Stage I")
+                or args.support_cache_root is None or args.fault_region_root is None
+                or args.data_cache_root is None or args.faulty_root is None
+                or args.split == "test"):
+            parser.error("Geometry baseline needs mild faults, injector footprints and support; train/val only")
         stage1 = None
         saved1 = {"version": GEOMETRY_GATE_VERSION,
                   "radar_variant": args.radar_variant}
@@ -284,7 +291,11 @@ def main() -> None:
             saved2.get(f"faulty_{args.split}_manifest_sha256") != sha256(
                 args.faulty_root / args.split / "manifest.json")
             or saved2.get(f"support_{args.split}_manifest_sha256") != sha256(
-                args.support_cache_root / args.split / "manifest.json")):
+                args.support_cache_root / args.split / "manifest.json")
+            or saved2.get(f"region_{args.split}_manifest_sha256") != sha256(
+                args.fault_region_root / args.split / "manifest.json")
+            or saved2.get(f"region_{args.split}_data_sha256") != sha256(
+                args.fault_region_root / args.split / "regions.json")):
         raise ValueError("Geometry baseline fault or support cache differs from training")
     if ((not geometry_only and saved2["stage1_sha256"] != sha256(args.stage1_checkpoint))
             or saved2["radar_variant"] != args.radar_variant):
@@ -299,6 +310,7 @@ def main() -> None:
                                               if args.faulty_root is None or geometry_only
                                               else None))
     support_cache = None
+    region_cache = None
     if geometry_only:
         expected = radar_support_identity(
             args.split, [frame.frame_id for frame in dataset.frames],
@@ -307,6 +319,14 @@ def main() -> None:
         support_cache = RadarSupportCache(args.support_cache_root / args.split,
                                           expected)
         support_cache.check_complete()
+        region_expected = fault_region_identity(
+            args.split, [frame.frame_id for frame in dataset.frames],
+            args.faulty_root / args.split / "manifest.json",
+            args.data_cache_root / args.split / "manifest.json")
+        region_cache = FaultRegionCache(args.fault_region_root / args.split,
+                                        region_expected)
+        if region_cache.regions is None:
+            raise FileNotFoundError("Injector footprint cache is incomplete")
     fog_cache = (SevereFogCache(args.fault_cache_root, args.split,
                                 [frame.frame_id for frame in dataset.frames],
                                 seed=int(saved2["fault_seed"]))
@@ -343,7 +363,8 @@ def main() -> None:
         if cache is None:
             radar = row["radar"].to(args.device)
             output = (geometry_gate_output(
-                radar, faulty, support_cache.load(frame_id)) if geometry_only else
+                radar, faulty, region_cache.get(frame_id),
+                support_cache.load(frame_id)) if geometry_only else
                 stage1_frame(stage1, radar, float(saved1.get("radius_m", saved1.get(
                     "support_radius_m", 3.2))), faulty=faulty))
             targets = None
@@ -371,6 +392,10 @@ def main() -> None:
             if len(chosen) and not bool(support[
                     chosen[:, 0], chosen[:, 1], chosen[:, 2]].all()):
                 raise RuntimeError("Stage II emitted a voxel outside its radar-support rule")
+            if geometry_only and len(chosen) and not bool(footprint_mask(
+                    predicted["occupied_coordinates"],
+                    region_cache.get(frame_id)).all()):
+                raise RuntimeError("Stage II emitted a voxel in a reliable untouched region")
         xyz = predicted["points_xyz"].cpu().numpy().astype(np.float32)
         scores = predicted["probabilities"].cpu().numpy().astype(np.float32)
         faulty_roi = _roi(faulty.cpu().numpy())

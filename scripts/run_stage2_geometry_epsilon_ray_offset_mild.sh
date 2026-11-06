@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixed 3 radar voxels / 1.6 m gate, mild faults, epsilon + ray + offset loss.
+# Fixed radar support intersected with the synthetic injector footprint.
 set -euo pipefail
 
 REPO=${REPO:-/media/arrubuntu20/EA0A117F0A114A49/Thesis-1-hierarchical-stage1-20261101}
@@ -10,8 +10,9 @@ VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/vi
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
 SUPPORT=${SUPPORT:-$DATA/radar_pruner3vox_1p6m_mild_fog2_20261103/support_masks}
+REGIONS=${REGIONS:-$DATA/stage2_mild_fog2_injector_regions_20261106}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
-OUT=${OUT:-$DATA/stage2_geometry1p6m_epsilon_ray_offset_mild_20261106}
+OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106}
 WORKERS=${WORKERS:-2}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
@@ -23,7 +24,9 @@ SAMPLING_STEPS=${SAMPLING_STEPS:-64}
 for required in "$PY" "$LPCR" \
   "$RAW/train/manifest.json" "$RAW/val/manifest.json" \
   "$MILD/train/manifest.json" "$MILD/val/manifest.json" \
-  "$SUPPORT/train/manifest.json" "$SUPPORT/val/manifest.json"; do
+  "$SUPPORT/train/manifest.json" "$SUPPORT/val/manifest.json" \
+  "$REGIONS/train/manifest.json" "$REGIONS/val/manifest.json" \
+  "$REGIONS/train/regions.json" "$REGIONS/val/regions.json"; do
   [[ -s "$required" ]] || { printf 'Missing required file: %s\n' "$required" >&2; exit 1; }
 done
 
@@ -46,6 +49,7 @@ fi
   --phase diffusion --diffusion-target epsilon --ray-offset-baseline \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --faulty-root "$MILD" --support-cache-root "$SUPPORT" \
+  --fault-region-root "$REGIONS" \
   --lpcr-checkpoint "$LPCR" --output-root "$OUT" \
   --radar-variant radar_20frames_verified_doppler_radial \
   --epochs "$EPOCHS" --batch-size 1 --num-workers "$WORKERS" \
@@ -61,6 +65,7 @@ if [[ "$EVAL" == 1 ]]; then
   "$PY" -u -m scripts.evaluate_stage2_geometry_baseline \
     --vod-root "$VOD" --data-cache-root "$RAW" \
     --faulty-root "$MILD" --support-cache-root "$SUPPORT" \
+    --fault-region-root "$REGIONS" \
     --checkpoint "$OUT/best.ckpt" \
     --output "$OUT/validation_512_calibrated.json" \
     --limit "$EVAL_LIMIT" --sampling-steps "$SAMPLING_STEPS" \
