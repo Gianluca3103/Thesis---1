@@ -18,6 +18,7 @@ from models.radar_lidar_crossmodal_v1.encoder import GRID as STAGE1_GRID
 from models.radar_lidar_stage1.sparse import encode_keys
 
 from .addition import addition_context, healthy_region_negatives
+from .geometry_gate import offset_targets
 from .ray_loss import addition_ray_losses
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import (
@@ -39,6 +40,7 @@ VERSION = "stage2_sparse_residual_v1"
 LPCR_REVISION = "stage2_full_region_lpcr_residual_v9"
 MODEL_REVISION = "stage2_full_region_lpcr_additive_v10"
 EPSILON_MODEL_REVISION = "stage2_full_region_lpcr_additive_epsilon_v1"
+GEOMETRY_EPSILON_REVISION = "stage2_geometry_1p6m_epsilon_ray_offset_v1"
 LATENT_CHANNELS = 32
 MAX_POINTS_PER_VOXEL = 1
 
@@ -578,6 +580,8 @@ class SparseResidualStage2(nn.Module):
                        reconstruction_weight: float = 1.0,
                        addition_weight: float = 1.0,
                        healthy_weight: float = 1.0,
+                       ray_offset_baseline: bool = False,
+                       offset_weight: float = 1.0,
                        ray_hit_weight: float = 0.0,
                        ray_extra_weight: float = 0.0,
                        ray_angular_tolerance_deg: float = 1.5,
@@ -587,6 +591,8 @@ class SparseResidualStage2(nn.Module):
                        faulty_batch_ids: torch.Tensor | None = None,
                        clean_batch_ids: torch.Tensor | None = None,
                        batch_size: int = 1) -> dict:
+        if ray_offset_baseline and self.diffusion_target != "epsilon":
+            raise ValueError("Ray/offset baseline requires epsilon prediction")
         with torch.no_grad():
             faulty, faulty_present = self.encode_lidar(
                 faulty_xyz, conditions, faulty_batch_ids)
@@ -629,15 +635,61 @@ class SparseResidualStage2(nn.Module):
             clean_hat, conditions.hierarchy,
             torch.ones_like(conditions.fine_probabilities),
             return_hidden=True)
-        reconstruction = self.lpcr_loss(
-            clean_hat, conditions, clean_xyz, batch_size=batch_size,
-            clean_batch_ids=clean_batch_ids, decoded=(logits, offsets))
-        addition = self.addition_loss(
-            hidden, logits, faulty_xyz, clean_xyz, conditions,
-            reconstruction["occupied_target"],
-            reconstruction["known_free_target"],
-            faulty_batch_ids=faulty_batch_ids,
-            clean_batch_ids=clean_batch_ids, batch_size=batch_size)
+        if ray_offset_baseline:
+            occupied, target_offsets, coverage = offset_targets(
+                clean_xyz, conditions.hierarchy[0], clean_batch_ids)
+            fine_ids = conditions.hierarchy[0][:, 0].long()
+            offset_error = (offsets[occupied] - target_offsets[occupied]).abs().mean(1)
+            offset_loss = (_frame_mean(offset_error, fine_ids[occupied], batch_size)
+                           if bool(occupied.any()) else offsets.sum() * 0)
+            zero = logits.sum() * 0
+            reconstruction = {"loss": offset_loss, "occupancy": zero,
+                              "offset": offset_loss, "iou_known": 0.0,
+                              "iou_full": 0.0, "gate_coverage": coverage,
+                              "known_sites": 0.0,
+                              "positive_sites": float(occupied.sum()) / batch_size,
+                              "occupied_target": occupied}
+            # Do not call addition_loss: it computes a healthy-region oracle
+            # even when its weight is zero. Ray targets are the only occupancy
+            # supervision in this ablation.
+            context = addition_context(faulty_xyz, conditions.hierarchy[0],
+                                       faulty_batch_ids, grid=self.grid)
+            addition_logits = self.addition_head(
+                hidden, logits, conditions.fine_probabilities,
+                context.observed, context.local_faulty_density)
+            zero = addition_logits.sum() * 0
+            with torch.no_grad():
+                fine_ids = conditions.hierarchy[0][:, 0].long()
+                missing = reconstruction["occupied_target"] & ~context.observed
+                added = (addition_logits.sigmoid() >= 0.5) & ~context.observed
+                final = context.observed | added
+                occupied = reconstruction["occupied_target"]
+                counts = {name: torch.bincount(fine_ids[mask], minlength=batch_size)
+                          for name, mask in (
+                              ("tp", added & missing), ("added", added),
+                              ("missing", missing), ("intersection", final & occupied),
+                              ("union", final | occupied))}
+                ratio = lambda numerator, denominator: float((
+                    counts[numerator] / counts[denominator].clamp_min(1)
+                ).float().mean())
+            addition = {"final": zero, "healthy": zero,
+                        "logits": addition_logits, "observed": context.observed,
+                        "addition_precision": ratio("tp", "added"),
+                        "addition_recall": ratio("tp", "missing"),
+                        "healthy_addition_rate": 0.0,
+                        "final_gate_iou": ratio("intersection", "union"),
+                        "missing_sites": float(missing.sum()) / batch_size,
+                        "healthy_negative_sites": 0.0}
+        else:
+            reconstruction = self.lpcr_loss(
+                clean_hat, conditions, clean_xyz, batch_size=batch_size,
+                clean_batch_ids=clean_batch_ids, decoded=(logits, offsets))
+            addition = self.addition_loss(
+                hidden, logits, faulty_xyz, clean_xyz, conditions,
+                reconstruction["occupied_target"],
+                reconstruction["known_free_target"],
+                faulty_batch_ids=faulty_batch_ids,
+                clean_batch_ids=clean_batch_ids, batch_size=batch_size)
         if ray_hit_weight or ray_extra_weight:
             rays = addition_ray_losses(
                 conditions.hierarchy[0], addition["logits"], addition["observed"],
@@ -652,7 +704,12 @@ class SparseResidualStage2(nn.Module):
             zero = addition["logits"].sum() * 0
             rays = {"hit": zero, "extra": zero, "hit_rays": 0,
                     "extra_sites": 0}
-        if self.diffusion_target == "epsilon":
+        if ray_offset_baseline:
+            total = noise_loss + task_weight * (
+                offset_weight * reconstruction["offset"]
+                + ray_hit_weight * rays["hit"]
+                + ray_extra_weight * rays["extra"])
+        elif self.diffusion_target == "epsilon":
             # The epsilon run has one primary denoising target. A residual
             # L1 auxiliary is available but defaults to zero for this ablation.
             decoded_tasks = (reconstruction_weight * reconstruction["loss"]
@@ -727,8 +784,10 @@ class SparseResidualStage2(nn.Module):
             emitted = self.lpcr.emit_points(
                 conditions.hierarchy[0], addition_logits,
                 offsets, occupancy_threshold)
+            emitted["candidate_probabilities"] = addition_logits.sigmoid()
         else:
             emitted = full
+            emitted["candidate_probabilities"] = logits.sigmoid()
         emitted["full_estimate_cells"] = full["predicted_cells"]
         emitted["residual_abs_present_latent"] = (
             float(residual[present].abs().mean()) if bool(present.any()) else None)

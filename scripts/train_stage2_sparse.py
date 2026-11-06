@@ -17,6 +17,8 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
     PRUNER_VERSIONS, RadarPruner)
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
+    RadarSupportCache, identity as radar_support_identity)
 from models.radar_lidar_stage2.addition import (
     HEALTHY_RETAINED_FRACTION, MIN_CLEAN_CELLS_IN_REGION,
     REGION_STRIDE_ZYX,
@@ -25,10 +27,14 @@ from models.radar_lidar_stage2.fault_data import (
     FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
 )
 from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
+from models.radar_lidar_stage2.geometry_gate import (
+    RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
+    geometry_gate_output)
 from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
-    EPSILON_MODEL_REVISION, LPCR_REVISION, MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
+    EPSILON_MODEL_REVISION, GEOMETRY_EPSILON_REVISION, LPCR_REVISION,
+    MAX_POINTS_PER_VOXEL, MODEL_REVISION, VERSION,
     SparseResidualStage2, Stage2Conditions,
     cosine_alpha_bars,
 )
@@ -108,7 +114,9 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
     if stage1 is not None:
         stage1.eval()
     totals: dict[str, float] = {}
-    fault_counts = {name: 0 for name, _ in FAULT_PLAN}
+    fault_counts = ({name: 0 for name in set(args.fault_names[split].values())}
+                    if args.ray_offset_baseline else
+                    {name: 0 for name, _ in FAULT_PLAN})
     processed = skipped = 0
     context = torch.enable_grad if training else torch.no_grad
     with context():
@@ -123,7 +131,18 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                         clean, row["frame_id"], epoch if training else 1,
                         args.lpcr_sites_per_frame)
                 else:
-                    if fixed_cache is not None:
+                    if args.ray_offset_baseline:
+                        radar = row["radar"].to(args.device, non_blocking=True)
+                        stage1_faulty = load_faulty(args.faulty_root, split,
+                                                    row["frame_id"])
+                        preloaded_faults[row["frame_id"]] = (
+                            stage1_faulty, args.fault_names[split][row["frame_id"]])
+                        support = args.support_caches[split].load(row["frame_id"])
+                        with torch.no_grad():
+                            output = geometry_gate_output(
+                                radar, stage1_faulty.to(args.device), support)
+                        targets = None
+                    elif fixed_cache is not None:
                         output = {key: value.to(args.device, non_blocking=True)
                                   for key, value in row["stage2_output"].items()}
                         stored = row["stage2_targets"]
@@ -200,6 +219,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                               reconstruction_weight=args.reconstruction_weight,
                                               addition_weight=args.addition_weight,
                                               healthy_weight=args.healthy_weight,
+                                              ray_offset_baseline=args.ray_offset_baseline,
+                                              offset_weight=args.offset_weight,
                                               ray_hit_weight=args.ray_hit_weight,
                                               ray_extra_weight=args.ray_extra_weight,
                                               ray_angular_tolerance_deg=args.ray_angular_tolerance_deg,
@@ -237,6 +258,12 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                "ray_extra_loss": rays["extra"],
                                "ray_hit_rays": rays["hit_rays"] / batch_size,
                                "ray_extra_sites": rays["extra_sites"] / batch_size})
+                if args.ray_offset_baseline:
+                    for disabled in ("occupancy", "iou_known", "iou_full",
+                                     "known_sites", "addition_final_loss",
+                                     "addition_healthy_loss", "healthy_addition_rate",
+                                     "healthy_negative_sites"):
+                        del values[disabled]
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 values["loss"].backward()
@@ -298,6 +325,11 @@ def main() -> None:
                         help="Compressed frozen Stage-I and LiDAR-label cache")
     parser.add_argument("--stage1-checkpoint", type=Path,
                         help="Required only for radar-conditioned diffusion")
+    parser.add_argument("--ray-offset-baseline", action="store_true",
+                        help="Fixed 3-radar-voxel/1.6 m gate; epsilon MSE, rays, offsets only")
+    parser.add_argument("--support-cache-root", type=Path,
+                        help="Precomputed 3-radar-voxel/1.6 m support masks")
+    parser.add_argument("--offset-weight", type=float, default=1.0)
     parser.add_argument("--lpcr-checkpoint", type=Path,
                         help="Required for diffusion; best LPCR checkpoint")
     parser.add_argument("--output-root", type=Path, required=True)
@@ -346,14 +378,26 @@ def main() -> None:
             args.lpcr_sites_per_frame < 7744 or
             args.paper_metrics_every < 1 or args.paper_metrics_frames < 1 or
             not 0 < args.paper_metrics_threshold < 1 or
-            min(args.residual_weight, args.reconstruction_weight,
+            min(args.residual_weight, args.reconstruction_weight, args.offset_weight,
                 args.addition_weight, args.healthy_weight,
                 args.ray_hit_weight, args.ray_extra_weight) < 0 or
             args.phase == "lpcr" and args.diffusion_target != "residual" or
             args.ray_angular_tolerance_deg <= 0 or
             args.ray_lateral_tolerance_m <= 0 or
             args.ray_range_margin_m is not None and args.ray_range_margin_m < 0 or
-            args.phase == "diffusion" and args.stage1_checkpoint is None or
+            args.phase == "diffusion" and not args.ray_offset_baseline
+            and args.stage1_checkpoint is None or
+            args.ray_offset_baseline and (
+                args.phase != "diffusion" or args.diffusion_target != "epsilon"
+                or args.stage1_checkpoint is not None
+                or args.stage2_cache_root is not None
+                or args.support_cache_root is None
+                or args.faulty_root is None or args.batch_size != 1
+                or not (args.ray_hit_weight > 0 and args.ray_extra_weight > 0
+                        and args.offset_weight > 0)
+                or any(value != 0 for value in (
+                    args.residual_weight, args.reconstruction_weight,
+                    args.addition_weight, args.healthy_weight))) or
             args.phase == "diffusion" and args.batch_size > 1
             and args.stage2_cache_root is None or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
@@ -368,6 +412,11 @@ def main() -> None:
     if args.phase == "lpcr":
         stage1 = None
         radius_m = None
+    elif args.ray_offset_baseline:
+        stage1 = None
+        stage1_saved = {"version": GEOMETRY_GATE_VERSION,
+                        "radar_variant": args.radar_variant}
+        radius_m = GEOMETRY_RADIUS_M
     elif args.stage2_cache_root:
         stage1_saved = torch.load(args.stage1_checkpoint, map_location="cpu",
                                   weights_only=False)
@@ -388,23 +437,32 @@ def main() -> None:
     model = SparseResidualStage2(diffusion_target=args.diffusion_target).to(args.device)
     identity = {"version": VERSION,
                 "model_revision": (LPCR_REVISION if args.phase == "lpcr"
+                                   else GEOMETRY_EPSILON_REVISION
+                                   if args.ray_offset_baseline
                                    else EPSILON_MODEL_REVISION
                                    if args.diffusion_target == "epsilon"
                                    else MODEL_REVISION),
                 "phase": args.phase, "grid": asdict(GRID),
                 "max_points_per_voxel": MAX_POINTS_PER_VOXEL,
-                "occupancy_weight": 0.9, "offset_weight": 0.1,
+                "occupancy_weight": 0.0 if args.ray_offset_baseline else 0.9,
+                "offset_weight": (args.offset_weight if args.ray_offset_baseline
+                                  else 0.1),
                 "diffusion_objective": (
+                    "epsilon_mse_weighted_ray_hit_ray_extra_offset"
+                    if args.ray_offset_baseline else
                     "epsilon_mse_weighted_lpcr_addition_healthy"
                     if args.diffusion_target == "epsilon" else
                     "clean_latent_mse_residual_l1_lpcr_addition_healthy"
                     if args.phase == "diffusion" else
                     "clean_latent_mse_residual_l1_lpcr"),
                 "stage1_sha256": (sha256(args.stage1_checkpoint)
-                                  if args.phase == "diffusion" else None),
+                                  if args.phase == "diffusion" and not args.ray_offset_baseline
+                                  else None),
                 "radar_variant": (args.radar_variant if args.phase == "diffusion" else None),
                 "gate_threshold": (args.gate_threshold if args.phase == "diffusion" else None),
                 "radius_m": radius_m,
+                "geometry_gate_version": (GEOMETRY_GATE_VERSION
+                                          if args.ray_offset_baseline else None),
                 "lpcr_sites_per_frame": (args.lpcr_sites_per_frame
                                           if args.phase == "lpcr" else None),
                 "lpcr_full_region": True,
@@ -413,8 +471,11 @@ def main() -> None:
                                 if args.lpcr_checkpoint else None),
                 "faulty_root": str(args.faulty_root.resolve()) if args.faulty_root else None,
                 "fault_seed": args.fault_seed,
-                "fault_policy_version": FAULT_POLICY_VERSION,
-                "fault_plan": FAULT_PLAN,
+                "fault_policy_version": ("precomputed_mild_faults"
+                                         if args.ray_offset_baseline
+                                         else FAULT_POLICY_VERSION),
+                "fault_plan": ("precomputed_mild_faults"
+                               if args.ray_offset_baseline else FAULT_PLAN),
                 "fault_cache_root": (str(args.fault_cache_root.resolve())
                                      if args.fault_cache_root else None),
                 "run_seed": run_seed,
@@ -434,6 +495,21 @@ def main() -> None:
                              "epsilon_task_weight": "min_1_sqrt_snr",
                              "epsilon_residual_clip": 2.0,
                              "epsilon_shared_timestep_per_batch": True})
+        if args.ray_offset_baseline:
+            identity.update({"ray_offset_baseline": True,
+                             "min_distinct_radar_voxels": 3,
+                             "observed_faulty_cells_excluded": True,
+                             "healthy_region_loss_enabled": False,
+                             "addition_classification_loss_enabled": False,
+                             "lpcr_occupancy_loss_enabled": False,
+                             "faulty_train_manifest_sha256": sha256(
+                                 args.faulty_root / "train" / "manifest.json"),
+                             "faulty_val_manifest_sha256": sha256(
+                                 args.faulty_root / "val" / "manifest.json"),
+                             "support_train_manifest_sha256": sha256(
+                                 args.support_cache_root / "train" / "manifest.json"),
+                             "support_val_manifest_sha256": sha256(
+                                 args.support_cache_root / "val" / "manifest.json")})
         if args.ray_hit_weight or args.ray_extra_weight:
             identity.update({"ray_angular_tolerance_deg": args.ray_angular_tolerance_deg,
                              "ray_lateral_tolerance_m": args.ray_lateral_tolerance_m,
@@ -469,6 +545,26 @@ def main() -> None:
                                            include_clean=True,
                                            data_cache_root=args.data_cache_root)
                      for split in ("train", "val")}
+    args.fault_names = {}
+    if args.ray_offset_baseline:
+        for split in ("train", "val"):
+            manifest = json.loads((args.faulty_root / split / "manifest.json")
+                                  .read_text(encoding="utf-8"))
+            if (manifest.get("radar_variant") != args.radar_variant
+                    or manifest.get("frame_ids") != [
+                        frame.frame_id for frame in full_datasets[split].frames]):
+                raise ValueError(f"Mild-fault cache differs from {split} dataset")
+            args.fault_names[split] = manifest["frame_faults"]
+    args.support_caches = {}
+    if args.ray_offset_baseline:
+        for split, dataset in full_datasets.items():
+            expected = radar_support_identity(
+                split, [frame.frame_id for frame in dataset.frames],
+                args.radar_variant, data_cache_root=args.data_cache_root,
+                radius_m=GEOMETRY_RADIUS_M)
+            cache = RadarSupportCache(args.support_cache_root / split, expected)
+            cache.check_complete()
+            args.support_caches[split] = cache
     fixed_caches = {}
     fog_caches = {}
     for split, dataset in full_datasets.items():
@@ -565,6 +661,19 @@ def main() -> None:
                       f"{paper['predicted_points']:.0f}/{paper['target_points']:.0f}, "
                       f"empty predictions={paper['empty_predictions']}",
                       flush=True)
+        elif args.ray_offset_baseline:
+            print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
+                  f"noise MSE={val['noise']:.5f}, "
+                  f"offset L1={val['offset']:.5f}, "
+                  f"ray hit/extra loss={val['ray_hit_loss']:.5f}/"
+                  f"{val['ray_extra_loss']:.5f}, "
+                  f"ray hit/extra labels={val['ray_hit_rays']:.0f}/"
+                  f"{val['ray_extra_sites']:.0f}, "
+                  f"addition precision/recall@0.5="
+                  f"{val['addition_precision']:.4f}/"
+                  f"{val['addition_recall']:.4f}, "
+                  f"mean allowed cells={val['allowed_sites']:.0f}, "
+                  f"train faults={train['fault_counts']}", flush=True)
         else:
             print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "
                   f"Known/Full gate IoU={val['iou_known']:.4f}/{val['iou_full']:.4f}, "

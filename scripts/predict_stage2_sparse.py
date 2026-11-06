@@ -16,7 +16,12 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_crossmodal_v1.radar_pruner import (
     PRUNER_VERSIONS, radar_support_mask)
-from models.radar_lidar_crossmodal_v1.radar_pruner_cache import bind_faulty_cache_identity
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
+    RadarSupportCache, bind_faulty_cache_identity,
+    identity as radar_support_identity)
+from models.radar_lidar_stage2.geometry_gate import (
+    RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
+    geometry_gate_output)
 from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
     load_faulty, severe_fault,
@@ -215,7 +220,9 @@ document.getElementById('zin').onclick=()=>{const canvas=panels[0].canvas;zoom(1
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
-    parser.add_argument("--stage1-checkpoint", type=Path, required=True)
+    parser.add_argument("--stage1-checkpoint", type=Path)
+    parser.add_argument("--support-cache-root", type=Path,
+                        help="Required for a geometry-only Stage-II checkpoint")
     parser.add_argument("--stage2-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path,
@@ -248,7 +255,18 @@ def main() -> None:
             (args.faulty_root is None and args.fault_cache_root is None) or
             (args.faulty_root is not None and args.fault_type != "auto")):
         parser.error("Inference requires CUDA, a severe fog cache for synthetic faults, and real faulty LiDAR for test")
-    if args.stage2_cache_root:
+    model, saved2 = load_stage2(args.stage2_checkpoint, args.device)
+    geometry_only = saved2.get("geometry_gate_version") == GEOMETRY_GATE_VERSION
+    if geometry_only:
+        if (args.stage1_checkpoint is not None or args.stage2_cache_root is not None
+                or args.support_cache_root is None or args.faulty_root is None):
+            parser.error("Geometry-only Stage II needs a support cache and faulty root, without Stage I")
+        stage1 = None
+        saved1 = {"version": GEOMETRY_GATE_VERSION,
+                  "radar_variant": args.radar_variant}
+    elif args.stage1_checkpoint is None:
+        parser.error("This Stage-II checkpoint requires --stage1-checkpoint")
+    elif args.stage2_cache_root:
         saved1 = torch.load(args.stage1_checkpoint, map_location="cpu",
                             weights_only=False)
         if saved1.get("radar_variant") != args.radar_variant:
@@ -257,21 +275,38 @@ def main() -> None:
     else:
         stage1, saved1 = load_stage1(args.stage1_checkpoint, args.device,
                                       args.radar_variant)
-    model, saved2 = load_stage2(args.stage2_checkpoint, args.device)
-    if (saved2.get("fault_policy_version") != FAULT_POLICY_VERSION
+    if (not geometry_only and
+            (saved2.get("fault_policy_version") != FAULT_POLICY_VERSION
             or tuple(tuple(item) for item in saved2.get("fault_plan", ()))
-            != FAULT_PLAN):
+            != FAULT_PLAN)):
         raise ValueError("This diffusion checkpoint used a different fog-return detection policy; retrain diffusion with the current fault policy")
-    if (saved2["stage1_sha256"] != sha256(args.stage1_checkpoint)
+    if geometry_only and args.split in ("train", "val") and (
+            saved2.get(f"faulty_{args.split}_manifest_sha256") != sha256(
+                args.faulty_root / args.split / "manifest.json")
+            or saved2.get(f"support_{args.split}_manifest_sha256") != sha256(
+                args.support_cache_root / args.split / "manifest.json")):
+        raise ValueError("Geometry baseline fault or support cache differs from training")
+    if ((not geometry_only and saved2["stage1_sha256"] != sha256(args.stage1_checkpoint))
             or saved2["radar_variant"] != args.radar_variant):
         raise ValueError("Stage-II checkpoint was trained with a different Stage I")
     if (saved1.get("version") in PRUNER_VERSIONS and
             args.stage2_cache_root and args.faulty_root is None):
         parser.error("Cached radar-pruner inference requires --faulty-root")
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
-                             include_clean=args.faulty_root is None,
+                             include_clean=(args.faulty_root is None or geometry_only)
+                             and args.split != "test",
                              data_cache_root=(args.data_cache_root
-                                              if args.faulty_root is None else None))
+                                              if args.faulty_root is None or geometry_only
+                                              else None))
+    support_cache = None
+    if geometry_only:
+        expected = radar_support_identity(
+            args.split, [frame.frame_id for frame in dataset.frames],
+            args.radar_variant, data_cache_root=args.data_cache_root,
+            radius_m=GEOMETRY_RADIUS_M)
+        support_cache = RadarSupportCache(args.support_cache_root / args.split,
+                                          expected)
+        support_cache.check_complete()
     fog_cache = (SevereFogCache(args.fault_cache_root, args.split,
                                 [frame.frame_id for frame in dataset.frames],
                                 seed=int(saved2["fault_seed"]))
@@ -307,9 +342,10 @@ def main() -> None:
         faulty = faulty.to(args.device)
         if cache is None:
             radar = row["radar"].to(args.device)
-            output = stage1_frame(
-                stage1, radar, float(saved1.get("radius_m", saved1.get(
-                    "support_radius_m", 3.2))), faulty=faulty)
+            output = (geometry_gate_output(
+                radar, faulty, support_cache.load(frame_id)) if geometry_only else
+                stage1_frame(stage1, radar, float(saved1.get("radius_m", saved1.get(
+                    "support_radius_m", 3.2))), faulty=faulty))
             targets = None
         else:
             output, targets = cache.load(frame_id, args.device)
@@ -327,9 +363,10 @@ def main() -> None:
                                  occupancy_threshold=args.occupancy_threshold,
                                  missing_only=not args.full_estimate,
                                  use_residual=not args.zero_residual)
-        if saved1.get("version") in PRUNER_VERSIONS:
-            support = radar_support_mask(
-                row["radar"], float(saved1["support_radius_m"]))
+        if geometry_only or saved1.get("version") in PRUNER_VERSIONS:
+            support = (support_cache.load(frame_id) if geometry_only else
+                       radar_support_mask(row["radar"],
+                                          float(saved1["support_radius_m"])))
             chosen = predicted["occupied_coordinates"][:, 1:].cpu().numpy()
             if len(chosen) and not bool(support[
                     chosen[:, 0], chosen[:, 1], chosen[:, 2]].all()):

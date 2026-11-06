@@ -19,7 +19,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner import (
 
 from .sparse_geometry import GRID
 from .sparse_residual import (
-    EPSILON_MODEL_REVISION, LPCR_REVISION, MODEL_REVISION, VERSION,
+    EPSILON_MODEL_REVISION, GEOMETRY_EPSILON_REVISION,
+    LPCR_REVISION, MODEL_REVISION, VERSION,
     SparseResidualStage2,
 )
 
@@ -76,7 +77,8 @@ def load_stage2(path: Path, device: str,
     saved = torch.load(path, map_location="cpu", weights_only=False)
     previous_diffusion_revision = "stage2_r2ldm_centroid_residual_v8"
     accepted_revisions = ({LPCR_REVISION} if phase == "lpcr"
-                          else {MODEL_REVISION, EPSILON_MODEL_REVISION, LPCR_REVISION})
+                          else {MODEL_REVISION, EPSILON_MODEL_REVISION,
+                                GEOMETRY_EPSILON_REVISION, LPCR_REVISION})
     if phase == "diffusion":
         accepted_revisions.add(previous_diffusion_revision)
     if (saved.get("version") != VERSION
@@ -85,7 +87,8 @@ def load_stage2(path: Path, device: str,
         raise ValueError(f"Expected {VERSION}/{accepted_revisions} {phase} checkpoint")
     if saved.get("grid") != asdict(GRID):
         raise ValueError("Stage-II checkpoint grid differs from current code")
-    epsilon = saved["model_revision"] == EPSILON_MODEL_REVISION
+    epsilon = saved["model_revision"] in (EPSILON_MODEL_REVISION,
+                                            GEOMETRY_EPSILON_REVISION)
     if epsilon and (saved.get("diffusion_target") != "epsilon"
                     or saved.get("max_points_per_voxel") != 1):
         raise ValueError("Epsilon checkpoint is missing its prediction or point-count contract")
@@ -93,12 +96,13 @@ def load_stage2(path: Path, device: str,
         diffusion_target="epsilon" if epsilon else "residual").to(device)
     missing, unexpected = model.load_state_dict(saved["model"], strict=False)
     if (unexpected or
-            (saved["model_revision"] in (MODEL_REVISION, EPSILON_MODEL_REVISION)
+            (saved["model_revision"] in (MODEL_REVISION, EPSILON_MODEL_REVISION,
+                                         GEOMETRY_EPSILON_REVISION)
              and missing) or
             any(not key.startswith("addition_head.") for key in missing)):
         raise ValueError("Stage-II checkpoint model weights differ from the architecture")
     model.use_addition_head = saved["model_revision"] in (
-        MODEL_REVISION, EPSILON_MODEL_REVISION)
+        MODEL_REVISION, EPSILON_MODEL_REVISION, GEOMETRY_EPSILON_REVISION)
     model.lpcr_uses_stage1_probabilities = (
         saved["model_revision"] == previous_diffusion_revision)
     return model.eval(), saved

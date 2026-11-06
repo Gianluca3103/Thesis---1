@@ -260,6 +260,47 @@ L_addition + L_healthy` with default outer weights of one. R2LDM itself uses
 clean-latent MSE during diffusion; the other terms are this project's additions.
 The 30-epoch, `1e-3` AdamW/StepLR LPCR starting settings are retained.
 
+### Fixed-geometry epsilon/ray/offset baseline
+
+`bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh` trains Stage II
+without a learned Stage I checkpoint. It reuses the existing 1.6 m support
+cache: a candidate must have at least three **distinct radar voxels** within
+1.6 m of its center. Voxels already occupied by the faulty LiDAR are removed
+from the addition domain before Stage II sees them. All other supported cells
+are scored; no learned gate threshold prunes them. The trainable radar adapter
+receives deterministic pooled radar count, RCS, Doppler, age, and position
+statistics, not a learned Stage I feature map.
+
+This run reuses the frozen full-region LPCR LiDAR encoder and decoder, and
+trains the Stage-II radar adapter, sparse epsilon U-Net and addition head on
+the cached mild-fog2/partial-loss data. The **only** optimized terms are
+`MSE(predicted_noise, sampled_noise)`, a clean-centroid XYZ offset L1 inside
+measured clean voxels, the first-hit ray term, and the extra-return ray term.
+The latter three are multiplied by the existing bounded epsilon task weight.
+No healthy-region oracle, addition-classification loss, LPCR occupancy BCE,
+or direct residual loss is called in this mode. Clean LiDAR supplies training
+targets and rays only, never inference inputs. The ray labels use direction
+matching as a proxy because exact LiDAR firing IDs are unavailable.
+
+The launcher uses the existing 20-frame radar variant, 1.6 m support cache,
+and 64 validation frames for checkpoint selection. It then evaluates 512
+different validation frames, alternating 256 calibration and 256 held-out
+frames; the first 64 are excluded. The evaluation samples with 64 diffusion
+steps and reports the geometry ceiling, keep-all precision, and held-out
+metrics at thresholds selected on calibration. `EVAL=0` skips this expensive
+second pass. A two-frame GPU smoke run can use a **new** output directory:
+
+```bash
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/stage2_geometry1p6m_smoke \
+EPOCHS=1 TRAIN_LIMIT=2 VAL_LIMIT=2 EVAL=0 \
+bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh
+```
+
+The default full run writes a separate checkpoint and validation report under
+`stage2_geometry1p6m_epsilon_ray_offset_mild_20261106`. GPU memory and speed
+must be verified by the smoke run: the full rule often exposes about 120,000
+fine candidates per frame, substantially more than an old learned gate.
+
 ### Separate epsilon-prediction ablation
 
 `bash scripts/train_stage2_epsilon_ablation.sh` reuses the radar Stage-I
