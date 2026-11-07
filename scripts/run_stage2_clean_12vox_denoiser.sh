@@ -10,6 +10,8 @@ VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/vi
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SUPPORT=${SUPPORT:-$DATA/radar_support12vox_1p6m_mild_fog2_20261107}
 OUT=${OUT:-$DATA/stage2_clean_denoiser_12vox_1p6m_20261107}
+MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
+CONDITION_FAULTY_RADAR=${CONDITION_FAULTY_RADAR:-0}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 if [[ ! -s "$LPCR" ]]; then
   LPCR=$DATA/stage2_fullregion_lpcr_for_geometry_20261106/best.ckpt
@@ -19,6 +21,11 @@ for required in "$PY" "$LPCR" "$RAW/train/manifest.json" \
   "$RAW/val/manifest.json"; do
   [[ -s "$required" ]] || { printf 'Missing required file: %s\n' "$required" >&2; exit 1; }
 done
+if [[ "$CONDITION_FAULTY_RADAR" == 1 ]]; then
+  for required in "$MILD/train/manifest.json" "$MILD/val/manifest.json"; do
+    [[ -s "$required" ]] || { printf 'Missing required file: %s\n' "$required" >&2; exit 1; }
+  done
+fi
 mkdir -p "$OUT" "$SUPPORT" "$DATA/stage2_clean_tmp"
 cd "$REPO"
 export PYTHONPATH="$REPO" OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
@@ -36,6 +43,9 @@ common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --lpcr-checkpoint "$LPCR"
   --batch-size "${BATCH_SIZE:-8}" --num-workers "${WORKERS:-2}"
   --device cuda)
+if [[ "$CONDITION_FAULTY_RADAR" == 1 ]]; then
+  common+=(--faulty-root "$MILD" --condition-faulty-radar)
+fi
 printf '2/3: run a 32-train/8-validation frame GPU smoke test.\n'
 if [[ ! -s "$OUT/smoke/last.ckpt" ]]; then
   "$PY" -u -m scripts.train_stage2_clean_denoiser \

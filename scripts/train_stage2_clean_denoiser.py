@@ -37,6 +37,8 @@ REVISION = "stage2_clean_12vox_1p6m_epsilon_denoiser_v1"
 REVERSE_REVISION = "stage2_clean_12vox_1p6m_fullnoise_reverse_5train_3val_v1"
 CONDITIONED_REVERSE_REVISION = (
     "stage2_clean_12vox_1p6m_faulty_radar_reverse_5train_3val_v1")
+CONDITIONED_ONE_STEP_REVISION = (
+    "stage2_clean_12vox_1p6m_faulty_radar_one_step_epsilon_v1")
 RADIUS_M = 1.6
 MIN_RADAR_VOXELS = 12
 RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
@@ -93,8 +95,8 @@ def _batch(rows: list[dict], device: str):
 
 def _conditioned_inputs(model: SparseResidualStage2, rows: list[dict],
                         hierarchy: tuple[torch.Tensor, ...],
-                        device: str) -> tuple[torch.Tensor, torch.Tensor,
-                                              torch.Tensor]:
+                        device: str, *, train_radar_adapter: bool = False
+                        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Encode faulty LiDAR and measured radar without exposing clean targets."""
     faults = [row["faulty_xyz"] for row in rows]
     faulty = torch.cat(faults).to(device, non_blocking=True)
@@ -106,19 +108,21 @@ def _conditioned_inputs(model: SparseResidualStage2, rows: list[dict],
     with torch.no_grad():
         faulty_latent, faulty_present = model.lidar_encoder(
             faulty, coarse, faulty_ids)
-        for frame, row in enumerate(rows):
-            radar = row["radar"].to(device, non_blocking=True)
-            # This full-scan, empty-fault call supplies radar statistics only.
-            # Its allowed cells are exactly the precomputed >=12/1.6 m mask;
-            # observed faulty cells are deliberately not removed here.
+    for frame, row in enumerate(rows):
+        radar = row["radar"].to(device, non_blocking=True)
+        # This full-scan, empty-fault call supplies radar statistics only.
+        # Its allowed cells are exactly the precomputed >=12/1.6 m mask;
+        # observed faulty cells are deliberately not removed here.
+        with torch.no_grad():
             output = geometry_gate_output(
                 radar, faulty[:0], {"kind": "full_scan"},
                 row["support_mask"], MIN_RADAR_VOXELS)
+        with torch.set_grad_enabled(train_radar_adapter):
             condition = model.conditions(output, 0.5)
-            frame_coarse = coarse[coarse[:, 0] == frame][:, 1:]
-            if not torch.equal(condition.hierarchy[-1][:, 1:], frame_coarse):
-                raise ValueError("Radar features do not align with gated latent sites")
-            radar_parts.append(condition.radar_features)
+        frame_coarse = coarse[coarse[:, 0] == frame][:, 1:]
+        if not torch.equal(condition.hierarchy[-1][:, 1:], frame_coarse):
+            raise ValueError("Radar features do not align with gated latent sites")
+        radar_parts.append(condition.radar_features)
     radar_latent = torch.cat(radar_parts)
     if radar_latent.shape != faulty_latent.shape:
         raise ValueError("Faulty LiDAR and radar latent features differ")
@@ -151,12 +155,13 @@ def reverse_step(xt: torch.Tensor, predicted_epsilon: torch.Tensor,
 
 def resolve_sampling_strategy(revision: str, requested: str) -> str:
     """Pin a checkpoint's default sampler while allowing a crossed comparison."""
-    if revision not in (REVISION, REVERSE_REVISION):
-        raise ValueError("Expected an unconditioned clean denoiser checkpoint")
+    if revision not in (REVISION, REVERSE_REVISION,
+                        CONDITIONED_ONE_STEP_REVISION):
+        raise ValueError("Expected a supported clean denoiser checkpoint")
     if requested not in ("checkpoint", "one_step", "reverse3"):
         raise ValueError("Unknown clean denoiser sampling strategy")
     if requested == "checkpoint":
-        return "one_step" if revision == REVISION else "reverse3"
+        return ("reverse3" if revision == REVERSE_REVISION else "one_step")
     return requested
 
 
@@ -164,18 +169,27 @@ def resolve_sampling_strategy(revision: str, requested: str) -> str:
 def sample_clean_latent(model: SparseResidualStage2, x0: torch.Tensor,
                         coarse: torch.Tensor, alpha_bars: torch.Tensor,
                         generator: torch.Generator, *, batch_size: int,
-                        strategy: str, eval_timestep: int) -> torch.Tensor:
+                        strategy: str, eval_timestep: int,
+                        conditions: tuple[torch.Tensor, torch.Tensor,
+                                          torch.Tensor] | None = None
+                        ) -> torch.Tensor:
     """Use the same fixed gate and decoder with either clean-noise or full-noise input."""
-    zero = torch.zeros_like(x0)
+    if conditions is None:
+        faulty = radar = torch.zeros_like(x0)
+        present = torch.zeros(len(x0), dtype=torch.bool, device=x0.device)
+    else:
+        faulty, present, radar = conditions
+        if (faulty.shape != x0.shape or radar.shape != x0.shape or
+                present.shape != (len(x0),)):
+            raise ValueError("Conditioning differs from clean latent sites")
     probability = x0.new_ones((len(x0), 1))
-    absent = torch.zeros(len(x0), dtype=torch.bool, device=x0.device)
     if strategy == "one_step":
         alpha = alpha_bars[eval_timestep]
         epsilon = torch.randn(x0.shape, dtype=x0.dtype, device=x0.device,
                               generator=generator)
         xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
         prediction = model.diffusion(
-            xt, zero, zero, probability, absent,
+            xt, faulty, radar, probability, present,
             torch.full((batch_size,), eval_timestep, device=x0.device,
                        dtype=torch.long), coarse)
         return (xt - (1 - alpha).sqrt() * prediction) / alpha.sqrt()
@@ -186,7 +200,7 @@ def sample_clean_latent(model: SparseResidualStage2, x0: torch.Tensor,
     schedule = reverse_schedule(3, total=len(alpha_bars)).to(x0.device)
     for index, timestep in enumerate(schedule):
         prediction = model.diffusion(
-            xt, zero, zero, probability, absent,
+            xt, faulty, radar, probability, present,
             timestep.expand(batch_size), coarse)
         following_alpha = (alpha_bars[schedule[index + 1]]
                            if index + 1 < len(schedule) else None)
@@ -203,7 +217,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                eval_timestep: int, seed: int,
                reverse_train_steps: int = 0,
                reverse_val_steps: int = 0,
-               condition_faulty_radar: bool = False) -> dict:
+               condition_faulty_radar: bool = False,
+               train_radar_adapter: bool = False) -> dict:
     training = optimizer is not None
     model.eval()
     model.diffusion.train(training)
@@ -231,7 +246,9 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
         latent_ids = coarse[:, 0].long()
         if condition_faulty_radar:
             faulty_condition, faulty_present, radar_condition = (
-                _conditioned_inputs(model, rows, hierarchy, device))
+                _conditioned_inputs(
+                    model, rows, hierarchy, device,
+                    train_radar_adapter=training and train_radar_adapter))
         else:
             faulty_condition = radar_condition = torch.zeros_like(x0)
             faulty_present = torch.zeros(
@@ -292,7 +309,9 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.diffusion.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        (parameter for parameter in model.parameters()
+                         if parameter.requires_grad), 1.0)
                     optimizer.step()
         loss_sum += float(loss.detach()) * len(rows)
         if not training:
@@ -333,6 +352,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                        "conditioning": ("faulty_LiDAR_and_measured_radar"
                                         if condition_faulty_radar else
                                         "gate_coordinates_only")})
+    elif condition_faulty_radar:
+        output["conditioning"] = "faulty_LiDAR_and_measured_radar"
     return output
 
 
@@ -371,9 +392,8 @@ def main() -> None:
         parser.error("Invalid training, validation, or diffusion settings")
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("This sparse U-Net run requires CUDA and MinkowskiEngine")
-    if args.condition_faulty_radar and (
-            args.faulty_root is None or args.reverse_train_steps != 5):
-        parser.error("Faulty/radar conditioning requires --faulty-root and 5/3 reverse steps")
+    if args.condition_faulty_radar and args.faulty_root is None:
+        parser.error("Faulty/radar conditioning requires --faulty-root")
     if args.faulty_root is not None and not args.condition_faulty_radar:
         parser.error("--faulty-root requires --condition-faulty-radar")
     torch.manual_seed(args.seed)
@@ -393,7 +413,13 @@ def main() -> None:
         raise ValueError("LPCR checkpoint differs from this Stage II architecture")
     model.requires_grad_(False)
     model.diffusion.requires_grad_(True)
-    optimizer = torch.optim.AdamW(model.diffusion.parameters(), lr=args.lr,
+    train_radar_adapter = bool(args.condition_faulty_radar and
+                               args.reverse_train_steps == 0)
+    if train_radar_adapter:
+        model.radar_adapter.requires_grad_(True)
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters()
+         if parameter.requires_grad], lr=args.lr,
                                   betas=(0.9, 0.999), weight_decay=0.01)
     alpha_bars = cosine_alpha_bars(device=args.device)
 
@@ -418,7 +444,9 @@ def main() -> None:
             num_workers=args.num_workers, collate_fn=_rows,
             pin_memory=True, persistent_workers=args.num_workers > 0)
 
-    revision = (CONDITIONED_REVERSE_REVISION if args.condition_faulty_radar
+    revision = (CONDITIONED_REVERSE_REVISION
+                if args.condition_faulty_radar and args.reverse_train_steps
+                else CONDITIONED_ONE_STEP_REVISION if args.condition_faulty_radar
                 else REVERSE_REVISION if args.reverse_train_steps else REVISION)
     identity = {"revision": revision,
                 "lpcr_sha256": sha256(args.lpcr_checkpoint),
@@ -445,6 +473,9 @@ def main() -> None:
         identity["faulty_manifest_sha256"] = {
             split: sha256(args.faulty_root / split / "manifest.json")
             for split in ("train", "val")}
+        if train_radar_adapter:
+            identity["radar_adapter_trainable"] = True
+            identity["conditioning"] = "faulty_LiDAR_and_measured_radar"
     start, best = 1, float("inf")
     best_iou = -1.0
     if args.resume:
@@ -452,15 +483,17 @@ def main() -> None:
         if saved.get("identity") != identity:
             raise ValueError("Resume checkpoint belongs to a different denoising run")
         model.diffusion.load_state_dict(saved["diffusion"])
+        if train_radar_adapter:
+            model.radar_adapter.load_state_dict(saved["radar_adapter"])
         optimizer.load_state_dict(saved["optimizer"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_val_noise_mse"])
-        if args.reverse_train_steps:
+        if args.reverse_train_steps or args.condition_faulty_radar:
             best_iou = float(saved["best_val_iou_at_0p5"])
     history = args.output_root / "history.jsonl"
     if start > args.epochs:
         print(f"Already complete: epoch {start - 1}; {args.output_root}", flush=True)
         return
-    print(f"Clean-only epsilon denoising on >=12 distinct radar voxels within 1.6 m; "
+    print(f"Clean-target epsilon denoising on >=12 distinct radar voxels within 1.6 m; "
           f"{len(loaders['train'].dataset)} train and {len(loaders['val'].dataset)} "
           f"validation frames. Reverse train/val steps="
           f"{args.reverse_train_steps}/{args.reverse_val_steps}. "
@@ -472,24 +505,27 @@ def main() -> None:
                            eval_timestep=args.eval_timestep, seed=args.seed,
                            reverse_train_steps=args.reverse_train_steps,
                            reverse_val_steps=args.reverse_val_steps,
-                           condition_faulty_radar=args.condition_faulty_radar)
+                           condition_faulty_radar=args.condition_faulty_radar,
+                           train_radar_adapter=train_radar_adapter)
         val = _run_epoch(model, loaders["val"], None, alpha_bars,
                          device=args.device, epoch=epoch,
                          eval_timestep=args.eval_timestep, seed=args.seed,
                          reverse_train_steps=args.reverse_train_steps,
                          reverse_val_steps=args.reverse_val_steps,
-                         condition_faulty_radar=args.condition_faulty_radar)
+                         condition_faulty_radar=args.condition_faulty_radar,
+                         train_radar_adapter=train_radar_adapter)
         improved = val["noise_mse"] < best
         if improved:
             best = val["noise_mse"]
-        improved_iou = (args.reverse_train_steps > 0 and
+        improved_iou = ((args.reverse_train_steps > 0 or
+                         args.condition_faulty_radar) and
                         val["eligible_occupancy"]["iou"] > best_iou)
         if improved_iou:
             best_iou = val["eligible_occupancy"]["iou"]
         record = {"epoch": epoch, "train": train, "val": val,
                   "best_val_noise_mse": best,
                   "validation_scope": f"{len(loaders['val'].dataset)} clean frames"}
-        if args.reverse_train_steps:
+        if args.reverse_train_steps or args.condition_faulty_radar:
             record["best_val_iou_at_0p5"] = best_iou
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -497,7 +533,9 @@ def main() -> None:
                       "best_val_noise_mse": best,
                       "diffusion": model.diffusion.state_dict(),
                       "optimizer": optimizer.state_dict(), "record": record}
-        if args.reverse_train_steps:
+        if train_radar_adapter:
+            checkpoint["radar_adapter"] = model.radar_adapter.state_dict()
+        if args.reverse_train_steps or args.condition_faulty_radar:
             checkpoint["best_val_iou_at_0p5"] = best_iou
         _atomic_save(args.output_root / "last.ckpt", checkpoint)
         if improved:
@@ -506,7 +544,7 @@ def main() -> None:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
         print(json.dumps(record), flush=True)
     print(f"Best checkpoint: {args.output_root / 'best.ckpt'}", flush=True)
-    if args.reverse_train_steps:
+    if args.reverse_train_steps or args.condition_faulty_radar:
         print(f"Best occupancy IoU checkpoint: "
               f"{args.output_root / 'best_iou.ckpt'}", flush=True)
 

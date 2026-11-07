@@ -10,7 +10,8 @@ from models.radar_lidar_stage2.sparse_residual import (
     LATENT_CHANNELS, SparseResidualStage2)
 from scripts import train_stage2_clean_denoiser as trainer
 from scripts.train_stage2_clean_denoiser import (
-    REVISION, REVERSE_REVISION, resolve_sampling_strategy,
+    CONDITIONED_ONE_STEP_REVISION, REVISION, REVERSE_REVISION,
+    resolve_sampling_strategy,
     reverse_schedule, reverse_step, sample_clean_latent)
 
 
@@ -41,6 +42,8 @@ def test_crossed_sampler_uses_the_requested_timesteps():
     assert resolve_sampling_strategy(REVERSE_REVISION, "checkpoint") == "reverse3"
     assert resolve_sampling_strategy(REVISION, "reverse3") == "reverse3"
     assert resolve_sampling_strategy(REVERSE_REVISION, "one_step") == "one_step"
+    assert resolve_sampling_strategy(
+        CONDITIONED_ONE_STEP_REVISION, "checkpoint") == "one_step"
     model = Model()
     x0 = torch.full((1, 2), 0.25)
     coarse = torch.tensor([[0, 0, 0, 0]])
@@ -66,6 +69,38 @@ def test_crossed_sampler_uses_the_requested_timesteps():
         model, x0 + 0.5, coarse, alpha_bars, same_noise, batch_size=1,
         strategy="reverse3", eval_timestep=499)
     assert torch.equal(first, different_clean)
+
+
+def test_one_step_sampling_uses_both_condition_tensors():
+    class Diffusion(nn.Module):
+        def forward(self, noisy, faulty, radar, probability, present,
+                    timestep, coords):
+            return faulty * present[:, None] + radar
+
+    class Model:
+        diffusion = Diffusion()
+
+    model = Model()
+    x0 = torch.zeros((1, 2))
+    coarse = torch.tensor([[0, 0, 0, 0]])
+    alpha_bars = torch.linspace(0.999, 0.001, 1000)
+    def sample(conditions):
+        return sample_clean_latent(
+            model, x0, coarse, alpha_bars,
+            torch.Generator().manual_seed(17), batch_size=1,
+            strategy="one_step", eval_timestep=499,
+            conditions=conditions)
+    gate_only = sample(None)
+    faulty = torch.full((1, 2), 0.4)
+    radar = torch.full((1, 2), 0.6)
+    conditioned = sample((faulty, torch.ones(1, dtype=torch.bool), radar))
+    assert not torch.equal(gate_only, conditioned)
+    assert not torch.equal(
+        conditioned, sample((torch.zeros_like(faulty),
+                             torch.ones(1, dtype=torch.bool), radar)))
+    assert not torch.equal(
+        conditioned, sample((faulty, torch.ones(1, dtype=torch.bool),
+                             torch.zeros_like(radar))))
 
 
 def test_reverse_step_recovers_clean_latent_with_exact_epsilon():
@@ -118,11 +153,15 @@ def test_faulty_and_radar_conditions_align_to_full_support_gate():
     hierarchy = trainer.batched_hierarchy([fine], "cpu")
     row = {"radar": radar, "faulty_xyz": torch.tensor([[10.1, 0.1, 0.1]]),
            "support_mask": mask, "fine_zyx": fine}
+    model = Model()
     faulty, present, measured_radar = trainer._conditioned_inputs(
-        Model(), [row], hierarchy, "cpu")
+        model, [row], hierarchy, "cpu", train_radar_adapter=True)
     assert faulty.shape == measured_radar.shape
     assert present.all()
     assert bool((measured_radar > 0).any())
+    measured_radar.mean().backward()
+    assert model.radar_adapter.weight.grad is not None
+    assert bool((model.radar_adapter.weight.grad.abs() > 0).any())
 
 
 def test_training_uses_five_reverse_passes_and_validation_uses_three(monkeypatch):
@@ -143,14 +182,13 @@ def test_training_uses_five_reverse_passes_and_validation_uses_three(monkeypatch
                 assert torch.count_nonzero(faulty) == 0
                 assert torch.count_nonzero(radar) == 0
             self.timesteps.append(int(timestep[0]))
-            return self.scale * noisy
+            return self.scale * noisy + 0.1 * radar
 
-    class Model:
+    class Model(nn.Module):
         def __init__(self):
+            super().__init__()
             self.diffusion = Diffusion()
-
-        def eval(self):
-            return self
+            self.radar_adapter = nn.Linear(2, 2, bias=False)
 
         def lidar_encoder(self, clean, coarse, point_ids):
             return torch.full((len(coarse), 2), 0.25), torch.ones(
@@ -187,9 +225,9 @@ def test_training_uses_five_reverse_passes_and_validation_uses_three(monkeypatch
     assert val["reverse_steps"] == 3
     assert val["eligible_occupancy"]["target"] == 1
 
-    monkeypatch.setattr(trainer, "_conditioned_inputs", lambda *args: (
+    monkeypatch.setattr(trainer, "_conditioned_inputs", lambda model, *args, **kwargs: (
         torch.full((1, 2), 0.4), torch.ones(1, dtype=torch.bool),
-        torch.full((1, 2), 0.6)))
+        model.radar_adapter(torch.full((1, 2), 0.6))))
     model.diffusion.expect_conditioned = True
     model.diffusion.timesteps.clear()
     conditioned = trainer._run_epoch(
@@ -198,3 +236,14 @@ def test_training_uses_five_reverse_passes_and_validation_uses_three(monkeypatch
         reverse_val_steps=3, condition_faulty_radar=True)
     assert model.diffusion.timesteps == [999, 599, 199]
     assert conditioned["conditioning"] == "faulty_LiDAR_and_measured_radar"
+
+    before = model.radar_adapter.weight.detach().clone()
+    model.diffusion.timesteps.clear()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    single = trainer._run_epoch(
+        model, rows, optimizer, alpha_bars, device="cpu", epoch=1,
+        eval_timestep=499, seed=3103, condition_faulty_radar=True,
+        train_radar_adapter=True)
+    assert len(model.diffusion.timesteps) == 1
+    assert single["conditioning"] == "faulty_LiDAR_and_measured_radar"
+    assert not torch.equal(model.radar_adapter.weight.detach(), before)

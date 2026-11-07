@@ -25,8 +25,9 @@ from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2, cosine_alpha_bars)
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.train_stage2_clean_denoiser import (
-    MIN_RADAR_VOXELS, RADIUS_M, REVISION, REVERSE_REVISION,
-    _batch, _CleanRows, _rows, resolve_sampling_strategy,
+    CONDITIONED_ONE_STEP_REVISION, MIN_RADAR_VOXELS, RADIUS_M,
+    REVISION, REVERSE_REVISION, _batch, _conditioned_inputs,
+    _CleanRows, _rows, resolve_sampling_strategy,
     sample_clean_latent)
 
 
@@ -35,6 +36,7 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
+    parser.add_argument("--faulty-root", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
@@ -50,8 +52,11 @@ def main() -> None:
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     identity = saved.get("identity")
     if not isinstance(identity, dict) or identity.get("revision") not in (
-            REVISION, REVERSE_REVISION):
+            REVISION, REVERSE_REVISION, CONDITIONED_ONE_STEP_REVISION):
         raise ValueError("Expected a clean 12-voxel/1.6 m denoiser checkpoint")
+    conditioned = identity["revision"] == CONDITIONED_ONE_STEP_REVISION
+    if conditioned != (args.faulty_root is not None):
+        parser.error("Conditioned checkpoint requires --faulty-root; gate-only does not")
     strategy = resolve_sampling_strategy(identity["revision"],
                                          args.sampling_strategy)
     if identity.get("lpcr_sha256") != sha256(args.lpcr_checkpoint):
@@ -66,6 +71,9 @@ def main() -> None:
         if identity["support_manifest_sha256"][split] != sha256(
                 args.support_cache_root / split / "manifest.json"):
             raise ValueError(f"Radar support {split} differs from training")
+        if conditioned and identity["faulty_manifest_sha256"][split] != sha256(
+                args.faulty_root / split / "manifest.json"):
+            raise ValueError(f"Cached mild faults {split} differ from training")
     if identity.get("val_limit") is not None:
         raise ValueError("Full threshold sweep requires a full-validation checkpoint")
 
@@ -81,6 +89,8 @@ def main() -> None:
     if unexpected or any(not key.startswith("addition_head.") for key in missing):
         raise ValueError("LPCR checkpoint differs from the architecture")
     model.diffusion.load_state_dict(saved["diffusion"])
+    if conditioned:
+        model.radar_adapter.load_state_dict(saved["radar_adapter"])
     model.eval().requires_grad_(False)
 
     dataset = paired_dataset(args.vod_root, "val", identity["radar_variant"],
@@ -94,7 +104,8 @@ def main() -> None:
     cache = RadarSupportCache(args.support_cache_root / "val", expected)
     cache.check_complete()
     loader = DataLoader(
-        _CleanRows(dataset, cache, None), batch_size=identity["batch_size"],
+        _CleanRows(dataset, cache, None, args.faulty_root, "val"),
+        batch_size=identity["batch_size"],
         shuffle=False, num_workers=args.num_workers, collate_fn=_rows,
         pin_memory=True, persistent_workers=args.num_workers > 0)
     # Adjacent frames can be correlated. Hold out four of every five 20-frame
@@ -134,10 +145,12 @@ def main() -> None:
             if not len(coarse):
                 continue
             x0, _ = model.lidar_encoder(clean, coarse, point_ids)
+            conditions = (_conditioned_inputs(model, rows, hierarchy, args.device)
+                          if conditioned else None)
             recovered = sample_clean_latent(
                 model, x0, coarse, alpha_bars, generator,
                 batch_size=len(rows), strategy=strategy,
-                eval_timestep=timestep)
+                eval_timestep=timestep, conditions=conditions)
             logits, _ = model.lpcr(recovered.clamp(-1, 1), hierarchy,
                                    x0.new_ones((len(fine), 1)))
             target, _, _ = offset_targets(clean, fine, point_ids)
@@ -176,6 +189,8 @@ def main() -> None:
         "threshold_steps": THRESHOLD_STEPS,
         "target_definition": "clean_LiDAR_occupied_voxels_within_12_radar_voxels_1p6m_gate",
         "prediction_definition": "frozen_LPCR_occupancy_from_recovered_clean_latent",
+        "conditioning": ("faulty_LiDAR_and_measured_radar" if conditioned
+                         else "gate_coordinates_only"),
         "validation_note": ("All frames were used to select the checkpoint. "
                             "Held-out here means held out from threshold selection only, "
                             "not an independent model test set."),

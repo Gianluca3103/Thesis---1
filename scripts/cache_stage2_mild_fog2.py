@@ -86,7 +86,8 @@ def main() -> None:
                         help="Fixed-frame clean LiDAR and radar cache")
     parser.add_argument("--fog-simulator-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--split", choices=("train", "val", "both"), default="both")
+    parser.add_argument("--split", choices=("train", "val", "test", "both"),
+                        default="both")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--num-workers", type=int, default=2)
