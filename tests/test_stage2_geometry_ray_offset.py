@@ -16,9 +16,10 @@ from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
 from models.radar_lidar_stage2.ray_loss import _first_ranges, addition_ray_losses
 from models.radar_lidar_stage2.sparse_geometry import GRID, select_allowed
 from models.radar_lidar_stage2.sparse_residual import (
-    SparseResidualStage2, Stage2Conditions,
+    SparseResidualStage2, Stage2Conditions, _frame_mean,
 )
 from scripts.evaluate_stage2_geometry_baseline import _counts, _select
+from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
 
 class GeometryGateTest(unittest.TestCase):
@@ -118,6 +119,33 @@ class GeometryGateTest(unittest.TestCase):
 
 
 class ObjectiveTest(unittest.TestCase):
+    def test_eight_live_frames_keep_distinct_sparse_batches(self):
+        rows = []
+        for index in range(8):
+            local = torch.tensor([[0, 8, 80, 80]], dtype=torch.long)
+            rows.append(Stage2Conditions(
+                (local,) * 5, torch.ones((1, 1)), torch.ones((1, 1)),
+                torch.full((1, 32), float(index))))
+        with self.assertRaises(ValueError):
+            _combine_conditions(rows)
+        combined = _combine_conditions(rows, allow_live_targets=True)
+        self.assertIsNone(combined.cached_targets)
+        for level in combined.hierarchy:
+            self.assertEqual(level[:, 0].tolist(), list(range(8)))
+        self.assertEqual(combined.radar_features[:, 0].tolist(),
+                         [float(index) for index in range(8)])
+        points, point_batches = _combine_points([
+            torch.tensor([[16.1, 0.1, 0.125]]) for _ in range(8)])
+        self.assertEqual(point_batches.tolist(), list(range(8)))
+        occupied, offsets, coverage = offset_targets(
+            points, combined.hierarchy[0], point_batches)
+        self.assertTrue(occupied.all().item())
+        self.assertEqual(offsets.shape, (8, 3))
+        self.assertEqual(coverage, 1.0)
+        weighted = _frame_mean(torch.tensor([1.0] + [10.0] * 8),
+                               torch.tensor([0] + list(range(8))), 8)
+        self.assertAlmostEqual(weighted.item(), 9.4375)
+
     def test_parallel_ray_queries_preserve_labels_and_gradients(self):
         rng = np.random.default_rng(7)
         query = rng.normal(size=(257, 3))
@@ -170,8 +198,9 @@ class ObjectiveTest(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.tensor(0.2))
 
             def encode_lidar(self, xyz, conditions, batch_ids):
-                latent = xyz.new_zeros((1, 32))
-                return latent, torch.zeros(1, dtype=torch.bool)
+                count = len(conditions.hierarchy[-1])
+                latent = xyz.new_zeros((count, 32))
+                return latent, torch.zeros(count, dtype=torch.bool)
 
             def diffusion(self, noisy, faulty, radar, probability, present,
                           timestep, coords):
@@ -215,6 +244,47 @@ class ObjectiveTest(unittest.TestCase):
         result["loss"].backward()
         self.assertIsNotNone(fake.weight.grad)
         self.assertTrue(torch.isfinite(fake.weight.grad))
+
+        fine8 = fine.repeat(8, 1)
+        fine8[:, 0] = torch.arange(8)
+        conditions8 = Stage2Conditions(
+            (fine8,) * 5, torch.ones((8, 1)), torch.ones((8, 1)),
+            torch.zeros((8, 32)))
+        clean8 = torch.tensor([[16.12, 0.13, 0.12]]).repeat(8, 1)
+        fake.weight.grad = None
+        with patch("models.radar_lidar_stage2.sparse_residual.addition_ray_losses", ray):
+            batched = SparseResidualStage2.diffusion_loss(
+                fake, torch.empty((0, 3)), clean8, conditions8,
+                torch.linspace(0.99, 0.01, 10), ray_offset_baseline=True,
+                ray_hit_weight=1, ray_extra_weight=1, offset_weight=1,
+                faulty_batch_ids=torch.empty(0, dtype=torch.long),
+                clean_batch_ids=torch.arange(8), batch_size=8)
+        self.assertTrue(torch.isfinite(batched["loss"]))
+        batched["loss"].backward()
+        self.assertTrue(torch.isfinite(fake.weight.grad))
+
+        def fixed_step(high, size, *, device, generator):
+            return torch.zeros(size, dtype=torch.long, device=device)
+
+        def fixed_noise(shape, *, device, dtype, generator):
+            return torch.zeros(shape, dtype=dtype, device=device)
+
+        with (patch("models.radar_lidar_stage2.sparse_residual.addition_ray_losses", ray),
+              patch("models.radar_lidar_stage2.sparse_residual.torch.randint", fixed_step),
+              patch("models.radar_lidar_stage2.sparse_residual.torch.randn", fixed_noise)):
+            single_fixed = SparseResidualStage2.diffusion_loss(
+                fake, torch.empty((0, 3)),
+                torch.tensor([[16.12, 0.13, 0.12]]), conditions,
+                torch.linspace(0.99, 0.01, 10), ray_offset_baseline=True,
+                ray_hit_weight=1, ray_extra_weight=1, offset_weight=1)
+            batch_fixed = SparseResidualStage2.diffusion_loss(
+                fake, torch.empty((0, 3)), clean8, conditions8,
+                torch.linspace(0.99, 0.01, 10), ray_offset_baseline=True,
+                ray_hit_weight=1, ray_extra_weight=1, offset_weight=1,
+                faulty_batch_ids=torch.empty(0, dtype=torch.long),
+                clean_batch_ids=torch.arange(8), batch_size=8)
+        self.assertTrue(torch.allclose(single_fixed["loss"], batch_fixed["loss"],
+                                       atol=1e-6))
 
 
 if __name__ == "__main__":

@@ -48,7 +48,8 @@ def _rows(rows: list[dict]) -> list[dict]:
     return rows
 
 
-def _combine_conditions(items: list[Stage2Conditions]) -> Stage2Conditions:
+def _combine_conditions(items: list[Stage2Conditions], *,
+                        allow_live_targets: bool = False) -> Stage2Conditions:
     """Join independent frames without allowing sparse kernels to cross frames."""
     if len(items) == 1:
         return items[0]
@@ -60,16 +61,22 @@ def _combine_conditions(items: list[Stage2Conditions]) -> Stage2Conditions:
             coordinates[:, 0] = batch_id
             frames.append(coordinates)
         levels.append(torch.cat(frames))
-    if any(item.cached_targets is None for item in items):
-        raise ValueError("Batched Stage II requires fixed cached targets")
-    targets = tuple(torch.cat([item.cached_targets[index] for item in items])
-                    for index in range(3))
-    coverage = sum(item.cached_targets[3] for item in items) / len(items)
+    if all(item.cached_targets is None for item in items):
+        if not allow_live_targets:
+            raise ValueError("Batched Stage II requires fixed cached targets")
+        targets = None
+    elif any(item.cached_targets is None for item in items):
+        raise ValueError("Batched Stage II cannot mix cached and live targets")
+    else:
+        arrays = tuple(torch.cat([item.cached_targets[index] for item in items])
+                       for index in range(3))
+        coverage = sum(item.cached_targets[3] for item in items) / len(items)
+        targets = (*arrays, coverage)
     return Stage2Conditions(tuple(levels),
                             torch.cat([item.fine_probabilities for item in items]),
                             torch.cat([item.latent_probabilities for item in items]),
                             torch.cat([item.radar_features for item in items]),
-                            (*targets, coverage))
+                            targets)
 
 
 def _combine_points(clouds: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -113,6 +120,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
            alpha_bars, radius_m: float) -> dict:
     training = optimizer is not None
     model.train(training)
+    if args.device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     if stage1 is not None:
         stage1.eval()
     totals: dict[str, float] = {}
@@ -183,7 +192,8 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 clean_clouds.append(clean)
             if not active_rows:
                 continue
-            conditions = _combine_conditions(items)
+            conditions = _combine_conditions(
+                items, allow_live_targets=args.ray_offset_baseline)
             clean, clean_batch_ids = _combine_points(clean_clouds)
             batch_size = len(active_rows)
             if args.phase == "lpcr":
@@ -284,10 +294,14 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
             processed += batch_size
     if not processed:
         raise RuntimeError("Stage II found no usable frames across this split")
-    return {key: value / processed for key, value in totals.items()} | {
+    metrics = {key: value / processed for key, value in totals.items()} | {
         "frames": processed,
         "skipped_empty_gate": skipped if args.phase == "diffusion" else None,
         "fault_counts": fault_counts if args.phase == "diffusion" else {}}
+    if args.device == "cuda":
+        metrics["gpu_peak_allocated_gib"] = (
+            torch.cuda.max_memory_allocated() / 2**30)
+    return metrics
 
 
 @torch.no_grad()
@@ -400,14 +414,14 @@ def main() -> None:
                 or args.support_cache_root is None
                 or args.fault_region_root is None
                 or args.data_cache_root is None
-                or args.faulty_root is None or args.batch_size != 1
+                or args.faulty_root is None
                 or not (args.ray_hit_weight > 0 and args.ray_extra_weight > 0
                         and args.offset_weight > 0)
                 or any(value != 0 for value in (
                     args.residual_weight, args.reconstruction_weight,
                     args.addition_weight, args.healthy_weight))) or
             args.phase == "diffusion" and args.batch_size > 1
-            and args.stage2_cache_root is None or
+            and args.stage2_cache_root is None and not args.ray_offset_baseline or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
             (args.phase == "diffusion" and args.faulty_root is None
              and args.fault_cache_root is None) or
@@ -527,6 +541,8 @@ def main() -> None:
                                  args.fault_region_root / "train" / "regions.json"),
                              "region_val_data_sha256": sha256(
                                  args.fault_region_root / "val" / "regions.json")})
+            if args.batch_size != 1:
+                identity["batch_size"] = args.batch_size
         if args.ray_hit_weight or args.ray_extra_weight:
             identity.update({"ray_angular_tolerance_deg": args.ray_angular_tolerance_deg,
                              "ray_lateral_tolerance_m": args.ray_lateral_tolerance_m,
@@ -699,6 +715,7 @@ def main() -> None:
                   f"{val['addition_precision']:.4f}/"
                   f"{val['addition_recall']:.4f}, "
                   f"mean allowed cells={val['allowed_sites']:.0f}, "
+                  f"train GPU peak={train['gpu_peak_allocated_gib']:.2f} GiB, "
                   f"train faults={train['fault_counts']}", flush=True)
         else:
             print(f"Epoch {epoch:03d}: val loss={val['loss']:.5f}, "

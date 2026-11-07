@@ -294,20 +294,24 @@ different validation frames, alternating 256 calibration and 256 held-out
 frames; the first 64 are excluded. The evaluation samples with 64 diffusion
 steps and reports the geometry ceiling, keep-all precision, and held-out
 metrics at thresholds selected on calibration. `EVAL=0` skips this expensive
-second pass. A two-frame GPU smoke run can use a **new** output directory:
+second pass. The launcher now uses eight frames per GPU optimizer step.
+Losses are averaged per frame; the learning rate remains `2e-4`. This gives
+roughly eight times fewer optimizer updates per epoch than the batch-one run,
+so compare validation outcomes rather than epoch numbers alone. An eight-frame
+GPU smoke run can use a **new** output directory:
 
 ```bash
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/stage2_geometry1p6m_injector_region_smoke \
-EPOCHS=1 TRAIN_LIMIT=2 VAL_LIMIT=2 EVAL=0 \
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/stage2_geometry1p6m_injector_region_batch8_smoke \
+BATCH_SIZE=8 EPOCHS=1 TRAIN_LIMIT=32 VAL_LIMIT=8 EVAL=0 \
 bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh
 ```
 
 The default full run writes a separate checkpoint and validation report under
-`stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106`.
+`stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_batch8_20261107`.
 `RAY_WORKERS=8` lets SciPy match fixed clean-return rays on eight CPU threads
 instead of one. This changes execution speed, not the ray labels or objective.
-The launcher resumes from `last.ckpt` in the same output directory, so set
-`RAY_WORKERS=4` or `8` for a resumed run if the host has spare CPU cores.
+The launcher resumes from `last.ckpt` in the same output directory. Batch size
+is bound to the checkpoint, so use a separate output directory for batch eight.
 Build the footprint sidecar with `scripts.cache_stage2_fault_regions` after
 the fixed-frame and mild-fault caches; it verifies the partial-fault outputs
 against the deterministic injector. GPU memory and speed

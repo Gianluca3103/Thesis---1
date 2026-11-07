@@ -12,9 +12,10 @@ MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
 SUPPORT=${SUPPORT:-$DATA/radar_pruner3vox_1p6m_mild_fog2_20261103/support_masks}
 REGIONS=${REGIONS:-$DATA/stage2_mild_fog2_injector_regions_20261106}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
-OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106}
+OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_batch8_20261107}
 WORKERS=${WORKERS:-2}
 RAY_WORKERS=${RAY_WORKERS:-8}
+BATCH_SIZE=${BATCH_SIZE:-8}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
 TRAIN_LIMIT=${TRAIN_LIMIT:-0}
@@ -37,7 +38,8 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
 export STAGE2_RAY_WORKERS="$RAY_WORKERS"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-printf 'Ray query workers=%s; data loader workers=%s\n' "$RAY_WORKERS" "$WORKERS"
+printf 'GPU batch size=%s; ray query workers=%s; data loader workers=%s\n' \
+  "$BATCH_SIZE" "$RAY_WORKERS" "$WORKERS"
 
 resume=()
 if [[ -s "$OUT/last.ckpt" ]]; then
@@ -55,7 +57,7 @@ fi
   --fault-region-root "$REGIONS" \
   --lpcr-checkpoint "$LPCR" --output-root "$OUT" \
   --radar-variant radar_20frames_verified_doppler_radial \
-  --epochs "$EPOCHS" --batch-size 1 --num-workers "$WORKERS" \
+  --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" --num-workers "$WORKERS" \
   --lr 0.0002 --val-limit "$VAL_LIMIT" "${limit_args[@]}" \
   --offset-weight 1 --ray-hit-weight 1 --ray-extra-weight 1 \
   --residual-weight 0 --reconstruction-weight 0 \
