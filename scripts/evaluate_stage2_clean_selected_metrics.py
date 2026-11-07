@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sweep-json", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -79,22 +80,25 @@ def main() -> None:
     model.diffusion.load_state_dict(saved["diffusion"])
     model.eval().requires_grad_(False)
 
-    dataset = paired_dataset(args.vod_root, "val", identity["radar_variant"],
+    dataset = paired_dataset(args.vod_root, args.split, identity["radar_variant"],
                              include_clean=True,
                              data_cache_root=args.data_cache_root)
     frame_ids = [frame.frame_id for frame in dataset.frames]
     calibration_ids = set(sweep["calibration_frame_ids"])
     heldout_ids = set(sweep["heldout_frame_ids"])
-    if (calibration_ids & heldout_ids or
-            calibration_ids | heldout_ids != set(frame_ids) or
-            len(calibration_ids) != sweep["frames"]["calibration"] or
-            len(heldout_ids) != sweep["frames"]["heldout"]):
-        raise ValueError("Threshold split differs from this validation dataset")
+    if args.split == "val":
+        if (calibration_ids & heldout_ids or
+                calibration_ids | heldout_ids != set(frame_ids) or
+                len(calibration_ids) != sweep["frames"]["calibration"] or
+                len(heldout_ids) != sweep["frames"]["heldout"]):
+            raise ValueError("Threshold split differs from this validation dataset")
+    elif set(frame_ids) & (calibration_ids | heldout_ids):
+        raise ValueError("Official test frames overlap threshold-selection validation")
     expected = support_identity(
-        "val", frame_ids, identity["radar_variant"],
+        args.split, frame_ids, identity["radar_variant"],
         data_cache_root=args.data_cache_root,
         radius_m=RADIUS_M, min_radar_voxels=MIN_RADAR_VOXELS)
-    cache = RadarSupportCache(args.support_cache_root / "val", expected)
+    cache = RadarSupportCache(args.support_cache_root / args.split, expected)
     cache.check_complete()
     loader = DataLoader(
         _CleanRows(dataset, cache, None), batch_size=identity["batch_size"],
@@ -104,8 +108,9 @@ def main() -> None:
     timestep = int(identity["eval_timestep"])
     generator = torch.Generator(device=args.device)
     generator.manual_seed(int(identity["seed"]))
-    accumulators = {"calibration": empty_accumulator(),
-                    "heldout": empty_accumulator()}
+    accumulators = ({"calibration": empty_accumulator(),
+                     "heldout": empty_accumulator()} if args.split == "val"
+                    else {"test": empty_accumulator()})
     with torch.no_grad():
         for rows in tqdm(loader, desc="Clean denoiser selected metrics",
                          unit="batch"):
@@ -140,24 +145,27 @@ def main() -> None:
                 target = fine[frame_cells & occupied].clone()
                 predicted[:, 0] = 0
                 target[:, 0] = 0
-                name = ("calibration" if row["frame_id"] in calibration_ids
+                name = ("test" if args.split == "test" else
+                        "calibration" if row["frame_id"] in calibration_ids
                         else "heldout")
                 add_frame(accumulators[name], predicted, target)
 
-    all_counts = {key: accumulators["calibration"][key] +
-                  accumulators["heldout"][key]
-                  for key in accumulators["calibration"]}
-    metrics = {"calibration": summarize(accumulators["calibration"]),
-               "heldout": summarize(accumulators["heldout"]),
-               "all_validation": summarize(all_counts)}
-    for name, row in metrics.items():
-        selected_row = selected[name]
-        if any(row[actual] != selected_row[expected] for actual, expected in (
-                ("exact_tp", "tp"), ("predicted", "predicted"),
-                ("eligible_target", "target"))):
-            raise RuntimeError(f"{name} exact counts differ from threshold sweep")
+    metrics = {name: summarize(accumulator)
+               for name, accumulator in accumulators.items()}
+    if args.split == "val":
+        all_counts = {key: accumulators["calibration"][key] +
+                      accumulators["heldout"][key]
+                      for key in accumulators["calibration"]}
+        metrics["all_validation"] = summarize(all_counts)
+        for name, row in metrics.items():
+            selected_row = selected[name]
+            if any(row[actual] != selected_row[expected] for actual, expected in (
+                    ("exact_tp", "tp"), ("predicted", "predicted"),
+                    ("eligible_target", "target"))):
+                raise RuntimeError(f"{name} exact counts differ from threshold sweep")
     report = {
         "checkpoint": str(args.checkpoint), "checkpoint_epoch": int(saved["epoch"]),
+        "split": args.split,
         "selected_by": "maximum_calibration_exact_eligible_iou",
         "occupancy_threshold": threshold,
         "sampling": "one_step_clean_x0_at_fixed_t",

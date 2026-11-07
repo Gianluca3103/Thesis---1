@@ -25,6 +25,29 @@ export PYTHONPATH="$REPO" OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
 export TMPDIR="$DATA/stage2_clean_tmp"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+printf 'Preparing official test radar with the training radar policy.\n'
+"$PY" -u -m scripts.generate_vod_accumulated_radar \
+  --vod-root "$VOD" --stack-sizes 20 --split test \
+  --alignment-source official-5 --output-suffix verified \
+  --isolate-split-history --no-basic-validity-filter --num-workers 2 \
+  2>&1 | tee "$OUT/prepare_test_verified_radar.log"
+"$PY" -u -m scripts.generate_vod_doppler_radar \
+  --vod-root "$VOD" --split test \
+  --output-variant radar_20frames_verified_doppler_radial \
+  --frame-period-s 0.10022 --doppler-sign 1 --num-workers 2 \
+  2>&1 | tee "$OUT/prepare_test_doppler_radar.log"
+
+printf 'Caching clean test frames and the 12-radar-voxel/1.6 m gate.\n'
+"$PY" -u -m scripts.cache_crossmodal_fixed_frames \
+  --vod-root "$VOD" --cache-root "$RAW" --split test \
+  --num-workers 2 --minimum-free-gib 2 \
+  2>&1 | tee "$OUT/cache_test_fixed_frames.log"
+"$PY" -u -m scripts.cache_radar_pruner_stage1 \
+  --vod-root "$VOD" --data-cache-root "$RAW" \
+  --output-root "$SUPPORT" --split test --radius-m 1.6 \
+  --min-distinct-radar-voxels 12 --num-workers 2 \
+  2>&1 | tee "$OUT/cache_test_support.log"
+
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --lpcr-checkpoint "$LPCR"
   --num-workers 2 --device cuda)
@@ -41,9 +64,19 @@ for name in best last; do
       "${common[@]}" --checkpoint "$checkpoint" --output-json "$sweep" \
       2>&1 | tee "$OUT/threshold_sweep_clean_$name.log"
   fi
-  printf 'Scoring %s at calibration-best exact IoU threshold.\n' "$name"
-  "$PY" -u -m scripts.evaluate_stage2_clean_selected_metrics \
-    "${common[@]}" --checkpoint "$checkpoint" --sweep-json "$sweep" \
-    --output-json "$OUT/selected_occupancy_$name.json" \
-    2>&1 | tee "$OUT/selected_occupancy_$name.log"
+  for split in val test; do
+    if [[ "$split" == val ]]; then
+      report="$OUT/selected_occupancy_$name.json"
+      log="$OUT/selected_occupancy_$name.log"
+    else
+      report="$OUT/selected_occupancy_${name}_test.json"
+      log="$OUT/selected_occupancy_${name}_test.log"
+    fi
+    printf 'Scoring %s on %s at validation-selected best exact IoU threshold.\n' \
+      "$name" "$split"
+    "$PY" -u -m scripts.evaluate_stage2_clean_selected_metrics \
+      "${common[@]}" --checkpoint "$checkpoint" --sweep-json "$sweep" \
+      --split "$split" --output-json "$report" \
+      2>&1 | tee "$log"
+  done
 done

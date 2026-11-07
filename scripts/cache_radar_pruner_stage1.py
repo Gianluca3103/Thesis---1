@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--radius-m", type=float, choices=(1.6, 3.0), default=3.0)
     parser.add_argument("--min-distinct-radar-voxels", type=int, default=3)
-    parser.add_argument("--split", choices=("train", "val", "both"), default="both")
+    parser.add_argument("--split", choices=("train", "val", "test", "both"), default="both")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()

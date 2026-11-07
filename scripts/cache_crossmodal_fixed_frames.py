@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
-    parser.add_argument("--split", choices=("train", "val"), required=True)
+    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--minimum-free-gib", type=float, default=10.)
