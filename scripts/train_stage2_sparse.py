@@ -26,6 +26,7 @@ from models.radar_lidar_stage2.addition import (
 from models.radar_lidar_stage2.fault_data import (
     FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache, load_faulty, severe_fault,
 )
+from models.radar_lidar_stage2.eligible_validation import evaluate_all_eligible
 from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity as fault_region_identity)
@@ -377,6 +378,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
+    parser.add_argument("--full-eligible-val-every-epoch", action="store_true",
+                        help="Score sampled occupancy on every validation frame each epoch")
+    parser.add_argument("--full-val-sampling-steps", type=int, default=64)
+    parser.add_argument("--full-val-occupancy-threshold", type=float, default=0.5)
     parser.add_argument("--faulty-root", type=Path)
     parser.add_argument("--fault-cache-root", type=Path,
                         help="Required for synthetic severe faults; contains severity-5 fog")
@@ -439,7 +444,11 @@ def main() -> None:
              and args.fault_cache_root is None) or
             args.phase == "lpcr" and args.lpcr_checkpoint is not None or
             args.train_limit is not None and args.train_limit < 1 or
-            args.val_limit is not None and args.val_limit < 1):
+            args.val_limit is not None and args.val_limit < 1 or
+            args.full_eligible_val_every_epoch and (
+                not args.ray_offset_baseline or args.val_limit is not None or
+                not 0 < args.full_val_occupancy_threshold < 1 or
+                not 1 <= args.full_val_sampling_steps <= 1000)):
         parser.error("Stage II requires CUDA and valid phase-specific paths and limits")
     run_seed = 3407 if args.phase == "lpcr" else 3103
     torch.manual_seed(run_seed)
@@ -685,6 +694,53 @@ def main() -> None:
         if scheduler is not None:
             scheduler.load_state_dict(saved["scheduler"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_val_loss"])
+        if (args.full_eligible_val_every_epoch and
+                saved.get("validation_scope") != "all_frames"):
+            # The old best loss was measured on a 64-frame subset.
+            best = float("inf")
+            print("Switching checkpoint selection to all-frame validation loss; "
+                  "resetting the old subset best.", flush=True)
+
+    def full_eligible_report(epoch_number: int) -> None:
+        report_dir = args.output_root / "eligible_validation"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"epoch_{epoch_number:03d}.json"
+        if report_path.exists():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if (report["epoch"] != epoch_number
+                    or report["frames"] != len(full_datasets["val"])
+                    or report["sampling_steps"] != args.full_val_sampling_steps
+                    or report["occupancy_threshold"] !=
+                    args.full_val_occupancy_threshold):
+                raise ValueError(f"Existing eligible report differs: {report_path}")
+        else:
+            report = evaluate_all_eligible(
+                model, full_datasets["val"], faulty_root=args.faulty_root,
+                support_cache=args.support_caches["val"],
+                region_cache=args.region_caches["val"],
+                fault_names=args.fault_names["val"], alpha_bars=alpha_bars,
+                gate_threshold=args.gate_threshold,
+                occupancy_threshold=args.full_val_occupancy_threshold,
+                sampling_steps=args.full_val_sampling_steps, device=args.device)
+            report["epoch"] = epoch_number
+            temporary = report_path.with_name(
+                report_path.name + f".{os.getpid()}.tmp")
+            try:
+                temporary.write_text(json.dumps(report, indent=2) + "\n",
+                                     encoding="utf-8")
+                temporary.replace(report_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print(f"Epoch {epoch_number:03d} full eligible validation: "
+              f"{report['frames']} frames, exact IoU={report['eligible_iou']:.4f}, "
+              f"IoU@0.2m={report['eligible_iou_0p2m']:.4f}, "
+              f"predicted={report['predicted']:,}, "
+              f"eligible targets={report['eligible_target']:,}; "
+              f"{report_path}", flush=True)
+
+    if args.full_eligible_val_every_epoch and args.resume:
+        # A previous process may have saved its checkpoint before sampling.
+        full_eligible_report(start - 1)
     for epoch in range(start, args.epochs + 1):
         train = _epoch(model, stage1, fixed_caches["train"], fog_caches["train"], loaders["train"],
                        optimizer, args, epoch,
@@ -702,11 +758,14 @@ def main() -> None:
             best = val["loss"]
         record = {"epoch": epoch, "batch_size": args.batch_size,
                   "num_workers": args.num_workers, "train": train, "val": val,
+                  "validation_scope": ("all_frames" if args.val_limit is None
+                                       else f"first_{args.val_limit}_frames"),
                   "cached_ray_labels": bool(args.ray_label_caches),
                   "best_val_loss": best, "point_cloud_metrics": paper}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         payload = {**identity, "epoch": epoch, "best_val_loss": best,
+                   "validation_scope": record["validation_scope"],
                    "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                    "scheduler": scheduler.state_dict() if scheduler else None,
                    "record": record}
@@ -762,6 +821,8 @@ def main() -> None:
                   f"healthy addition rate={val['healthy_addition_rate']:.4f}, "
                   f"gate coverage={val['gate_coverage']:.4f}, "
                   f"train faults={train['fault_counts']}", flush=True)
+        if args.full_eligible_val_every_epoch:
+            full_eligible_report(epoch)
 
 
 if __name__ == "__main__":

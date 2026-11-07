@@ -19,6 +19,9 @@ BATCH_SIZE=${BATCH_SIZE:-8}
 RAY_LABELS=${RAY_LABELS:-}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
+FULL_VAL=${FULL_VAL:-0}
+FULL_VAL_STEPS=${FULL_VAL_STEPS:-64}
+FULL_VAL_THRESHOLD=${FULL_VAL_THRESHOLD:-0.5}
 TRAIN_LIMIT=${TRAIN_LIMIT:-0}
 EVAL=${EVAL:-1}
 EVAL_LIMIT=${EVAL_LIMIT:-512}
@@ -60,6 +63,18 @@ limit_args=()
 if (( TRAIN_LIMIT > 0 )); then
   limit_args=(--train-limit "$TRAIN_LIMIT")
 fi
+if [[ "$FULL_VAL" == 1 ]]; then
+  val_args=(--full-eligible-val-every-epoch
+            --full-val-sampling-steps "$FULL_VAL_STEPS"
+            --full-val-occupancy-threshold "$FULL_VAL_THRESHOLD")
+  printf 'Validation: all frames and sampled eligible IoU every epoch\n'
+elif [[ "$FULL_VAL" == 0 ]]; then
+  val_args=(--val-limit "$VAL_LIMIT")
+  printf 'Validation: first %s frames\n' "$VAL_LIMIT"
+else
+  printf 'FULL_VAL must be 0 or 1\n' >&2
+  exit 1
+fi
 
 "$PY" -u -m scripts.train_stage2_sparse \
   --phase diffusion --diffusion-target epsilon --ray-offset-baseline \
@@ -69,7 +84,7 @@ fi
   --lpcr-checkpoint "$LPCR" --output-root "$OUT" \
   --radar-variant radar_20frames_verified_doppler_radial \
   --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" --num-workers "$WORKERS" \
-  --lr 0.0002 --val-limit "$VAL_LIMIT" "${limit_args[@]}" \
+  --lr 0.0002 "${val_args[@]}" "${limit_args[@]}" \
   --offset-weight 1 --ray-hit-weight 1 --ray-extra-weight 1 \
   --residual-weight 0 --reconstruction-weight 0 \
   --addition-weight 0 --healthy-weight 0 \

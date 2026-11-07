@@ -8,6 +8,35 @@ order. The original R2LDM dense decoder and its checkpoints do not fit the
 new grid. This implementation instead uses a sparse decoder and a sparse
 latent diffusion U-Net. It is an adaptation, not an exact R2LDM reproduction.
 
+## Geometry-only mild-fault baseline: full eligible validation
+
+Set `FULL_VAL=1` in `scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh`.
+The trainer then evaluates the loss on **all 1,296 validation frames** each
+epoch and samples the diffusion model on each of those frames. Sampling uses
+64 steps and a 0.5 occupied-cell threshold by default (`FULL_VAL_STEPS` and
+`FULL_VAL_THRESHOLD` override them). This is substantially slower than the
+former 64-frame validation pass. A fixed seed per frame makes the sampled
+occupancy comparison repeatable across epochs.
+
+The prediction set is **added occupied voxels inside the candidate gate**:
+at least three distinct radar voxels within 1.6 m, inside the cached synthetic
+injector footprint, excluding cells observed by faulty LiDAR. The target set
+is clean occupied voxels inside that same gate. Therefore the scores measure
+reconstruction occupancy on eligible cells only. They do not score the entire
+scene, preserved faulty points, or any predicted centroid offsets.
+
+`eligible_iou` is exact voxel intersection over union. `eligible_iou_0p2m`
+counts a maximum one-to-one match between predicted and target **voxel
+centers** within 0.2 m, then uses matches / (predicted + target - matches).
+The 0.2 m rule allows a horizontal neighbor on the 0.2 m grid, but not a
+vertical neighbor 0.25 m away. The scores are pooled over all frames and also
+reported by fault. The epoch report is written atomically to
+`$OUT/eligible_validation/epoch_NNN.json` and summarized in `train.log`.
+If a run stops after saving `last.ckpt` but before finishing sampled
+validation, resuming completes that epoch's report first. Resuming from the
+old 64-frame protocol resets the best-loss comparison; subsequent
+`best.ckpt` selections use full validation loss.
+
 ## Data flow
 
 1. Frozen radar-only Stage I reads calibrated VoD radar and supplies a
