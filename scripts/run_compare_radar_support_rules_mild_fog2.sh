@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare all ten geometry gates and build toggleable 3D validation examples.
+# Compare all thirteen geometry gates and build toggleable 3D validation examples.
 set -euo pipefail
 
 REPO=${REPO:-/media/arrubuntu20/EA0A117F0A114A49/Thesis-1-stage2-geometry-16baaa0}
@@ -9,7 +9,7 @@ PY=${PY:-$BASE/Sensor-Fusion/.venv_model_v2/bin/python}
 VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC}
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
-OUT=${OUT:-$DATA/radar_geometry_10rules_mild_fog2_20261107}
+OUT=${OUT:-$DATA/radar_geometry_13rules_mild_fog2_20261107}
 
 for required in "$PY" "$RAW/val/manifest.json" "$MILD/val/manifest.json" \
   "$REPO/scripts/compare_radar_support_rules.py"; do

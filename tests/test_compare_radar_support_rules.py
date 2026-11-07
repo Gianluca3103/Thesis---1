@@ -1,4 +1,4 @@
-"""Ten-rule geometry comparison and toggleable viewer invariants."""
+"""Thirteen-rule geometry comparison and toggleable viewer invariants."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch
 from models.radar_lidar_crossmodal_v1.radar_pruner import radar_support_mask
 from scripts.compare_radar_geometry_radii import CENTERS
 from scripts.compare_radar_support_rules import (
-    RULES, RULE_NAMES, _viewer_html, nearest_distances, selected_mask,
+    OBSERVED_BIT, RULES, RULE_NAMES, _viewer_html, nearest_distances, selected_mask,
     write_viewer_frame,
 )
 
@@ -24,12 +24,15 @@ def _radar(points):
 
 
 def test_distinct_voxels_and_nested_rules():
+    assert RULE_NAMES[:5] == tuple(f"{count}@0.8m" for count in range(1, 6))
+    assert len(RULES) == 13
+    assert OBSERVED_BIT == 1 << len(RULES)
     radar = _radar([(10.0, 0, 0)] * 4 + [(10.6, 0, 0), (11.2, 0, 0)])
     distance = nearest_distances(radar)
     assert np.isinf(distance[:, 3:]).all()
     masks = {name: selected_mask(distance, count, radius)
              for name, (count, radius) in zip(RULE_NAMES, RULES)}
-    for radius, counts in ((0.8, (1, 2)), (1.6, (1, 2, 3)),
+    for radius, counts in ((0.8, (1, 2, 3, 4, 5)), (1.6, (1, 2, 3)),
                            (3.2, (1, 2, 3, 4, 5))):
         for small, large in zip(counts, counts[1:]):
             assert np.all(~masks[f"{large}@{radius:g}m"] |
@@ -49,11 +52,12 @@ def test_empty_radar_selects_nothing():
                    for count, radius in RULES)
 
 
-def test_viewer_has_all_ten_toggles_and_escapes_payload():
+def test_viewer_has_all_thirteen_toggles_and_escapes_payload():
     payload = {"frame_id": "<script>", "fault": "fog_sim_2",
                "rules": [{"label": name, "raw_cells": 0, "candidates": 0,
                           "missing_recall": 0} for name in RULE_NAMES],
                "candidate_count": 0, "packed_candidates": "",
+               "observed_bit": OBSERVED_BIT,
                "grid": {"shape": (16, 160, 160), "minimum": (0, -16, -2),
                         "size": (0.2, 0.2, 0.25)},
                "faulty": [], "missing": [], "radar": []}
@@ -87,9 +91,10 @@ def test_viewer_encodes_raw_and_addition_cells(tmp_path):
                            dtype=[("index", "<u4"), ("membership", "<u2")])
     assert packed["index"].tolist() == [0, 1]
     assert packed["membership"].tolist() == [
-        2**0 + 2**2 + 2**5 + 2**10,
-        2**0 + 2**2 + 2**5,
+        2**0 + 2**5 + 2**8 + OBSERVED_BIT,
+        2**0 + 2**5 + 2**8,
     ]
+    assert not any(value & OBSERVED_BIT for value in packed["membership"][1:])
 
 
 def test_viewer_never_subsamples_eligible_cells(tmp_path):

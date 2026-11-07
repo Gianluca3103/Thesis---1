@@ -1,4 +1,4 @@
-"""Rebuild complete voxel viewers for frames selected by a ten-rule report.
+"""Rebuild complete voxel viewers for frames selected by a geometry report.
 
 This reads the existing metric report and recomputes only its viewer frames.
 It does not rerun the full validation comparison or any model checkpoint.
@@ -32,8 +32,9 @@ def main() -> None:
     if args.display_points < 1:
         parser.error("--display-points must be positive")
     report = json.loads(args.report.read_text(encoding="utf-8"))
-    if [row["name"] for row in report["rules"]] != list(RULE_NAMES):
-        parser.error("Report uses different geometry rules")
+    report_names = [row["name"] for row in report["rules"]]
+    if not report_names or not set(report_names) <= set(RULE_NAMES):
+        parser.error("Report uses unknown geometry rules")
     viewers = report.get("viewer_frames")
     if not viewers:
         parser.error("Report has no selected viewer frames")

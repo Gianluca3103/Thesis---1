@@ -1,8 +1,8 @@
-"""Compare ten geometry-only radar support rules on mild-fault validation.
+"""Compare thirteen geometry-only radar support rules on mild-fault validation.
 
 Radar returns are deduplicated into radar voxels before neighbor counting.
 These are full Stage-II ROI gates, before the synthetic injector footprint.
-The HTML viewer samples cells for display; reported counts use every cell.
+The HTML viewer and reported counts use every qualifying voxel.
 """
 
 from __future__ import annotations
@@ -28,11 +28,13 @@ from models.radar_lidar_stage2.sparse_geometry import GRID
 from scripts.compare_radar_geometry_radii import CENTERS, SHAPE, _empty_counts, _one, _summarize
 
 
-RULES = tuple((count, radius) for radius, counts in ((0.8, (1, 2)),
+RULES = tuple((count, radius) for radius, counts in ((0.8, (1, 2, 3, 4, 5)),
                                                   (1.6, (1, 2, 3)),
                                                   (3.2, (1, 2, 3, 4, 5)))
               for count in counts)
 RULE_NAMES = tuple(f"{count}@{radius:g}m" for count, radius in RULES)
+OBSERVED_BIT = 1 << len(RULES)
+assert OBSERVED_BIT < 1 << 16
 CELL_COUNT = len(CENTERS)
 
 
@@ -120,7 +122,7 @@ const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},v={...initial},mid=[16,0
 function project(p,w,h,s){let x=p[0]-mid[0],y=p[1]-mid[1],z=p[2]-mid[2],cy=Math.cos(v.yaw),sy=Math.sin(v.yaw),cp=Math.cos(v.pitch),sp=Math.sin(v.pitch),u=cy*x-sy*y,q=sy*x+cy*y;return[w/2+v.panX+u*s,h/2+v.panY-(cp*z-sp*q)*s];}
 function plot(points,w,h,s,color,size){ctx.fillStyle=color;for(const p of points){let [x,y]=project(p,w,h,s);if(x>=0&&x<w&&y>=0&&y<h)ctx.fillRect(x-size/2,y-size/2,size,size);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(draw);}
-function draw(){pending=false;const ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;if(!w||!h)return;c.width=Math.round(w*ratio);c.height=Math.round(h*ratio);ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const s=.95*Math.min(w,h)*v.zoom/extent,box=Math.max(2,Math.min(14,.23*s)),cy=Math.cos(v.yaw),sy=Math.sin(v.yaw),cp=Math.cos(v.pitch),sp=Math.sin(v.pitch);let bits=0;for(let i=0;i<checks.length;i++)if(checks[i].checked)bits|=1<<i;const zi=Number(zslider.value),image=sctx.createImageData(nx,ny);let selected=0,sliceCount=0;ctx.fillStyle='#7cb8ff';for(let i=0;i<indices.length;i++){const m=membership[i];if(!(m&bits)||(exclude.checked&&(m&1024)))continue;selected++;const flat=indices[i],x=flat%nx,y=Math.floor(flat/nx)%ny,z=Math.floor(flat/(nx*ny));if(z===zi){sliceCount++;const at=4*((ny-1-y)*nx+x);image.data[at]=124;image.data[at+1]=184;image.data[at+2]=255;image.data[at+3]=255;}const dx=d.grid.minimum[0]+(x+.5)*d.grid.size[0]-mid[0],dy=d.grid.minimum[1]+(y+.5)*d.grid.size[1]-mid[1],dz=d.grid.minimum[2]+(z+.5)*d.grid.size[2]-mid[2],u=cy*dx-sy*dy,q=sy*dx+cy*dy,px=w/2+v.panX+u*s,py=h/2+v.panY-(cp*dz-sp*q)*s;if(px>=0&&px<w&&py>=0&&py<h)ctx.fillRect(px-box/2,py-box/2,box,box);}sctx.putImageData(image,0,0);for(const [key,,color] of layerNames)if(layerChecks[key].checked)plot(d[key],w,h,s,color,key==='radar'?3:2);zlabel.textContent=`z=${(d.grid.minimum[2]+(zi+.5)*d.grid.size[2]).toFixed(3)} m · ${sliceCount.toLocaleString()} cells`;document.getElementById('counts').textContent=`${selected.toLocaleString()} complete ${exclude.checked?'addition':'support'} voxels shown · ${checks.filter(x=>x.checked).length} rules selected`;}
+function draw(){pending=false;const ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;if(!w||!h)return;c.width=Math.round(w*ratio);c.height=Math.round(h*ratio);ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,w,h);const s=.95*Math.min(w,h)*v.zoom/extent,box=Math.max(2,Math.min(14,.23*s)),cy=Math.cos(v.yaw),sy=Math.sin(v.yaw),cp=Math.cos(v.pitch),sp=Math.sin(v.pitch);let bits=0;for(let i=0;i<checks.length;i++)if(checks[i].checked)bits|=1<<i;const zi=Number(zslider.value),image=sctx.createImageData(nx,ny);let selected=0,sliceCount=0;ctx.fillStyle='#7cb8ff';for(let i=0;i<indices.length;i++){const m=membership[i];if(!(m&bits)||(exclude.checked&&(m&d.observed_bit)))continue;selected++;const flat=indices[i],x=flat%nx,y=Math.floor(flat/nx)%ny,z=Math.floor(flat/(nx*ny));if(z===zi){sliceCount++;const at=4*((ny-1-y)*nx+x);image.data[at]=124;image.data[at+1]=184;image.data[at+2]=255;image.data[at+3]=255;}const dx=d.grid.minimum[0]+(x+.5)*d.grid.size[0]-mid[0],dy=d.grid.minimum[1]+(y+.5)*d.grid.size[1]-mid[1],dz=d.grid.minimum[2]+(z+.5)*d.grid.size[2]-mid[2],u=cy*dx-sy*dy,q=sy*dx+cy*dy,px=w/2+v.panX+u*s,py=h/2+v.panY-(cp*dz-sp*q)*s;if(px>=0&&px<w&&py>=0&&py<h)ctx.fillRect(px-box/2,py-box/2,box,box);}sctx.putImageData(image,0,0);for(const [key,,color] of layerNames)if(layerChecks[key].checked)plot(d[key],w,h,s,color,key==='radar'?3:2);zlabel.textContent=`z=${(d.grid.minimum[2]+(zi+.5)*d.grid.size[2]).toFixed(3)} m · ${sliceCount.toLocaleString()} cells`;document.getElementById('counts').textContent=`${selected.toLocaleString()} complete ${exclude.checked?'addition':'support'} voxels shown · ${checks.filter(x=>x.checked).length} rules selected`;}
 c.addEventListener('pointerdown',e=>{c.setPointerCapture(e.pointerId);c.last=[e.clientX,e.clientY]});c.addEventListener('pointermove',e=>{if(!c.last)return;const dx=e.clientX-c.last[0],dy=e.clientY-c.last[1];c.last=[e.clientX,e.clientY];if(e.shiftKey){v.panX+=dx;v.panY+=dy}else{v.yaw+=dx*.008;v.pitch=Math.max(-1.55,Math.min(1.55,v.pitch+dy*.008))}redraw()});for(const name of ['pointerup','pointercancel'])c.addEventListener(name,()=>{c.last=null});c.addEventListener('wheel',e=>{e.preventDefault();v.zoom=Math.max(.1,Math.min(80,v.zoom*Math.exp(-e.deltaY*.001)));redraw()},{passive:false});
 document.getElementById('none').onclick=()=>{checks.forEach(x=>x.checked=false);redraw()};document.getElementById('all').onclick=()=>{checks.forEach(x=>x.checked=true);redraw()};document.getElementById('reset').onclick=()=>{Object.assign(v,initial);redraw()};window.addEventListener('resize',redraw);redraw();
 })();
@@ -146,7 +148,7 @@ def write_viewer_frame(path: Path, *, frame_id: str, fault: str, distances: np.n
                       "raw_cells": int(mask.sum()), "candidates": candidates,
                       "missing_recall": round(100 * eligible / max(len(missing), 1), 2)})
     membership |= (np.isin(candidate_index, observed_index,
-                            assume_unique=True).astype(np.uint16) << 10)
+                            assume_unique=True).astype(np.uint16) << len(RULES))
     packed = np.empty(len(candidate_index),
                       dtype=np.dtype([("index", "<u4"), ("membership", "<u2")]))
     packed["index"] = candidate_index
@@ -154,6 +156,7 @@ def write_viewer_frame(path: Path, *, frame_id: str, fault: str, distances: np.n
     radar_xyz = unique_radar_voxel_centers(radar)
     payload = {"frame_id": frame_id, "fault": fault, "rules": rules,
                "candidate_count": len(candidate_index),
+               "observed_bit": OBSERVED_BIT,
                "packed_candidates": base64.b64encode(packed.tobytes()).decode("ascii"),
                "grid": {"minimum": GRID.minimum_xyz, "size": GRID.voxel_xyz,
                         "shape": GRID.shape_zyx},
@@ -170,7 +173,7 @@ def _viewer_index(rows: list[dict]) -> str:
     return ("<!doctype html><html lang='en'><meta charset='utf-8'>"
             "<title>Radar support rule viewer</title><style>body{background:#101820;"
             "color:#eaf3f8;font:16px system-ui;padding:24px}a{color:#9dcafb}"
-            "li{margin:10px}</style><h1>Ten radar support rules</h1>"
+            f"li{{margin:10px}}</style><h1>{len(RULES)} radar support rules</h1>"
             "<p>Open a frame to toggle the gates in 3D. These are geometry-only "
             "candidate sets, not reconstructed points.</p><ul>" + links + "</ul></html>")
 
@@ -192,7 +195,7 @@ def evaluate(dataset, indices: list[int], faulty_root: Path, frame_faults: dict[
     viewer_rows = []
     loader = DataLoader(Subset(dataset, indices), batch_size=1, shuffle=False,
                         collate_fn=_one, num_workers=0)
-    for row in tqdm(loader, desc="Ten radar geometry rules", unit="frame"):
+    for row in tqdm(loader, desc=f"{len(RULES)} radar geometry rules", unit="frame"):
         frame_id = row["frame_id"]
         fault = frame_faults[frame_id]
         faulty = load_faulty(faulty_root, "val", frame_id)
