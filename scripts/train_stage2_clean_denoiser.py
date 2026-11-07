@@ -45,12 +45,14 @@ RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
 
 class _CleanRows:
     def __init__(self, dataset, cache: RadarSupportCache, limit: int | None,
-                 faulty_root: Path | None = None, split: str | None = None):
+                 faulty_root: Path | None = None, split: str | None = None,
+                 *, include_full_clean: bool = False):
         self.dataset = dataset
         self.cache = cache
         self.limit = len(dataset) if limit is None else min(len(dataset), limit)
         self.faulty_root = faulty_root
         self.split = split
+        self.include_full_clean = include_full_clean
 
     def __len__(self) -> int:
         return self.limit
@@ -62,6 +64,8 @@ class _CleanRows:
                   "fine_zyx": supported_coordinates(mask),
                   "clean_xyz": clean_points_in_support(
                       row["clean_lidar"][:, :3], mask)}
+        if self.include_full_clean:
+            result["full_clean_xyz"] = row["clean_lidar"][:, :3]
         if self.faulty_root is not None:
             result.update({"radar": row["radar"],
                            "faulty_xyz": load_faulty(

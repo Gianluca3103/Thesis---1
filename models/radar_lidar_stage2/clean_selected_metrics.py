@@ -7,7 +7,7 @@ from scipy.spatial import cKDTree
 import torch
 
 from .eligible_occupancy_metrics import occupancy_counts
-from .sparse_geometry import GRID
+from .sparse_geometry import GRID, sorted_unique, voxelize_means
 
 
 def voxel_centers(coords: torch.Tensor) -> np.ndarray:
@@ -84,3 +84,40 @@ def summarize(accumulator: dict) -> dict:
             "chamfer_paired_frames": paired,
             "empty_prediction_frames": accumulator["empty_prediction_frames"],
             "empty_target_frames": accumulator["empty_target_frames"]}
+
+
+def full_frame_voxels(clean_xyz: torch.Tensor, faulty_xyz: torch.Tensor,
+                      predicted: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compare observed faulty cells with their union with gated predictions.
+
+    All three sets use the same Stage-II ROI and voxel grid. Predictions may
+    only add cells; duplicate occupied cells are counted once.
+    """
+    if (predicted.ndim != 2 or predicted.shape[1] != 4 or
+            (len(predicted) and bool((predicted[:, 0] != 0).any()))):
+        raise ValueError("Predictions must be one frame of BZYX cells")
+    if len(predicted):
+        limits = predicted.new_tensor(GRID.shape_zyx)
+        if bool(((predicted[:, 1:] < 0) |
+                 (predicted[:, 1:] >= limits)).any()):
+            raise ValueError("Predicted cell lies outside the Stage-II ROI")
+    clean, _ = voxelize_means(clean_xyz, grid=GRID)
+    faulty, _ = voxelize_means(faulty_xyz, grid=GRID)
+    completed = sorted_unique(torch.cat((faulty, predicted.long()), dim=0),
+                              GRID.shape_zyx)
+    return clean, faulty, completed
+
+
+def completion_summary(faulty_accumulator: dict,
+                       completed_accumulator: dict) -> dict:
+    before = summarize(faulty_accumulator)
+    after = summarize(completed_accumulator)
+    if (before["frames"] != after["frames"] or
+            before["eligible_target"] != after["eligible_target"] or
+            before["predicted"] > after["predicted"]):
+        raise ValueError("Full-frame before/after sets are inconsistent")
+    metrics = ("iou", "f1", "iou_0p2m", "f1_0p2m")
+    return {"faulty": before, "completed": after,
+            "added_cells": after["predicted"] - before["predicted"],
+            "improvement": {key: after[key] - before[key] for key in metrics}}

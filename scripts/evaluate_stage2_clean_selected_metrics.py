@@ -1,4 +1,4 @@
-"""Score exact/tolerant occupancy and Chamfer at calibration-best IoU."""
+"""Score gated occupancy and full-ROI completion at calibration-best IoU."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as support_identity)
 from models.radar_lidar_stage2.clean_selected_metrics import (
-    add_frame, empty_accumulator, summarize)
+    add_frame, completion_summary, empty_accumulator,
+    full_frame_voxels, summarize)
 from models.radar_lidar_stage2.geometry_gate import offset_targets
 from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2, cosine_alpha_bars)
@@ -139,7 +140,8 @@ def main() -> None:
     cache = RadarSupportCache(args.support_cache_root / args.split, expected)
     cache.check_complete()
     loader = DataLoader(
-        _CleanRows(dataset, cache, None, args.faulty_root, args.split),
+        _CleanRows(dataset, cache, None, args.faulty_root, args.split,
+                   include_full_clean=conditioned),
         batch_size=identity["batch_size"],
         shuffle=False, num_workers=args.num_workers, collate_fn=_rows,
         pin_memory=True, persistent_workers=args.num_workers > 0)
@@ -150,6 +152,9 @@ def main() -> None:
     accumulators = ({"calibration": empty_accumulator(),
                      "heldout": empty_accumulator()} if args.split == "val"
                     else {"test": empty_accumulator()})
+    overall = ({name: {"faulty": empty_accumulator(),
+                       "completed": empty_accumulator()}
+                for name in accumulators} if conditioned else None)
     with torch.no_grad():
         for rows in tqdm(loader, desc="Clean denoiser selected metrics",
                          unit="batch"):
@@ -183,6 +188,13 @@ def main() -> None:
                         "calibration" if row["frame_id"] in calibration_ids
                         else "heldout")
                 add_frame(accumulators[name], predicted, target)
+                if overall is not None:
+                    full_target, faulty, completed = full_frame_voxels(
+                        row["full_clean_xyz"], row["faulty_xyz"],
+                        predicted.cpu())
+                    add_frame(overall[name]["faulty"], faulty, full_target)
+                    add_frame(overall[name]["completed"], completed,
+                              full_target)
 
     metrics = {name: summarize(accumulator)
                for name, accumulator in accumulators.items()}
@@ -192,6 +204,12 @@ def main() -> None:
                       accumulators["heldout"][key]
                       for key in accumulators["calibration"]}
         metrics["all_validation"] = summarize(all_counts)
+        if overall is not None:
+            overall["all_validation"] = {
+                stage: {key: overall["calibration"][stage][key] +
+                        overall["heldout"][stage][key]
+                        for key in overall["calibration"][stage]}
+                for stage in ("faulty", "completed")}
         sweep_comparison = {}
         for name, row in metrics.items():
             selected_row = selected[name]
@@ -204,6 +222,9 @@ def main() -> None:
             if any(differences.values()):
                 print(f"Re-evaluation differs from the threshold pass on "
                       f"{name}: {differences}", flush=True)
+    overall_metrics = ({name: completion_summary(
+        stages["faulty"], stages["completed"])
+        for name, stages in overall.items()} if overall is not None else None)
     report = {
         "checkpoint": str(args.checkpoint), "checkpoint_epoch": int(saved["epoch"]),
         "split": args.split,
@@ -219,8 +240,17 @@ def main() -> None:
         "chamfer_definition": ("per-frame mean nearest-center L2 in both "
                                "directions, summed; paired nonempty frames only"),
         "validation_note": sweep["validation_note"],
+        "full_roi_note": (
+            "Overall means the full Stage-II ROI after voxelizing clean and "
+            "faulty LiDAR on its 0.2m x 0.2m x 0.25m grid. Completed is the "
+            "union of observed faulty cells and model-selected gated cells; "
+            "no points are added outside the 12-radar/1.6m gate. The model "
+            "starts denoising from a noised clean-LiDAR latent, so this is "
+            "an oracle-assisted diagnostic, not deployable reconstruction."
+            if conditioned else None),
         "exact_count_difference_from_threshold_pass": sweep_comparison,
-        "metrics": metrics}
+        "metrics": metrics,
+        "overall_stage2_roi": overall_metrics}
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
     try:
@@ -240,6 +270,25 @@ def main() -> None:
               f"Chamfer squared L2={chamfer_text}, "
               f"Chamfer paired={row['chamfer_paired_frames']}, "
               f"empty predictions={row['empty_prediction_frames']}", flush=True)
+    if overall_metrics is not None:
+        print("Overall Stage-II ROI: faulty LiDAR versus faulty plus gated "
+              "predictions (oracle-assisted clean-latent diagnostic)",
+              flush=True)
+        for name, values in overall_metrics.items():
+            before, after, delta = (values[key] for key in
+                                    ("faulty", "completed", "improvement"))
+            print(f"{name} ({before['frames']} frames, "
+                  f"{values['added_cells']:,} added cells): "
+                  f"exact IoU {before['iou']:.2%} -> {after['iou']:.2%} "
+                  f"({delta['iou'] * 100:+.2f} pp), "
+                  f"exact F1 {before['f1']:.2%} -> {after['f1']:.2%} "
+                  f"({delta['f1'] * 100:+.2f} pp), "
+                  f"IoU@0.2m {before['iou_0p2m']:.2%} -> "
+                  f"{after['iou_0p2m']:.2%} "
+                  f"({delta['iou_0p2m'] * 100:+.2f} pp), "
+                  f"F1@0.2m {before['f1_0p2m']:.2%} -> "
+                  f"{after['f1_0p2m']:.2%} "
+                  f"({delta['f1_0p2m'] * 100:+.2f} pp)", flush=True)
     print(f"Report: {args.output_json}", flush=True)
 
 
