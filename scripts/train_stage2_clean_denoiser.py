@@ -31,6 +31,7 @@ from models.radar_lidar_stage2.stage2_io import sha256
 
 
 REVISION = "stage2_clean_12vox_1p6m_epsilon_denoiser_v1"
+REVERSE_REVISION = "stage2_clean_12vox_1p6m_fullnoise_reverse_5train_3val_v1"
 RADIUS_M = 1.6
 MIN_RADAR_VOXELS = 12
 RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
@@ -75,10 +76,36 @@ def _batch(rows: list[dict], device: str):
     return hierarchy, clean, point_ids
 
 
+def reverse_schedule(count: int, *, total: int = 1000,
+                     final_timestep: int = 199) -> torch.Tensor:
+    """Nested five/three-step DDIM schedules with a shared terminal noise level."""
+    if count < 2 or total <= final_timestep or final_timestep < 1:
+        raise ValueError("Invalid reverse-step schedule")
+    schedule = torch.linspace(total - 1, final_timestep, count).round().long()
+    if not bool((schedule[:-1] > schedule[1:]).all()):
+        raise ValueError("Reverse timesteps must be distinct")
+    return schedule
+
+
+def reverse_step(xt: torch.Tensor, predicted_epsilon: torch.Tensor,
+                 alpha: torch.Tensor, next_alpha: torch.Tensor | None
+                 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Deterministic DDIM update; bound only the estimated clean latent."""
+    x0_hat = ((xt - (1 - alpha).sqrt() * predicted_epsilon)
+              / alpha.sqrt()).clamp(-1, 1)
+    if next_alpha is None:
+        return x0_hat, None
+    following = (next_alpha.sqrt() * x0_hat
+                 + (1 - next_alpha).sqrt() * predicted_epsilon)
+    return x0_hat, following
+
+
 def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                optimizer: torch.optim.Optimizer | None,
                alpha_bars: torch.Tensor, *, device: str, epoch: int,
-               eval_timestep: int, seed: int) -> dict:
+               eval_timestep: int, seed: int,
+               reverse_train_steps: int = 0,
+               reverse_val_steps: int = 0) -> dict:
     training = optimizer is not None
     model.eval()
     model.diffusion.train(training)
@@ -89,6 +116,9 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
     counts = {"tp": 0, "predicted": 0, "target": 0}
     oracle = dict(counts)
     description = f"Clean denoiser {'train' if training else 'val'} {epoch:03d}"
+    reverse_count = reverse_train_steps if training else reverse_val_steps
+    schedule = (reverse_schedule(reverse_count, total=len(alpha_bars)).to(device)
+                if reverse_count else None)
     for rows in tqdm(loader, desc=description, unit="batch"):
         hierarchy, clean, point_ids = _batch(rows, device)
         frames += len(rows)
@@ -100,35 +130,73 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
         with torch.no_grad():
             x0, present = model.lidar_encoder(clean, coarse, point_ids)
         present_latents += int(present.sum())
-        if training:
-            steps = torch.randint(len(alpha_bars), (len(rows),),
-                                  device=device, generator=generator)
-        else:
-            steps = torch.full((len(rows),), eval_timestep,
-                               device=device, dtype=torch.long)
         latent_ids = coarse[:, 0].long()
-        alpha = alpha_bars[steps[latent_ids], None]
-        epsilon = torch.randn(x0.shape, dtype=x0.dtype,
-                              device=device, generator=generator)
-        xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
-        with torch.set_grad_enabled(training):
-            predicted_noise = model.diffusion(
-                xt, torch.zeros_like(x0), torch.zeros_like(x0),
-                x0.new_ones((len(x0), 1)),
-                torch.zeros(len(x0), dtype=torch.bool, device=device),
-                steps, coarse)
-            loss = frame_mean((predicted_noise - epsilon).square().mean(1),
-                              latent_ids, len(rows))
+        zero_condition = torch.zeros_like(x0)
+        site_probability = x0.new_ones((len(x0), 1))
+        absent = torch.zeros(len(x0), dtype=torch.bool, device=device)
+        if reverse_count:
+            # Start from Gaussian noise. Each epsilon target is computed for the
+            # *actual rolled-out state*, not for a different forward-noised x0.
+            # Detaching the DDIM transition keeps the five sparse U-Net passes
+            # from retaining a five-step GPU autograd graph.
+            xt = torch.randn(x0.shape, dtype=x0.dtype,
+                             device=device, generator=generator)
+            losses = []
             if training:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+            for index, timestep in enumerate(schedule):
+                alpha = alpha_bars[timestep]
+                epsilon_target = (xt - alpha.sqrt() * x0) / (1 - alpha).sqrt()
+                steps = timestep.expand(len(rows))
+                with torch.set_grad_enabled(training):
+                    predicted_noise = model.diffusion(
+                        xt, zero_condition, zero_condition,
+                        site_probability, absent, steps, coarse)
+                    step_loss = frame_mean(
+                        (predicted_noise - epsilon_target).square().mean(1),
+                        latent_ids, len(rows))
+                    if training:
+                        (step_loss / reverse_count).backward()
+                losses.append(step_loss.detach())
+                next_alpha = (alpha_bars[schedule[index + 1]]
+                              if index + 1 < reverse_count else None)
+                with torch.no_grad():
+                    recovered, following = reverse_step(
+                        xt, predicted_noise.detach(), alpha, next_alpha)
+                    if following is not None:
+                        xt = following
+            loss = torch.stack(losses).mean()
+            if training:
                 torch.nn.utils.clip_grad_norm_(model.diffusion.parameters(), 1.0)
                 optimizer.step()
+        else:
+            if training:
+                steps = torch.randint(len(alpha_bars), (len(rows),),
+                                      device=device, generator=generator)
+            else:
+                steps = torch.full((len(rows),), eval_timestep,
+                                   device=device, dtype=torch.long)
+            alpha = alpha_bars[steps[latent_ids], None]
+            epsilon = torch.randn(x0.shape, dtype=x0.dtype,
+                                  device=device, generator=generator)
+            xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
+            with torch.set_grad_enabled(training):
+                predicted_noise = model.diffusion(
+                    xt, zero_condition, zero_condition,
+                    site_probability, absent, steps, coarse)
+                loss = frame_mean((predicted_noise - epsilon).square().mean(1),
+                                  latent_ids, len(rows))
+                if training:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.diffusion.parameters(), 1.0)
+                    optimizer.step()
         loss_sum += float(loss.detach()) * len(rows)
         if not training:
             with torch.no_grad():
-                recovered = ((xt - (1 - alpha).sqrt() * predicted_noise)
-                             / alpha.sqrt())
+                if not reverse_count:
+                    recovered = ((xt - (1 - alpha).sqrt() * predicted_noise)
+                                 / alpha.sqrt())
                 latent_mse = frame_mean((recovered - x0).square().mean(1),
                                         latent_ids, len(rows))
                 latent_mse_sum += float(latent_mse) * len(rows)
@@ -153,7 +221,13 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                        "eligible_occupancy": occupancy_metrics(counts),
                        "frozen_lpcr_oracle": occupancy_metrics(oracle),
                        "occupancy_threshold": 0.5,
-                       "eval_timestep": eval_timestep})
+                       "eval_timestep": eval_timestep if not reverse_count else None})
+    if reverse_count:
+        output.update({"sampling": "sequential_DDIM_from_Gaussian_noise",
+                       "reverse_steps": reverse_count,
+                       "reverse_schedule": schedule.tolist(),
+                       "reverse_terminal_timestep": int(schedule[-1]),
+                       "conditioning": "gate_coordinates_only"})
     return output
 
 
@@ -173,12 +247,18 @@ def main() -> None:
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--eval-timestep", type=int, default=499,
                         help="Fixed zero-based diffusion timestep for validation")
+    parser.add_argument("--reverse-train-steps", type=int, default=0,
+                        help="Sequential DDIM steps from Gaussian noise during training")
+    parser.add_argument("--reverse-val-steps", type=int, default=0,
+                        help="Sequential DDIM steps from Gaussian noise during validation")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or not 0 <= args.eval_timestep < 1000 or
+            ((args.reverse_train_steps, args.reverse_val_steps) not in
+             ((0, 0), (5, 3))) or
             any(value is not None and value < 1 for value in
                 (args.train_limit, args.val_limit))):
         parser.error("Invalid training, validation, or diffusion settings")
@@ -225,7 +305,8 @@ def main() -> None:
             num_workers=args.num_workers, collate_fn=_rows,
             pin_memory=True, persistent_workers=args.num_workers > 0)
 
-    identity = {"revision": REVISION, "lpcr_sha256": sha256(args.lpcr_checkpoint),
+    identity = {"revision": REVERSE_REVISION if args.reverse_train_steps else REVISION,
+                "lpcr_sha256": sha256(args.lpcr_checkpoint),
                 "support_manifest_sha256": support_hashes,
                 "data_manifest_sha256": {
                     split: sha256(args.data_cache_root / split / "manifest.json")
@@ -236,7 +317,15 @@ def main() -> None:
                 "train_limit": args.train_limit, "val_limit": args.val_limit,
                 "batch_size": args.batch_size, "lr": args.lr,
                 "eval_timestep": args.eval_timestep, "seed": args.seed}
+    if args.reverse_train_steps:
+        identity.update({"reverse_train_steps": args.reverse_train_steps,
+                         "reverse_val_steps": args.reverse_val_steps,
+                         "reverse_train_schedule": reverse_schedule(5).tolist(),
+                         "reverse_val_schedule": reverse_schedule(3).tolist(),
+                         "sampling": "sequential_DDIM_from_Gaussian_noise",
+                         "conditioning": "gate_coordinates_only"})
     start, best = 1, float("inf")
+    best_iou = -1.0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if saved.get("identity") != identity:
@@ -244,37 +333,58 @@ def main() -> None:
         model.diffusion.load_state_dict(saved["diffusion"])
         optimizer.load_state_dict(saved["optimizer"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_val_noise_mse"])
+        if args.reverse_train_steps:
+            best_iou = float(saved["best_val_iou_at_0p5"])
     history = args.output_root / "history.jsonl"
     if start > args.epochs:
         print(f"Already complete: epoch {start - 1}; {args.output_root}", flush=True)
         return
     print(f"Clean-only epsilon denoising on >=12 distinct radar voxels within 1.6 m; "
           f"{len(loaders['train'].dataset)} train and {len(loaders['val'].dataset)} "
-          "validation frames. No fault input or task losses.", flush=True)
+          f"validation frames. Reverse train/val steps="
+          f"{args.reverse_train_steps}/{args.reverse_val_steps}. "
+          "No fault input or task losses.", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = _run_epoch(model, loaders["train"], optimizer, alpha_bars,
                            device=args.device, epoch=epoch,
-                           eval_timestep=args.eval_timestep, seed=args.seed)
+                           eval_timestep=args.eval_timestep, seed=args.seed,
+                           reverse_train_steps=args.reverse_train_steps,
+                           reverse_val_steps=args.reverse_val_steps)
         val = _run_epoch(model, loaders["val"], None, alpha_bars,
                          device=args.device, epoch=epoch,
-                         eval_timestep=args.eval_timestep, seed=args.seed)
+                         eval_timestep=args.eval_timestep, seed=args.seed,
+                         reverse_train_steps=args.reverse_train_steps,
+                         reverse_val_steps=args.reverse_val_steps)
         improved = val["noise_mse"] < best
         if improved:
             best = val["noise_mse"]
+        improved_iou = (args.reverse_train_steps > 0 and
+                        val["eligible_occupancy"]["iou"] > best_iou)
+        if improved_iou:
+            best_iou = val["eligible_occupancy"]["iou"]
         record = {"epoch": epoch, "train": train, "val": val,
                   "best_val_noise_mse": best,
                   "validation_scope": f"{len(loaders['val'].dataset)} clean frames"}
+        if args.reverse_train_steps:
+            record["best_val_iou_at_0p5"] = best_iou
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         checkpoint = {"identity": identity, "epoch": epoch,
                       "best_val_noise_mse": best,
                       "diffusion": model.diffusion.state_dict(),
                       "optimizer": optimizer.state_dict(), "record": record}
+        if args.reverse_train_steps:
+            checkpoint["best_val_iou_at_0p5"] = best_iou
         _atomic_save(args.output_root / "last.ckpt", checkpoint)
         if improved:
             _atomic_save(args.output_root / "best.ckpt", checkpoint)
+        if improved_iou:
+            _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
         print(json.dumps(record), flush=True)
     print(f"Best checkpoint: {args.output_root / 'best.ckpt'}", flush=True)
+    if args.reverse_train_steps:
+        print(f"Best occupancy IoU checkpoint: "
+              f"{args.output_root / 'best_iou.ckpt'}", flush=True)
 
 
 if __name__ == "__main__":
