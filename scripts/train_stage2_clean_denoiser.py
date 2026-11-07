@@ -16,7 +16,6 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner import supported_coordinates
@@ -228,11 +227,10 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
     frames = fine_sites = latent_sites = present_latents = 0
     counts = {"tp": 0, "predicted": 0, "target": 0}
     oracle = dict(counts)
-    description = f"Clean denoiser {'train' if training else 'val'} {epoch:03d}"
     reverse_count = reverse_train_steps if training else reverse_val_steps
     schedule = (reverse_schedule(reverse_count, total=len(alpha_bars)).to(device)
                 if reverse_count else None)
-    for rows in tqdm(loader, desc=description, unit="batch"):
+    for rows in loader:
         hierarchy, clean, point_ids = _batch(rows, device)
         frames += len(rows)
         fine_sites += len(hierarchy[0])
@@ -493,12 +491,6 @@ def main() -> None:
     if start > args.epochs:
         print(f"Already complete: epoch {start - 1}; {args.output_root}", flush=True)
         return
-    print(f"Clean-target epsilon denoising on >=12 distinct radar voxels within 1.6 m; "
-          f"{len(loaders['train'].dataset)} train and {len(loaders['val'].dataset)} "
-          f"validation frames. Reverse train/val steps="
-          f"{args.reverse_train_steps}/{args.reverse_val_steps}. "
-          f"Conditioning={'faulty LiDAR + radar' if args.condition_faulty_radar else 'none'}. "
-          "No task losses.", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = _run_epoch(model, loaders["train"], optimizer, alpha_bars,
                            device=args.device, epoch=epoch,
@@ -542,11 +534,11 @@ def main() -> None:
             _atomic_save(args.output_root / "best.ckpt", checkpoint)
         if improved_iou:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
-        print(json.dumps(record), flush=True)
-    print(f"Best checkpoint: {args.output_root / 'best.ckpt'}", flush=True)
-    if args.reverse_train_steps or args.condition_faulty_radar:
-        print(f"Best occupancy IoU checkpoint: "
-              f"{args.output_root / 'best_iou.ckpt'}", flush=True)
+        print(f"Epoch {epoch:03d}: "
+              f"train_loss={train['noise_mse']:.4f} "
+              f"val_loss={val['noise_mse']:.4f} "
+              f"exact_IoU={val['eligible_occupancy']['iou']:.2%}",
+              flush=True)
 
 
 if __name__ == "__main__":
