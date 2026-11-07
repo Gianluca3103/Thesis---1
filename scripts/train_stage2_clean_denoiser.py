@@ -1,9 +1,10 @@
-"""Train epsilon-only clean LiDAR denoising on a fixed radar-supported grid.
+"""Train epsilon-only clean LiDAR latent recovery on a fixed radar gate.
 
-This is a clean-input diagnostic. The frozen LPCR encoder supplies x0 from
-clean LiDAR inside the gate; validation decodes the denoised x0 for occupancy
-metrics. No faulty LiDAR, fault mask, ray loss, offset loss, or occupancy loss
-enters training.
+The original diagnostic uses one forward-noised clean latent per update. The
+full-noise trial rolls out five/three DDIM reverse steps. Its optional
+faulty/radar conditioning uses cached mild faults and measured radar features;
+clean LiDAR remains the target only. No ray, offset, or occupancy loss enters
+training.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 from models.radar_lidar_stage2.clean_denoising import (
     batched_hierarchy, clean_points_in_support, frame_mean,
     occupancy_counts, occupancy_metrics)
+from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.geometry_gate import offset_targets
+from models.radar_lidar_stage2.geometry_gate import geometry_gate_output
 from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2, cosine_alpha_bars)
 from models.radar_lidar_stage2.stage2_io import sha256
@@ -32,16 +35,21 @@ from models.radar_lidar_stage2.stage2_io import sha256
 
 REVISION = "stage2_clean_12vox_1p6m_epsilon_denoiser_v1"
 REVERSE_REVISION = "stage2_clean_12vox_1p6m_fullnoise_reverse_5train_3val_v1"
+CONDITIONED_REVERSE_REVISION = (
+    "stage2_clean_12vox_1p6m_faulty_radar_reverse_5train_3val_v1")
 RADIUS_M = 1.6
 MIN_RADAR_VOXELS = 12
 RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
 
 
 class _CleanRows:
-    def __init__(self, dataset, cache: RadarSupportCache, limit: int | None):
+    def __init__(self, dataset, cache: RadarSupportCache, limit: int | None,
+                 faulty_root: Path | None = None, split: str | None = None):
         self.dataset = dataset
         self.cache = cache
         self.limit = len(dataset) if limit is None else min(len(dataset), limit)
+        self.faulty_root = faulty_root
+        self.split = split
 
     def __len__(self) -> int:
         return self.limit
@@ -49,9 +57,16 @@ class _CleanRows:
     def __getitem__(self, index: int) -> dict:
         row = self.dataset[index]
         mask = self.cache.load(row["frame_id"])
-        return {"frame_id": row["frame_id"],
-                "fine_zyx": supported_coordinates(mask),
-                "clean_xyz": clean_points_in_support(row["clean_lidar"][:, :3], mask)}
+        result = {"frame_id": row["frame_id"],
+                  "fine_zyx": supported_coordinates(mask),
+                  "clean_xyz": clean_points_in_support(
+                      row["clean_lidar"][:, :3], mask)}
+        if self.faulty_root is not None:
+            result.update({"radar": row["radar"],
+                           "faulty_xyz": load_faulty(
+                               self.faulty_root, self.split, row["frame_id"]),
+                           "support_mask": mask})
+        return result
 
 
 def _rows(rows: list[dict]) -> list[dict]:
@@ -74,6 +89,40 @@ def _batch(rows: list[dict], device: str):
     point_ids = torch.cat([torch.full((len(cloud),), frame, dtype=torch.long)
                            for frame, cloud in enumerate(clouds)]).to(device)
     return hierarchy, clean, point_ids
+
+
+def _conditioned_inputs(model: SparseResidualStage2, rows: list[dict],
+                        hierarchy: tuple[torch.Tensor, ...],
+                        device: str) -> tuple[torch.Tensor, torch.Tensor,
+                                              torch.Tensor]:
+    """Encode faulty LiDAR and measured radar without exposing clean targets."""
+    faults = [row["faulty_xyz"] for row in rows]
+    faulty = torch.cat(faults).to(device, non_blocking=True)
+    faulty_ids = torch.cat([
+        torch.full((len(cloud),), frame, dtype=torch.long)
+        for frame, cloud in enumerate(faults)]).to(device)
+    coarse = hierarchy[-1]
+    radar_parts = []
+    with torch.no_grad():
+        faulty_latent, faulty_present = model.lidar_encoder(
+            faulty, coarse, faulty_ids)
+        for frame, row in enumerate(rows):
+            radar = row["radar"].to(device, non_blocking=True)
+            # This full-scan, empty-fault call supplies radar statistics only.
+            # Its allowed cells are exactly the precomputed >=12/1.6 m mask;
+            # observed faulty cells are deliberately not removed here.
+            output = geometry_gate_output(
+                radar, faulty[:0], {"kind": "full_scan"},
+                row["support_mask"], MIN_RADAR_VOXELS)
+            condition = model.conditions(output, 0.5)
+            frame_coarse = coarse[coarse[:, 0] == frame][:, 1:]
+            if not torch.equal(condition.hierarchy[-1][:, 1:], frame_coarse):
+                raise ValueError("Radar features do not align with gated latent sites")
+            radar_parts.append(condition.radar_features)
+    radar_latent = torch.cat(radar_parts)
+    if radar_latent.shape != faulty_latent.shape:
+        raise ValueError("Faulty LiDAR and radar latent features differ")
+    return faulty_latent, faulty_present, radar_latent
 
 
 def reverse_schedule(count: int, *, total: int = 1000,
@@ -105,7 +154,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                alpha_bars: torch.Tensor, *, device: str, epoch: int,
                eval_timestep: int, seed: int,
                reverse_train_steps: int = 0,
-               reverse_val_steps: int = 0) -> dict:
+               reverse_val_steps: int = 0,
+               condition_faulty_radar: bool = False) -> dict:
     training = optimizer is not None
     model.eval()
     model.diffusion.train(training)
@@ -131,9 +181,14 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
             x0, present = model.lidar_encoder(clean, coarse, point_ids)
         present_latents += int(present.sum())
         latent_ids = coarse[:, 0].long()
-        zero_condition = torch.zeros_like(x0)
+        if condition_faulty_radar:
+            faulty_condition, faulty_present, radar_condition = (
+                _conditioned_inputs(model, rows, hierarchy, device))
+        else:
+            faulty_condition = radar_condition = torch.zeros_like(x0)
+            faulty_present = torch.zeros(
+                len(x0), dtype=torch.bool, device=device)
         site_probability = x0.new_ones((len(x0), 1))
-        absent = torch.zeros(len(x0), dtype=torch.bool, device=device)
         if reverse_count:
             # Start from Gaussian noise. Each epsilon target is computed for the
             # *actual rolled-out state*, not for a different forward-noised x0.
@@ -150,8 +205,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                 steps = timestep.expand(len(rows))
                 with torch.set_grad_enabled(training):
                     predicted_noise = model.diffusion(
-                        xt, zero_condition, zero_condition,
-                        site_probability, absent, steps, coarse)
+                        xt, faulty_condition, radar_condition,
+                        site_probability, faulty_present, steps, coarse)
                     step_loss = frame_mean(
                         (predicted_noise - epsilon_target).square().mean(1),
                         latent_ids, len(rows))
@@ -182,8 +237,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
             xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
             with torch.set_grad_enabled(training):
                 predicted_noise = model.diffusion(
-                    xt, zero_condition, zero_condition,
-                    site_probability, absent, steps, coarse)
+                    xt, faulty_condition, radar_condition,
+                    site_probability, faulty_present, steps, coarse)
                 loss = frame_mean((predicted_noise - epsilon).square().mean(1),
                                   latent_ids, len(rows))
                 if training:
@@ -227,7 +282,9 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                        "reverse_steps": reverse_count,
                        "reverse_schedule": schedule.tolist(),
                        "reverse_terminal_timestep": int(schedule[-1]),
-                       "conditioning": "gate_coordinates_only"})
+                       "conditioning": ("faulty_LiDAR_and_measured_radar"
+                                        if condition_faulty_radar else
+                                        "gate_coordinates_only")})
     return output
 
 
@@ -236,6 +293,8 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
+    parser.add_argument("--faulty-root", type=Path)
+    parser.add_argument("--condition-faulty-radar", action="store_true")
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default=RADAR_VARIANT)
@@ -264,6 +323,11 @@ def main() -> None:
         parser.error("Invalid training, validation, or diffusion settings")
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("This sparse U-Net run requires CUDA and MinkowskiEngine")
+    if args.condition_faulty_radar and (
+            args.faulty_root is None or args.reverse_train_steps != 5):
+        parser.error("Faulty/radar conditioning requires --faulty-root and 5/3 reverse steps")
+    if args.faulty_root is not None and not args.condition_faulty_radar:
+        parser.error("--faulty-root requires --condition-faulty-radar")
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -299,13 +363,16 @@ def main() -> None:
         cache.check_complete()
         support_hashes[split] = sha256(args.support_cache_root / split /
                                        "manifest.json")
-        rows = _CleanRows(dataset, cache, limit)
+        rows = _CleanRows(dataset, cache, limit,
+                          args.faulty_root, split)
         loaders[split] = DataLoader(
             rows, batch_size=args.batch_size, shuffle=(split == "train"),
             num_workers=args.num_workers, collate_fn=_rows,
             pin_memory=True, persistent_workers=args.num_workers > 0)
 
-    identity = {"revision": REVERSE_REVISION if args.reverse_train_steps else REVISION,
+    revision = (CONDITIONED_REVERSE_REVISION if args.condition_faulty_radar
+                else REVERSE_REVISION if args.reverse_train_steps else REVISION)
+    identity = {"revision": revision,
                 "lpcr_sha256": sha256(args.lpcr_checkpoint),
                 "support_manifest_sha256": support_hashes,
                 "data_manifest_sha256": {
@@ -323,7 +390,13 @@ def main() -> None:
                          "reverse_train_schedule": reverse_schedule(5).tolist(),
                          "reverse_val_schedule": reverse_schedule(3).tolist(),
                          "sampling": "sequential_DDIM_from_Gaussian_noise",
-                         "conditioning": "gate_coordinates_only"})
+                         "conditioning": ("faulty_LiDAR_and_measured_radar"
+                                          if args.condition_faulty_radar else
+                                          "gate_coordinates_only")})
+    if args.condition_faulty_radar:
+        identity["faulty_manifest_sha256"] = {
+            split: sha256(args.faulty_root / split / "manifest.json")
+            for split in ("train", "val")}
     start, best = 1, float("inf")
     best_iou = -1.0
     if args.resume:
@@ -343,18 +416,21 @@ def main() -> None:
           f"{len(loaders['train'].dataset)} train and {len(loaders['val'].dataset)} "
           f"validation frames. Reverse train/val steps="
           f"{args.reverse_train_steps}/{args.reverse_val_steps}. "
-          "No fault input or task losses.", flush=True)
+          f"Conditioning={'faulty LiDAR + radar' if args.condition_faulty_radar else 'none'}. "
+          "No task losses.", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = _run_epoch(model, loaders["train"], optimizer, alpha_bars,
                            device=args.device, epoch=epoch,
                            eval_timestep=args.eval_timestep, seed=args.seed,
                            reverse_train_steps=args.reverse_train_steps,
-                           reverse_val_steps=args.reverse_val_steps)
+                           reverse_val_steps=args.reverse_val_steps,
+                           condition_faulty_radar=args.condition_faulty_radar)
         val = _run_epoch(model, loaders["val"], None, alpha_bars,
                          device=args.device, epoch=epoch,
                          eval_timestep=args.eval_timestep, seed=args.seed,
                          reverse_train_steps=args.reverse_train_steps,
-                         reverse_val_steps=args.reverse_val_steps)
+                         reverse_val_steps=args.reverse_val_steps,
+                         condition_faulty_radar=args.condition_faulty_radar)
         improved = val["noise_mse"] < best
         if improved:
             best = val["noise_mse"]
