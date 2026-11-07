@@ -48,6 +48,12 @@ checks that `last.ckpt` is epoch 25, sweeps 512 other validation frames
 (256 calibration and 256 held-out) using `best.ckpt`, writes eight balanced
 interactive previews, and scores the selected `best.ckpt` on all 1,296
 eligible validation frames. It performs no additional training updates.
+When the interactive HTML viewer cannot open, run
+`scripts.render_stage2_sample_png --sample-root "$OUT/val_samples_best_f1"`.
+It reads the already exported NPZ arrays and writes a `static_png` directory
+with eight top/side-view PNGs and a `contact_sheet.png`. These open directly
+in VS Code's image preview; rendering requires only NumPy and the Python
+standard library, with no Firefox, display server, or model inference.
 
 ## Data flow
 
