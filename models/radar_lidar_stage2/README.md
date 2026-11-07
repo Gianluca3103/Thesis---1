@@ -310,6 +310,22 @@ The default full run writes a separate checkpoint and validation report under
 `stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_batch8_20261107`.
 `RAY_WORKERS=8` lets SciPy match fixed clean-return rays on eight CPU threads
 instead of one. This changes execution speed, not the ray labels or objective.
+The fixed hit, front-of-hit, and extra-return indices can also be cached once
+with `scripts.cache_stage2_ray_labels` and selected with `RAY_LABELS=/path/to/cache`
+when launching training. Logits and ray-loss gradients still run on the GPU.
+This optional cache is validated against the ordered candidate coordinates,
+fault cache, support mask, injector footprint, and ray tolerances. It can be
+enabled when resuming an existing batch-eight checkpoint because it does not
+change the objective or checkpoint identity.
+
+```bash
+python -m scripts.cache_stage2_ray_labels \
+  --vod-root "$VOD" --data-cache-root "$RAW" --faulty-root "$MILD" \
+  --support-cache-root "$SUPPORT" --fault-region-root "$REGIONS" \
+  --output-root "$RAY_LABELS" --split both --device cuda
+RAY_LABELS="$RAY_LABELS" bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh
+```
+
 The launcher resumes from `last.ckpt` in the same output directory. Batch size
 is bound to the checkpoint, so use a separate output directory for batch eight.
 Build the footprint sidecar with `scripts.cache_stage2_fault_regions` after

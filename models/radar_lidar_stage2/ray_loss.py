@@ -70,6 +70,8 @@ def addition_ray_losses(
         range_margin_m: float | None = None,
         hit_enabled: bool = True, extra_enabled: bool = True,
         grid: Stage2Grid = GRID,
+        collect_labels: bool = False,
+        cached_labels: list[dict] | None = None,
         ) -> dict[str, torch.Tensor | int]:
     """First-hit likelihood and extra-return suppression on radar-allowed sites.
 
@@ -96,6 +98,46 @@ def addition_ray_losses(
     if clean_batch_ids.shape != (len(clean_xyz),):
         raise ValueError("Clean point batch IDs differ from clean points")
     zero = addition_logits.sum() * 0
+    if cached_labels is not None:
+        if collect_labels:
+            raise ValueError("Cannot collect and reuse ray labels together")
+        frame_count = len(cached_labels)
+        counts = [int(label["candidate_count"]) for label in cached_labels]
+        if (not frame_count or sum(counts) != len(fine)
+                or len(fine) > 1 and bool((fine[1:, 0] < fine[:-1, 0]).any())
+                or torch.bincount(fine[:, 0].long(), minlength=frame_count).tolist()
+                != counts):
+            raise ValueError("Cached ray labels differ from batched fine cells")
+        hit_terms, extra_terms = [], []
+        hit_rays = extra_sites = offset = 0
+        for label in cached_labels:
+            count = int(label["candidate_count"])
+            ids = {}
+            for name in ("hit", "front", "extra"):
+                values = np.asarray(label[name])
+                if (values.ndim != 1 or values.dtype.kind not in "iu"
+                        or bool(np.any(values < 0))
+                        or bool(np.any(values >= count))):
+                    raise ValueError(f"Invalid cached ray {name} indices")
+                ids[name] = torch.as_tensor(values.astype(np.int64),
+                                            device=addition_logits.device) + offset
+            if hit_enabled and len(ids["hit"]):
+                hit_rays += len(ids["hit"])
+                frame_loss = F.softplus(-addition_logits[ids["hit"]]).sum()
+                if len(ids["front"]):
+                    frame_loss = frame_loss + F.softplus(
+                        addition_logits[ids["front"]]).sum()
+                hit_terms.append(frame_loss / len(ids["hit"]))
+            if extra_enabled and len(ids["extra"]):
+                extra_sites += len(ids["extra"])
+                extra_terms.append(F.softplus(
+                    addition_logits[ids["extra"]]).mean())
+            offset += count
+        return {"hit": torch.stack(hit_terms).sum() / frame_count
+                if hit_terms else zero,
+                "extra": torch.stack(extra_terms).sum() / frame_count
+                if extra_terms else zero,
+                "hit_rays": hit_rays, "extra_sites": extra_sites}
     if not (hit_enabled or extra_enabled) or not len(fine):
         return {"hit": zero, "extra": zero, "hit_rays": 0,
                 "extra_sites": 0}
@@ -136,6 +178,11 @@ def addition_ray_losses(
     extra_terms = []
     hit_rays = 0
     extra_sites = 0
+    labels = ([{"candidate_count": int(np.count_nonzero(frames_np == frame)),
+                "hit": np.empty(0, dtype=np.int32),
+                "front": np.empty(0, dtype=np.int32),
+                "extra": np.empty(0, dtype=np.int32)}
+               for frame in range(frame_count)] if collect_labels else None)
     for frame in range(frame_count):
         frame_ids = np.flatnonzero(frames_np == frame)
         clean_returns = clean_np[clean_frames_np == frame]
@@ -188,6 +235,11 @@ def addition_ray_losses(
                     frame_loss = frame_loss + F.softplus(addition_logits[
                         torch.as_tensor(front_ids, device=addition_logits.device)]).sum()
                 hit_terms.append(frame_loss / len(frame_hit_ids))
+                if labels is not None:
+                    labels[frame]["hit"] = np.searchsorted(
+                        frame_ids, frame_hit_ids).astype(np.int32)
+                    labels[frame]["front"] = np.searchsorted(
+                        frame_ids, np.asarray(front_ids, dtype=np.int64)).astype(np.int32)
 
         if extra_enabled and len(free_ids):
             first = _first_ranges(centers_np[free_ids], clean_returns,
@@ -200,7 +252,13 @@ def addition_ray_losses(
                 extra_sites += len(selected)
                 extra_terms.append(F.softplus(addition_logits[
                     torch.as_tensor(selected, device=addition_logits.device)]).mean())
+                if labels is not None:
+                    labels[frame]["extra"] = np.searchsorted(
+                        frame_ids, selected).astype(np.int32)
     hit = torch.stack(hit_terms).sum() / frame_count if hit_terms else zero
     extra = torch.stack(extra_terms).sum() / frame_count if extra_terms else zero
-    return {"hit": hit, "extra": extra, "hit_rays": hit_rays,
-            "extra_sites": extra_sites}
+    result = {"hit": hit, "extra": extra, "hit_rays": hit_rays,
+              "extra_sites": extra_sites}
+    if labels is not None:
+        result["labels"] = labels
+    return result

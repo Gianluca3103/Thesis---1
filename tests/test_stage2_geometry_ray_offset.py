@@ -13,6 +13,7 @@ from models.radar_lidar_stage2.geometry_gate import geometry_gate_output, offset
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, footprint_mask, partial_azimuth_region)
 from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
+from models.radar_lidar_stage2.ray_label_cache import RayLabelCache
 from models.radar_lidar_stage2.ray_loss import _first_ranges, addition_ray_losses
 from models.radar_lidar_stage2.sparse_geometry import GRID, select_allowed
 from models.radar_lidar_stage2.sparse_residual import (
@@ -107,6 +108,21 @@ class GeometryGateTest(unittest.TestCase):
                          "2": {"kind": "empty"}})
             self.assertEqual(FaultRegionCache(root, expected).get("2")["kind"],
                              "empty")
+
+    def test_ray_label_cache_is_bound_to_ordered_coordinates(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            expected = {"frame_ids": ["1"], "grid": {"shape": (16, 160, 160)}}
+            cache = RayLabelCache(Path(directory), expected, create=True)
+            fine = torch.tensor([[0, 8, 80, 80], [0, 8, 80, 81]])
+            labels = {"candidate_count": 2,
+                      "hit": np.array([0], dtype=np.int32),
+                      "front": np.array([1, 1], dtype=np.int32),
+                      "extra": np.array([], dtype=np.int32)}
+            cache.write("1", fine, labels)
+            loaded = RayLabelCache(Path(directory), expected).load("1", fine)
+            np.testing.assert_array_equal(loaded["front"], labels["front"])
+            with self.assertRaises(ValueError):
+                cache.load("1", fine.flip(0))
 
     def test_offset_target_is_centroid_relative_to_eligible_cell(self):
         fine = torch.tensor([[0, 8, 80, 80], [0, 8, 80, 81]])

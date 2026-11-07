@@ -587,6 +587,7 @@ class SparseResidualStage2(nn.Module):
                        ray_angular_tolerance_deg: float = 1.5,
                        ray_lateral_tolerance_m: float = 0.15,
                        ray_range_margin_m: float | None = None,
+                       cached_ray_labels: list[dict] | None = None,
                        generator: torch.Generator | None = None,
                        faulty_batch_ids: torch.Tensor | None = None,
                        clean_batch_ids: torch.Tensor | None = None,
@@ -699,7 +700,8 @@ class SparseResidualStage2(nn.Module):
                 lateral_tolerance_m=ray_lateral_tolerance_m,
                 range_margin_m=ray_range_margin_m,
                 hit_enabled=ray_hit_weight > 0,
-                extra_enabled=ray_extra_weight > 0, grid=self.grid)
+                extra_enabled=ray_extra_weight > 0, grid=self.grid,
+                cached_labels=cached_ray_labels)
         else:
             zero = addition["logits"].sum() * 0
             rays = {"hit": zero, "extra": zero, "hit_rays": 0,

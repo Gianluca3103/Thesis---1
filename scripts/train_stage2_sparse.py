@@ -33,6 +33,8 @@ from models.radar_lidar_stage2.geometry_gate import (
     RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
     geometry_gate_output)
 from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
+from models.radar_lidar_stage2.ray_label_cache import (
+    RayLabelCache, identity as ray_label_identity)
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
     EPSILON_MODEL_REVISION, GEOMETRY_EPSILON_REVISION, LPCR_REVISION,
@@ -187,6 +189,9 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                 if not len(item.hierarchy[0]):
                     skipped += 1
                     continue
+                if args.ray_offset_baseline and args.ray_label_caches:
+                    row["cached_ray_labels"] = args.ray_label_caches[split].load(
+                        row["frame_id"], item.hierarchy[0])
                 active_rows.append(row)
                 items.append(item)
                 clean_clouds.append(clean)
@@ -240,6 +245,10 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                                               ray_angular_tolerance_deg=args.ray_angular_tolerance_deg,
                                               ray_lateral_tolerance_m=args.ray_lateral_tolerance_m,
                                               ray_range_margin_m=args.ray_range_margin_m,
+                                              cached_ray_labels=(
+                                                  [row["cached_ray_labels"]
+                                                   for row in active_rows]
+                                                  if args.ray_label_caches else None),
                                               generator=generator,
                                               faulty_batch_ids=faulty_batch_ids,
                                               clean_batch_ids=clean_batch_ids,
@@ -349,6 +358,8 @@ def main() -> None:
                         help="Precomputed 3-radar-voxel/1.6 m support masks")
     parser.add_argument("--fault-region-root", type=Path,
                         help="Cached synthetic injector footprint; required for geometry baseline")
+    parser.add_argument("--ray-label-cache-root", type=Path,
+                        help="Optional precomputed fixed ray associations")
     parser.add_argument("--offset-weight", type=float, default=1.0)
     parser.add_argument("--lpcr-checkpoint", type=Path,
                         help="Required for diffusion; best LPCR checkpoint")
@@ -420,6 +431,7 @@ def main() -> None:
                 or any(value != 0 for value in (
                     args.residual_weight, args.reconstruction_weight,
                     args.addition_weight, args.healthy_weight))) or
+            args.ray_label_cache_root is not None and not args.ray_offset_baseline or
             args.phase == "diffusion" and args.batch_size > 1
             and args.stage2_cache_root is None and not args.ray_offset_baseline or
             args.phase == "diffusion" and args.lpcr_checkpoint is None or
@@ -590,6 +602,7 @@ def main() -> None:
             args.fault_names[split] = manifest["frame_faults"]
     args.support_caches = {}
     args.region_caches = {}
+    args.ray_label_caches = {}
     if args.ray_offset_baseline:
         for split, dataset in full_datasets.items():
             expected = radar_support_identity(
@@ -607,6 +620,23 @@ def main() -> None:
                 args.fault_region_root / split, region_expected)
             if args.region_caches[split].regions is None:
                 raise FileNotFoundError(f"Missing {split} injector footprint cache")
+            if args.ray_label_cache_root is not None:
+                ray_expected = ray_label_identity(
+                    split, [frame.frame_id for frame in dataset.frames],
+                    data_cache_root=args.data_cache_root,
+                    faulty_root=args.faulty_root,
+                    support_cache_root=args.support_cache_root,
+                    fault_region_root=args.fault_region_root,
+                    radar_variant=args.radar_variant,
+                    gate_threshold=args.gate_threshold,
+                    angular_tolerance_deg=args.ray_angular_tolerance_deg,
+                    lateral_tolerance_m=args.ray_lateral_tolerance_m,
+                    range_margin_m=args.ray_range_margin_m,
+                    device=args.device)
+                ray_cache = RayLabelCache(
+                    args.ray_label_cache_root / split, ray_expected)
+                ray_cache.check_complete()
+                args.ray_label_caches[split] = ray_cache
     fixed_caches = {}
     fog_caches = {}
     for split, dataset in full_datasets.items():
@@ -672,6 +702,7 @@ def main() -> None:
             best = val["loss"]
         record = {"epoch": epoch, "batch_size": args.batch_size,
                   "num_workers": args.num_workers, "train": train, "val": val,
+                  "cached_ray_labels": bool(args.ray_label_caches),
                   "best_val_loss": best, "point_cloud_metrics": paper}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")

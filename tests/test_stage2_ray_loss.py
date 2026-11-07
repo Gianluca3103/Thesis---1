@@ -1,6 +1,7 @@
 """Ray supervision uses only compatible measured rays and addition logits."""
 
 import torch
+from unittest.mock import patch
 
 from models.radar_lidar_stage2.ray_loss import addition_ray_losses
 from models.radar_lidar_stage2.sparse_geometry import GRID
@@ -84,3 +85,36 @@ def test_ray_matching_never_crosses_batch_frames():
     assert result["extra_sites"] == 0
     result["hit"].backward()
     assert logits.grad[1] == 0
+
+
+def test_cached_ray_indices_preserve_batched_loss_and_gradients():
+    local = torch.tensor([[0, 8, 80, 20], [0, 8, 80, 25],
+                          [0, 8, 80, 30], [0, 8, 85, 30]])
+    frames = []
+    for batch_id in range(8):
+        frame = local.clone()
+        frame[:, 0] = batch_id
+        frames.append(frame)
+    fine = torch.cat(frames)
+    clean = _centers(fine[torch.arange(8) * 4 + 1])
+    occupied = torch.tensor([False, True, False, False] * 8)
+    logits = torch.tensor([-0.3, 0.2, 0.7, -1.2] * 8,
+                          requires_grad=True)
+    kwargs = {"clean_batch_ids": torch.arange(8)}
+    online = addition_ray_losses(
+        fine, logits, torch.zeros(len(fine), dtype=torch.bool), occupied, clean,
+        collect_labels=True, **kwargs)
+    with patch("models.radar_lidar_stage2.ray_loss._first_ranges",
+               side_effect=AssertionError("cached loss ran CPU ray search")):
+        cached = addition_ray_losses(
+            fine, logits, torch.zeros(len(fine), dtype=torch.bool), occupied, clean,
+            cached_labels=online["labels"], **kwargs)
+    for key in ("hit", "extra"):
+        assert torch.allclose(online[key], cached[key], rtol=0, atol=0)
+    assert online["hit_rays"] == cached["hit_rays"]
+    assert online["extra_sites"] == cached["extra_sites"]
+    original_grad = torch.autograd.grad(online["hit"] + online["extra"],
+                                        logits, retain_graph=True)[0]
+    cached_grad = torch.autograd.grad(cached["hit"] + cached["extra"],
+                                      logits)[0]
+    assert torch.equal(original_grad, cached_grad)

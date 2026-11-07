@@ -16,6 +16,7 @@ OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_bat
 WORKERS=${WORKERS:-2}
 RAY_WORKERS=${RAY_WORKERS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
+RAY_LABELS=${RAY_LABELS:-}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
 TRAIN_LIMIT=${TRAIN_LIMIT:-0}
@@ -42,8 +43,18 @@ printf 'GPU batch size=%s; ray query workers=%s; data loader workers=%s\n' \
   "$BATCH_SIZE" "$RAY_WORKERS" "$WORKERS"
 
 resume=()
+log_mode=()
 if [[ -s "$OUT/last.ckpt" ]]; then
   resume=(--resume "$OUT/last.ckpt")
+  log_mode=(-a)
+fi
+ray_args=()
+if [[ -n "$RAY_LABELS" ]]; then
+  for required in "$RAY_LABELS/train/manifest.json" "$RAY_LABELS/val/manifest.json"; do
+    [[ -s "$required" ]] || { printf 'Missing ray label cache: %s\n' "$required" >&2; exit 1; }
+  done
+  ray_args=(--ray-label-cache-root "$RAY_LABELS")
+  printf 'Using cached ray labels: %s\n' "$RAY_LABELS"
 fi
 limit_args=()
 if (( TRAIN_LIMIT > 0 )); then
@@ -54,7 +65,7 @@ fi
   --phase diffusion --diffusion-target epsilon --ray-offset-baseline \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --faulty-root "$MILD" --support-cache-root "$SUPPORT" \
-  --fault-region-root "$REGIONS" \
+  --fault-region-root "$REGIONS" "${ray_args[@]}" \
   --lpcr-checkpoint "$LPCR" --output-root "$OUT" \
   --radar-variant radar_20frames_verified_doppler_radial \
   --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" --num-workers "$WORKERS" \
@@ -63,7 +74,7 @@ fi
   --residual-weight 0 --reconstruction-weight 0 \
   --addition-weight 0 --healthy-weight 0 \
   --device cuda "${resume[@]}" \
-  2>&1 | tee "$OUT/train.log"
+  2>&1 | tee "${log_mode[@]}" "$OUT/train.log"
 
 printf 'Best checkpoint: %s\n' "$OUT/best.ckpt"
 if [[ "$EVAL" == 1 ]]; then
