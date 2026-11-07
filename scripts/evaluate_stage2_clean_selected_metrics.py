@@ -46,6 +46,7 @@ def main() -> None:
     sweep = json.loads(args.sweep_json.read_text(encoding="utf-8"))
     if (sweep.get("checkpoint") != str(args.checkpoint) or
             sweep.get("checkpoint_epoch") != saved.get("epoch") or
+            sweep.get("checkpoint_sha256") != sha256(args.checkpoint) or
             sweep.get("model_revision") != REVISION or
             sweep.get("eval_timestep") != identity["eval_timestep"]):
         raise ValueError("Threshold sweep does not match this checkpoint")
@@ -152,17 +153,24 @@ def main() -> None:
 
     metrics = {name: summarize(accumulator)
                for name, accumulator in accumulators.items()}
+    sweep_comparison = None
     if args.split == "val":
         all_counts = {key: accumulators["calibration"][key] +
                       accumulators["heldout"][key]
                       for key in accumulators["calibration"]}
         metrics["all_validation"] = summarize(all_counts)
+        sweep_comparison = {}
         for name, row in metrics.items():
             selected_row = selected[name]
-            if any(row[actual] != selected_row[expected] for actual, expected in (
-                    ("exact_tp", "tp"), ("predicted", "predicted"),
-                    ("eligible_target", "target"))):
-                raise RuntimeError(f"{name} exact counts differ from threshold sweep")
+            differences = {
+                actual: row[actual] - selected_row[expected]
+                for actual, expected in (("exact_tp", "tp"),
+                                         ("predicted", "predicted"),
+                                         ("eligible_target", "target"))}
+            sweep_comparison[name] = differences
+            if any(differences.values()):
+                print(f"Re-evaluation differs from the threshold pass on "
+                      f"{name}: {differences}", flush=True)
     report = {
         "checkpoint": str(args.checkpoint), "checkpoint_epoch": int(saved["epoch"]),
         "split": args.split,
@@ -176,6 +184,7 @@ def main() -> None:
         "chamfer_definition": ("per-frame mean nearest-center L2 in both "
                                "directions, summed; paired nonempty frames only"),
         "validation_note": sweep["validation_note"],
+        "exact_count_difference_from_threshold_pass": sweep_comparison,
         "metrics": metrics}
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")

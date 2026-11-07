@@ -54,16 +54,10 @@ common=(--vod-root "$VOD" --data-cache-root "$RAW"
 for name in best last; do
   checkpoint="$OUT/$name.ckpt"
   sweep="$OUT/threshold_sweep_clean_$name.json"
-  if [[ -s "$sweep" ]] && "$PY" -c \
-    'import json,sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); s=json.load(open(sys.argv[2],encoding="utf-8")); raise SystemExit(0 if s.get("checkpoint_epoch")==c.get("epoch") and s.get("checkpoint")==sys.argv[1] else 1)' \
-    "$checkpoint" "$sweep"; then
-    printf 'Reusing current %s threshold sweep.\n' "$name"
-  else
-    printf 'Building %s threshold sweep on every validation frame.\n' "$name"
-    "$PY" -u -m scripts.evaluate_stage2_clean_denoiser_thresholds \
-      "${common[@]}" --checkpoint "$checkpoint" --output-json "$sweep" \
-      2>&1 | tee "$OUT/threshold_sweep_clean_$name.log"
-  fi
+  printf 'Building %s threshold sweep on every validation frame.\n' "$name"
+  "$PY" -u -m scripts.evaluate_stage2_clean_denoiser_thresholds \
+    "${common[@]}" --checkpoint "$checkpoint" --output-json "$sweep" \
+    2>&1 | tee "$OUT/threshold_sweep_clean_$name.log"
   for split in val test; do
     if [[ "$split" == val ]]; then
       report="$OUT/selected_occupancy_$name.json"

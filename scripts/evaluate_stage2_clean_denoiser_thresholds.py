@@ -165,6 +165,7 @@ def main() -> None:
         for label, index in indices.items()}
     report = {
         "checkpoint": str(args.checkpoint), "checkpoint_epoch": int(saved["epoch"]),
+        "checkpoint_sha256": sha256(args.checkpoint),
         "model_revision": REVISION, "sampling": "one_step_clean_x0_at_fixed_t",
         "eval_timestep": timestep, "alpha_bar": float(alpha),
         "threshold_steps": THRESHOLD_STEPS,
