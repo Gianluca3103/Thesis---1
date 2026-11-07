@@ -25,7 +25,9 @@ from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2, cosine_alpha_bars)
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.train_stage2_clean_denoiser import (
-    MIN_RADAR_VOXELS, RADIUS_M, REVISION, _batch, _CleanRows, _rows)
+    MIN_RADAR_VOXELS, RADIUS_M, REVISION, REVERSE_REVISION,
+    _batch, _CleanRows, _rows, resolve_sampling_strategy,
+    sample_clean_latent)
 
 
 def main() -> None:
@@ -37,6 +39,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--sampling-strategy",
+                        choices=("checkpoint", "one_step", "reverse3"),
+                        default="checkpoint")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.device != "cuda" or not torch.cuda.is_available() or args.num_workers < 0:
@@ -44,8 +49,11 @@ def main() -> None:
 
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     identity = saved.get("identity")
-    if not isinstance(identity, dict) or identity.get("revision") != REVISION:
+    if not isinstance(identity, dict) or identity.get("revision") not in (
+            REVISION, REVERSE_REVISION):
         raise ValueError("Expected a clean 12-voxel/1.6 m denoiser checkpoint")
+    strategy = resolve_sampling_strategy(identity["revision"],
+                                         args.sampling_strategy)
     if identity.get("lpcr_sha256") != sha256(args.lpcr_checkpoint):
         raise ValueError("Pretrained LPCR checkpoint differs from training")
     if identity.get("radius_m") != RADIUS_M or identity.get(
@@ -126,17 +134,10 @@ def main() -> None:
             if not len(coarse):
                 continue
             x0, _ = model.lidar_encoder(clean, coarse, point_ids)
-            alpha = alpha_bars[timestep]
-            epsilon = torch.randn(x0.shape, dtype=x0.dtype,
-                                  device=args.device, generator=generator)
-            xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
-            prediction = model.diffusion(
-                xt, torch.zeros_like(x0), torch.zeros_like(x0),
-                x0.new_ones((len(x0), 1)),
-                torch.zeros(len(x0), dtype=torch.bool, device=args.device),
-                torch.full((len(rows),), timestep, device=args.device,
-                           dtype=torch.long), coarse)
-            recovered = (xt - (1 - alpha).sqrt() * prediction) / alpha.sqrt()
+            recovered = sample_clean_latent(
+                model, x0, coarse, alpha_bars, generator,
+                batch_size=len(rows), strategy=strategy,
+                eval_timestep=timestep)
             logits, _ = model.lpcr(recovered.clamp(-1, 1), hierarchy,
                                    x0.new_ones((len(fine), 1)))
             target, _, _ = offset_targets(clean, fine, point_ids)
@@ -166,12 +167,16 @@ def main() -> None:
     report = {
         "checkpoint": str(args.checkpoint), "checkpoint_epoch": int(saved["epoch"]),
         "checkpoint_sha256": sha256(args.checkpoint),
-        "model_revision": REVISION, "sampling": "one_step_clean_x0_at_fixed_t",
-        "eval_timestep": timestep, "alpha_bar": float(alpha),
+        "model_revision": identity["revision"],
+        "sampling": ("one_step_clean_x0_at_fixed_t" if strategy == "one_step"
+                     else "three_step_full_noise_DDIM"),
+        "eval_timestep": timestep if strategy == "one_step" else None,
+        "alpha_bar": (float(alpha_bars[timestep])
+                      if strategy == "one_step" else None),
         "threshold_steps": THRESHOLD_STEPS,
         "target_definition": "clean_LiDAR_occupied_voxels_within_12_radar_voxels_1p6m_gate",
-        "prediction_definition": "frozen_LPCR_occupancy_from_one_step_denoised_clean_latent",
-        "validation_note": ("All frames were used to select the checkpoint by noise MSE. "
+        "prediction_definition": "frozen_LPCR_occupancy_from_recovered_clean_latent",
+        "validation_note": ("All frames were used to select the checkpoint. "
                             "Held-out here means held out from threshold selection only, "
                             "not an independent model test set."),
         "split_rule": "one calibration block and four held-out blocks per five consecutive 20-frame blocks",

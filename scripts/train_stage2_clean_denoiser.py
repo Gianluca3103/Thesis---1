@@ -149,6 +149,54 @@ def reverse_step(xt: torch.Tensor, predicted_epsilon: torch.Tensor,
     return x0_hat, following
 
 
+def resolve_sampling_strategy(revision: str, requested: str) -> str:
+    """Pin a checkpoint's default sampler while allowing a crossed comparison."""
+    if revision not in (REVISION, REVERSE_REVISION):
+        raise ValueError("Expected an unconditioned clean denoiser checkpoint")
+    if requested not in ("checkpoint", "one_step", "reverse3"):
+        raise ValueError("Unknown clean denoiser sampling strategy")
+    if requested == "checkpoint":
+        return "one_step" if revision == REVISION else "reverse3"
+    return requested
+
+
+@torch.no_grad()
+def sample_clean_latent(model: SparseResidualStage2, x0: torch.Tensor,
+                        coarse: torch.Tensor, alpha_bars: torch.Tensor,
+                        generator: torch.Generator, *, batch_size: int,
+                        strategy: str, eval_timestep: int) -> torch.Tensor:
+    """Use the same fixed gate and decoder with either clean-noise or full-noise input."""
+    zero = torch.zeros_like(x0)
+    probability = x0.new_ones((len(x0), 1))
+    absent = torch.zeros(len(x0), dtype=torch.bool, device=x0.device)
+    if strategy == "one_step":
+        alpha = alpha_bars[eval_timestep]
+        epsilon = torch.randn(x0.shape, dtype=x0.dtype, device=x0.device,
+                              generator=generator)
+        xt = alpha.sqrt() * x0 + (1 - alpha).sqrt() * epsilon
+        prediction = model.diffusion(
+            xt, zero, zero, probability, absent,
+            torch.full((batch_size,), eval_timestep, device=x0.device,
+                       dtype=torch.long), coarse)
+        return (xt - (1 - alpha).sqrt() * prediction) / alpha.sqrt()
+    if strategy != "reverse3":
+        raise ValueError("Unknown clean denoiser sampling strategy")
+    xt = torch.randn(x0.shape, dtype=x0.dtype, device=x0.device,
+                     generator=generator)
+    schedule = reverse_schedule(3, total=len(alpha_bars)).to(x0.device)
+    for index, timestep in enumerate(schedule):
+        prediction = model.diffusion(
+            xt, zero, zero, probability, absent,
+            timestep.expand(batch_size), coarse)
+        following_alpha = (alpha_bars[schedule[index + 1]]
+                           if index + 1 < len(schedule) else None)
+        recovered, following = reverse_step(
+            xt, prediction, alpha_bars[timestep], following_alpha)
+        if following is not None:
+            xt = following
+    return recovered
+
+
 def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                optimizer: torch.optim.Optimizer | None,
                alpha_bars: torch.Tensor, *, device: str, epoch: int,

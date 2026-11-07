@@ -9,7 +9,9 @@ from models.radar_lidar_stage2.sparse_geometry import GRID
 from models.radar_lidar_stage2.sparse_residual import (
     LATENT_CHANNELS, SparseResidualStage2)
 from scripts import train_stage2_clean_denoiser as trainer
-from scripts.train_stage2_clean_denoiser import reverse_schedule, reverse_step
+from scripts.train_stage2_clean_denoiser import (
+    REVISION, REVERSE_REVISION, resolve_sampling_strategy,
+    reverse_schedule, reverse_step, sample_clean_latent)
 
 
 def test_train_and_validation_schedules_share_start_middle_and_endpoint():
@@ -18,6 +20,52 @@ def test_train_and_validation_schedules_share_start_middle_and_endpoint():
     assert train.tolist() == [999, 799, 599, 399, 199]
     assert val.tolist() == [999, 599, 199]
     assert torch.equal(train[::2], val)
+
+
+def test_crossed_sampler_uses_the_requested_timesteps():
+    class Diffusion(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.timesteps = []
+
+        def forward(self, noisy, faulty, radar, probability, present,
+                    timestep, coords):
+            self.timesteps.append(int(timestep[0]))
+            assert not faulty.any() and not radar.any()
+            return torch.zeros_like(noisy)
+
+    class Model:
+        diffusion = Diffusion()
+
+    assert resolve_sampling_strategy(REVISION, "checkpoint") == "one_step"
+    assert resolve_sampling_strategy(REVERSE_REVISION, "checkpoint") == "reverse3"
+    assert resolve_sampling_strategy(REVISION, "reverse3") == "reverse3"
+    assert resolve_sampling_strategy(REVERSE_REVISION, "one_step") == "one_step"
+    model = Model()
+    x0 = torch.full((1, 2), 0.25)
+    coarse = torch.tensor([[0, 0, 0, 0]])
+    alpha_bars = torch.linspace(0.999, 0.001, 1000)
+    generator = torch.Generator().manual_seed(3103)
+    one = sample_clean_latent(
+        model, x0, coarse, alpha_bars, generator, batch_size=1,
+        strategy="one_step", eval_timestep=499)
+    assert one.shape == x0.shape
+    assert model.diffusion.timesteps == [499]
+    model.diffusion.timesteps.clear()
+    reverse = sample_clean_latent(
+        model, x0, coarse, alpha_bars, generator, batch_size=1,
+        strategy="reverse3", eval_timestep=499)
+    assert reverse.shape == x0.shape
+    assert model.diffusion.timesteps == [999, 599, 199]
+    same_noise = torch.Generator().manual_seed(123)
+    first = sample_clean_latent(
+        model, x0, coarse, alpha_bars, same_noise, batch_size=1,
+        strategy="reverse3", eval_timestep=499)
+    same_noise = torch.Generator().manual_seed(123)
+    different_clean = sample_clean_latent(
+        model, x0 + 0.5, coarse, alpha_bars, same_noise, batch_size=1,
+        strategy="reverse3", eval_timestep=499)
+    assert torch.equal(first, different_clean)
 
 
 def test_reverse_step_recovers_clean_latent_with_exact_epsilon():
