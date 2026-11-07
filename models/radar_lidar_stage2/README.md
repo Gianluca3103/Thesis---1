@@ -54,6 +54,13 @@ It reads the already exported NPZ arrays and writes a `static_png` directory
 with eight top/side-view PNGs and a `contact_sheet.png`. These open directly
 in VS Code's image preview; rendering requires only NumPy and the Python
 standard library, with no Firefox, display server, or model inference.
+For interactive rotation on a slower desktop, run
+`scripts.make_stage2_lite_viewer --input-root "$OUT/val_samples_best_f1" --output-root "$OUT/val_samples_best_f1_lite"`.
+This reuses the already generated frame HTML, caps only the points sent to the
+browser (6,000 per cloud and 4,000 eligible-cell centers by default), and
+keeps the full counts and metrics in the viewer. The original PLY and NPZ
+files remain untouched. Open the light directory's `index.html` to rotate
+and compare the sample clouds.
 
 ## Data flow
 
