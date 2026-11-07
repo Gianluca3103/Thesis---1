@@ -7,6 +7,8 @@ conservative proxy. Unmatched candidate sites receive no ray supervision.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from scipy.spatial import cKDTree
 import torch
@@ -16,6 +18,14 @@ from models.radar_lidar_stage1.sparse import encode_keys
 
 from .sparse_batch import voxelize_means_batched
 from .sparse_geometry import GRID, Stage2Grid
+
+
+def _query_workers() -> int:
+    """CPU threads for fixed ray association; it does not alter labels."""
+    workers = int(os.environ.get("STAGE2_RAY_WORKERS", "1"))
+    if not 1 <= workers <= 32:
+        raise ValueError("STAGE2_RAY_WORKERS must be between 1 and 32")
+    return workers
 
 
 def _first_ranges(query: np.ndarray, returns: np.ndarray, *,
@@ -34,10 +44,11 @@ def _first_ranges(query: np.ndarray, returns: np.ndarray, *,
     if not len(valid):
         return first
     tree = cKDTree(returns / return_range[:, None])
-    for start in range(0, len(valid), 8192):
-        ids = valid[start:start + 8192]
+    workers = _query_workers()
+    for start in range(0, len(valid), 8192 * workers):
+        ids = valid[start:start + 8192 * workers]
         chord, index = tree.query(query[ids] / query_range[ids, None],
-                                  k=min(16, len(returns)), workers=1)
+                                  k=min(16, len(returns)), workers=workers)
         chord = np.asarray(chord).reshape(len(ids), -1)
         index = np.asarray(index).reshape(len(ids), -1)
         compatible = ((chord <= angular_chord) &

@@ -14,6 +14,7 @@ REGIONS=${REGIONS:-$DATA/stage2_mild_fog2_injector_regions_20261106}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106}
 WORKERS=${WORKERS:-2}
+RAY_WORKERS=${RAY_WORKERS:-8}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
 TRAIN_LIMIT=${TRAIN_LIMIT:-0}
@@ -34,7 +35,9 @@ mkdir -p "$OUT"
 cd "$REPO"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
+export STAGE2_RAY_WORKERS="$RAY_WORKERS"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+printf 'Ray query workers=%s; data loader workers=%s\n' "$RAY_WORKERS" "$WORKERS"
 
 resume=()
 if [[ -s "$OUT/last.ckpt" ]]; then

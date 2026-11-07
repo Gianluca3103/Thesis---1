@@ -304,6 +304,10 @@ bash scripts/run_stage2_geometry_epsilon_ray_offset_mild.sh
 
 The default full run writes a separate checkpoint and validation report under
 `stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_20261106`.
+`RAY_WORKERS=8` lets SciPy match fixed clean-return rays on eight CPU threads
+instead of one. This changes execution speed, not the ray labels or objective.
+The launcher resumes from `last.ckpt` in the same output directory, so set
+`RAY_WORKERS=4` or `8` for a resumed run if the host has spare CPU cores.
 Build the footprint sidecar with `scripts.cache_stage2_fault_regions` after
 the fixed-frame and mild-fault caches; it verifies the partial-fault outputs
 against the deterministic injector. GPU memory and speed

@@ -13,6 +13,7 @@ from models.radar_lidar_stage2.geometry_gate import geometry_gate_output, offset
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, footprint_mask, partial_azimuth_region)
 from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
+from models.radar_lidar_stage2.ray_loss import _first_ranges, addition_ray_losses
 from models.radar_lidar_stage2.sparse_geometry import GRID, select_allowed
 from models.radar_lidar_stage2.sparse_residual import (
     SparseResidualStage2, Stage2Conditions,
@@ -117,6 +118,36 @@ class GeometryGateTest(unittest.TestCase):
 
 
 class ObjectiveTest(unittest.TestCase):
+    def test_parallel_ray_queries_preserve_labels_and_gradients(self):
+        rng = np.random.default_rng(7)
+        query = rng.normal(size=(257, 3))
+        returns = rng.normal(size=(41, 3))
+        with patch.dict("os.environ", {"STAGE2_RAY_WORKERS": "1"}):
+            serial = _first_ranges(query, returns, angular_chord=0.4,
+                                   lateral_m=0.5)
+        with patch.dict("os.environ", {"STAGE2_RAY_WORKERS": "4"}):
+            parallel = _first_ranges(query, returns, angular_chord=0.4,
+                                     lateral_m=0.5)
+        np.testing.assert_allclose(serial, parallel, rtol=0, atol=0,
+                                   equal_nan=True)
+
+        fine = torch.tensor([[0, 8, 80, 20], [0, 8, 80, 25],
+                             [0, 8, 80, 30]])
+        clean = torch.tensor([[5.1, 0.1, 0.125]])
+        outputs = []
+        for workers in ("1", "4"):
+            logits = torch.zeros(3, requires_grad=True)
+            with patch.dict("os.environ", {"STAGE2_RAY_WORKERS": workers}):
+                result = addition_ray_losses(
+                    fine, logits, torch.zeros(3, dtype=torch.bool),
+                    torch.tensor([False, True, False]), clean)
+            (result["hit"] + result["extra"]).backward()
+            outputs.append((result["hit"].item(), result["extra"].item(),
+                            result["hit_rays"], result["extra_sites"],
+                            logits.grad.clone()))
+        self.assertEqual(outputs[0][:4], outputs[1][:4])
+        self.assertTrue(torch.equal(outputs[0][4], outputs[1][4]))
+
     def test_calibration_threshold_is_applied_to_heldout_counts(self):
         calibration_pos = np.array([1, 2, 7, 10], dtype=np.int64)
         calibration_neg = np.array([20, 10, 1, 0], dtype=np.int64)
