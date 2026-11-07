@@ -1,4 +1,4 @@
-"""Compare thirteen geometry-only radar support rules on mild-fault validation.
+"""Compare fourteen geometry-only radar support rules on mild-fault validation.
 
 Radar returns are deduplicated into radar voxels before neighbor counting.
 These are full Stage-II ROI gates, before the synthetic injector footprint.
@@ -29,7 +29,7 @@ from scripts.compare_radar_geometry_radii import CENTERS, SHAPE, _empty_counts, 
 
 
 RULES = tuple((count, radius) for radius, counts in ((0.8, (1, 2, 3, 4, 5)),
-                                                  (1.6, (1, 2, 3)),
+                                                  (1.6, (1, 2, 3, 10)),
                                                   (3.2, (1, 2, 3, 4, 5)))
               for count in counts)
 RULE_NAMES = tuple(f"{count}@{radius:g}m" for count, radius in RULES)
@@ -39,9 +39,9 @@ CELL_COUNT = len(CENTERS)
 
 
 def nearest_distances(radar) -> np.ndarray:
-    """Distances to the first five *distinct* radar voxel centers per ROI cell."""
+    """First five radar-voxel distances, plus the tenth inside 1.6 m."""
     radar_centers = unique_radar_voxel_centers(radar)
-    result = np.full((CELL_COUNT, 5), np.inf, dtype=np.float64)
+    result = np.full((CELL_COUNT, 6), np.inf, dtype=np.float64)
     if not len(radar_centers):
         return result
     tree = cKDTree(radar_centers)
@@ -49,14 +49,22 @@ def nearest_distances(radar) -> np.ndarray:
         stop = min(start + 65536, CELL_COUNT)
         distances, _ = tree.query(CENTERS[start:stop], k=5,
                                   distance_upper_bound=3.2 + 1e-9, workers=1)
-        result[start:stop] = distances
+        result[start:stop, :5] = distances
+    # Only cells already within five radar voxels at 1.6 m can satisfy ten.
+    eligible = np.flatnonzero(result[:, 4] <= 1.6 + 1e-9)
+    for start in range(0, len(eligible), 65536):
+        positions = eligible[start:start + 65536]
+        tenth, _ = tree.query(CENTERS[positions], k=10,
+                              distance_upper_bound=1.6 + 1e-9, workers=1)
+        result[positions, 5] = tenth[:, -1]
     return result
 
 
 def selected_mask(distances: np.ndarray, count: int, radius: float) -> np.ndarray:
-    if count not in range(1, 6) or radius <= 0:
+    if (count not in (*range(1, 6), 10) or radius <= 0 or
+            (count == 10 and radius > 1.6)):
         raise ValueError("Invalid radar rule")
-    return distances[:, count - 1] <= radius + 1e-9
+    return distances[:, 5 if count == 10 else count - 1] <= radius + 1e-9
 
 
 def flat_indices(coords) -> np.ndarray:
