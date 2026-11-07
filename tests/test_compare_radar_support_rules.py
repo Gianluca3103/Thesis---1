@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import numpy as np
@@ -50,17 +51,21 @@ def test_empty_radar_selects_nothing():
 
 def test_viewer_has_all_ten_toggles_and_escapes_payload():
     payload = {"frame_id": "<script>", "fault": "fog_sim_2",
-               "rules": [{"label": name, "candidates": 0, "missing_recall": 0}
-                         for name in RULE_NAMES], "candidates": [],
-               "membership": [], "faulty": [], "missing": [], "radar": []}
+               "rules": [{"label": name, "raw_cells": 0, "candidates": 0,
+                          "missing_recall": 0} for name in RULE_NAMES],
+               "candidate_count": 0, "packed_candidates": "",
+               "grid": {"shape": (16, 160, 160), "minimum": (0, -16, -2),
+                        "size": (0.2, 0.2, 0.25)},
+               "faulty": [], "missing": [], "radar": []}
     markup = _viewer_html(payload)
     assert "<script>" not in markup.split('id="data"')[1].split("</script>")[0]
     assert "for(let i=0;i<d.rules.length;i++)" in markup
+    assert "Every blue square" in markup
     embedded = markup.split('id="data" type="application/json">')[1].split("</script>")[0]
     assert json.loads(embedded)["rules"] == payload["rules"]
 
 
-def test_viewer_omits_observed_cells_but_keeps_missing_candidates(tmp_path):
+def test_viewer_encodes_raw_and_addition_cells(tmp_path):
     distances = np.full((len(CENTERS), 5), np.inf, dtype=np.float64)
     distances[0, 0] = distances[1, 0] = 0.5
     path = tmp_path / "sample.html"
@@ -70,11 +75,34 @@ def test_viewer_omits_observed_cells_but_keeps_missing_candidates(tmp_path):
                        distances=distances, observed_index=np.array([0]),
                        clean=torch.cat((observed, missing)), faulty=observed,
                        missing=missing, radar=_radar([(10, 0, 0)]),
-                       display_cells=100, display_points=100, seed=1)
+                       display_points=100, seed=1)
     markup = path.read_text(encoding="utf-8")
     data = json.loads(markup.split('id="data" type="application/json">')[1]
                       .split("</script>")[0])
-    assert len(data["candidates"]) == 1
+    assert data["candidate_count"] == 2
     assert data["rules"][0]["candidates"] == 1
+    assert data["rules"][0]["raw_cells"] == 2
     assert data["rules"][0]["missing_recall"] == 100
-    assert data["membership"] == [2**0 + 2**2 + 2**5]
+    packed = np.frombuffer(base64.b64decode(data["packed_candidates"]),
+                           dtype=[("index", "<u4"), ("membership", "<u2")])
+    assert packed["index"].tolist() == [0, 1]
+    assert packed["membership"].tolist() == [
+        2**0 + 2**2 + 2**5 + 2**10,
+        2**0 + 2**2 + 2**5,
+    ]
+
+
+def test_viewer_never_subsamples_eligible_cells(tmp_path):
+    distances = np.full((len(CENTERS), 5), np.inf, dtype=np.float64)
+    distances[:15001, 0] = 0.5
+    path = tmp_path / "all.html"
+    empty = torch.empty((0, 3), dtype=torch.long)
+    write_viewer_frame(path, frame_id="00002", fault="fog_sim_2",
+                       distances=distances, observed_index=np.empty(0, dtype=np.int64),
+                       clean=empty, faulty=empty, missing=empty,
+                       radar=_radar([(10, 0, 0)]), display_points=100, seed=1)
+    embedded = path.read_text(encoding="utf-8").split(
+        'id="data" type="application/json">')[1].split("</script>")[0]
+    data = json.loads(embedded)
+    assert data["candidate_count"] == 15001
+    assert len(base64.b64decode(data["packed_candidates"])) == 15001 * 6
