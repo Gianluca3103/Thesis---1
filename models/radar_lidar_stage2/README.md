@@ -37,6 +37,18 @@ validation, resuming completes that epoch's report first. Resuming from the
 old 64-frame protocol resets the best-loss comparison; subsequent
 `best.ckpt` selections use full validation loss.
 
+For qualitative geometry-baseline previews,
+`scripts.predict_stage2_sparse --html --per-fault 2 --skip-first 64`
+selects two validation examples from each cached mild-fault type after the
+first 64 frames. The viewer labels the actual cached
+fault, shows eligible voxel centers, and reports occupancy-only eligible IoU
+and IoU@0.2m for each sample alongside the reconstructed point cloud.
+After the 25-epoch batch-eight run, `scripts/run_stage2_geometry_post25.sh`
+checks that `last.ckpt` is epoch 25, sweeps 512 other validation frames
+(256 calibration and 256 held-out) using `best.ckpt`, writes eight balanced
+interactive previews, and scores the selected `best.ckpt` on all 1,296
+eligible validation frames. It performs no additional training updates.
+
 ## Data flow
 
 1. Frozen radar-only Stage I reads calibrated VoD radar and supplies a

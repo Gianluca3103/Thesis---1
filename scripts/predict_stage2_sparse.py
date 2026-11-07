@@ -29,6 +29,8 @@ from models.radar_lidar_stage2.fault_data import (
     FAULT_NAMES, FAULT_PLAN, FAULT_POLICY_VERSION, SevereFogCache,
     load_faulty, severe_fault,
 )
+from models.radar_lidar_stage2.eligible_occupancy_metrics import (
+    occupancy_counts, summarize_counts)
 from models.radar_lidar_stage2.sparse_geometry import (
     GRID, reconstruction_targets, voxelize_means,
 )
@@ -84,6 +86,24 @@ def _present_in_faulty(clean: np.ndarray, faulty: np.ndarray) -> np.ndarray:
     row_dtype = np.dtype((np.void, clean.shape[1] * np.dtype(np.float32).itemsize))
     return np.isin(clean_values.view(row_dtype).reshape(-1),
                    faulty_values.view(row_dtype).reshape(-1))
+
+
+def _sample_indices(frame_ids: list[str], fault_names: dict[str, str] | None,
+                    per_fault: int | None, limit: int, seed: int) -> list[int]:
+    rng = random.Random(seed)
+    if per_fault is None:
+        return rng.sample(range(len(frame_ids)), min(limit, len(frame_ids)))
+    if fault_names is None:
+        raise ValueError("Per-fault sampling needs cached fault labels")
+    groups: dict[str, list[int]] = {}
+    for index, frame_id in enumerate(frame_ids):
+        groups.setdefault(fault_names[frame_id], []).append(index)
+    selected = []
+    for name, indices in sorted(groups.items()):
+        if len(indices) < per_fault:
+            raise ValueError(f"Only {len(indices)} validation frames have fault {name}")
+        selected.extend(rng.sample(indices, per_fault))
+    return selected
 
 
 def _write_html(path: Path, *, frame_id: str, epoch: int, split: str,
@@ -153,21 +173,21 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:48vh;min-height:340px;
 @media(max-width:750px){.panels{display:block}section{margin-bottom:8px}canvas{height:50vh;min-height:280px}}
 </style>
 <h1 id="title"></h1><p id="note"></p><p id="counts"></p>
-<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="rotation-mode">Drag rotation <select id="rotation-mode"><option value="locked">Axis locked</option><option value="pitch">Pitch only</option><option value="yaw">Yaw only</option><option value="free">Free</option></select></label><output id="yaw-value">Yaw -37°</output><label class="pitch-control">Pitch <output id="pitch-value">20°</output><input id="pitch-angle" type="range" min="-89" max="89" step="1" value="20"></label><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label><label class="confidence" id="gate-control">Show allowed cells with Stage I probability ≥ <output id="gate-value"></output><input id="gate-confidence" type="range" max="1" step="0.01"></label></div>
+<div class="controls"><button id="zin">Zoom in</button><button id="zout">Zoom out</button><button id="reset">Reset view</button><label class="rotation-mode">Drag rotation <select id="rotation-mode"><option value="locked">Axis locked</option><option value="pitch">Pitch only</option><option value="yaw">Yaw only</option><option value="free">Free</option></select></label><output id="yaw-value">Yaw -37°</output><label class="pitch-control">Pitch <output id="pitch-value">20°</output><input id="pitch-angle" type="range" min="-89" max="89" step="1" value="20"></label><label class="camera-speed">Camera speed <output id="camera-speed-value">0.7×</output><input id="camera-speed" type="range" min="0.2" max="2" step="0.1" value="0.7"></label><label class="confidence">Reconstruction confidence ≥ <output id="confidence-value"></output><input id="confidence" type="range" max="1" step="0.01"></label><label class="confidence" id="gate-control">Show eligible cells with gate score ≥ <output id="gate-value"></output><input id="gate-confidence" type="range" max="1" step="0.01"></label></div>
 <div id="panels" class="panels"></div>
-<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction &nbsp; <span style="color:#b97ae6">●</span> Stage I allowed voxel centers (violet shade shows gate probability). Each panel has its own layer switches. The gate slider only filters displayed allowed cells; it does not change the trained gate or rerun reconstruction. The reconstruction confidence slider cannot show points below the generation threshold. Vertical drag pitches and horizontal drag yaws; the default drag mode locks to one axis. Choose Pitch only or use the Pitch slider to change elevation without yaw. Shift-drag or right-drag pans; the wheel zooms. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
+<p class="legend"><span style="color:#ffb85c">●</span> faulty input &nbsp; <span style="color:#60d796">●</span> clean reference &nbsp; <span style="color:#67b7ff">●</span> aligned radar &nbsp; <span style="color:#ff8b6c">●</span> reconstruction &nbsp; <span style="color:#b97ae6">●</span> eligible voxel centers (violet shade shows gate probability). Each panel has its own layer switches. The gate slider only filters displayed allowed cells; it does not change the trained gate or rerun reconstruction. The reconstruction confidence slider cannot show points below the generation threshold. Vertical drag pitches and horizontal drag yaws; the default drag mode locks to one axis. Choose Pitch only or use the Pitch slider to change elevation without yaw. Shift-drag or right-drag pans; the wheel zooms. All panels share one camera. PLY and NPZ contain the complete reconstruction.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} frame ${d.frame} · ${d.fault_type} · ${d.diffusion_target||'residual'} diffusion epoch ${d.epoch}`;
-const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog responses and returns below the intensity detection floor are removed. Retained input points have original clean XYZ; intensity is not a model input.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
+const explanations={total_loss:'All LiDAR returns are removed.',fov_filter:'The established FOV filter at severity 5 retains only its narrowest angular sector.',fog_sim:'Fog responses and returns below the intensity detection floor are removed. Retained input points have original clean XYZ; intensity is not a model input.',fog_sim_2:'Mild synthetic fog at severity 2 removed some LiDAR returns.',partial_loss_30:'A contiguous azimuth sector containing 30% of returns was removed.',partial_loss_40:'A contiguous azimuth sector containing 40% of returns was removed.',partial_loss_50:'A contiguous azimuth sector containing 50% of returns was removed.',real:'Pre-aligned real faulty LiDAR was loaded; its intensity column is ignored.'};
 document.getElementById('note').textContent=`${explanations[d.fault_type]} ${d.zero_residual?'Zero-residual ablation: the faulty LiDAR latent goes directly to LPCR; radar still selects the allowed region.':'The model receives faulty LiDAR and radar features; clean LiDAR is used only as the reference.'} ${d.missing_only?'The reconstructed layer contains additions only; faulty-occupied voxels are preserved from the input.':'The reconstructed layer shows the unfiltered full-cloud estimate.'}`;
-document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} Stage I allowed cells at gate probability ≥ ${d.gate_threshold==null?'unknown':Number(d.gate_threshold).toFixed(2)}; reconstruction generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
-if(d.metrics){const m=d.metrics,p=document.createElement('p'),missing=m.missing_precision==null?'':`missing-voxel precision ${m.missing_precision.toFixed(4)}, recall ${m.missing_recall.toFixed(4)}, F1 ${m.missing_f1.toFixed(4)}, `;p.textContent=`${m.metric_scope||'Metrics'}: Known IoU ${m.known_iou.toFixed(4)}, Full IoU ${m.full_iou.toFixed(4)}, ${missing}gate coverage ${m.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
+document.getElementById('counts').textContent=`${d.totals[0].toLocaleString()} faulty points, ${d.totals[1].toLocaleString()} clean reference points, ${d.totals[2].toLocaleString()} aligned radar points, ${d.totals[3].toLocaleString()} shown reconstructed points. The full estimate predicted ${d.full_estimate_cells.toLocaleString()} occupied voxels; ${d.overlap_observed_cells.toLocaleString()} coincide with faulty-occupied voxels. ${d.removed_clean_points===null?'Clean-point difference unavailable for real faulty LiDAR':`${d.removed_clean_points.toLocaleString()} clean points removed by the synthetic fault.`} ${d.allowed_cells.toLocaleString()} eligible cells at gate probability ≥ ${d.gate_threshold==null?'unknown':Number(d.gate_threshold).toFixed(2)}; reconstruction generation threshold ${d.threshold.toFixed(2)}; ${d.sampling_steps} diffusion steps.`;
+if(d.metrics){const m=d.metrics,p=document.createElement('p'),missing=m.missing_precision==null?'':`missing-voxel precision ${m.missing_precision.toFixed(4)}, recall ${m.missing_recall.toFixed(4)}, F1 ${m.missing_f1.toFixed(4)}, `,eligible=m.eligible_iou==null?'':`Eligible occupancy IoU ${m.eligible_iou.toFixed(4)}, IoU@0.2m ${m.eligible_iou_0p2m.toFixed(4)}, `;p.textContent=`${m.metric_scope||'Metrics'}: ${eligible}Known IoU ${m.known_iou.toFixed(4)}, Full IoU ${m.full_iou.toFixed(4)}, ${missing}gate coverage ${m.gate_coverage.toFixed(4)}. The display slider does not recompute these metrics.`;document.getElementById('counts').after(p);}
 const hasGate=Array.isArray(d.allowed_xyz)&&Array.isArray(d.allowed_probabilities)&&d.allowed_xyz.length===d.allowed_probabilities.length&&d.allowed_xyz.length===d.allowed_cells;
 const layers=[{key:'faulty',name:'Faulty LiDAR',color:'#ffb85c'},{key:'clean',name:'Clean LiDAR',color:'#60d796'},{key:'radar',name:'Radar',color:'#67b7ff'},{key:'predicted',name:'Reconstructed',color:'#ff8b6c'}];
-if(hasGate)layers.push({key:'allowed',name:'Stage I allowed cells',color:'#b97ae6'});
+if(hasGate)layers.push({key:'allowed',name:'Eligible cells',color:'#b97ae6'});
 const presets=[{name:'Faulty LiDAR',visible:['faulty']},{name:'Clean LiDAR',visible:['clean']},{name:'Reconstructed + radar',visible:['allowed','predicted','radar']},{name:'Faulty LiDAR + radar + reconstructed',visible:['faulty','radar','predicted']}];
 const panes=document.getElementById('panels'),panels=[];
 for(const preset of presets){const section=document.createElement('section'),h=document.createElement('h2'),switches=document.createElement('div'),canvas=document.createElement('canvas'),inputs={};switches.className='layers';h.textContent=preset.name;for(const layer of layers){const label=document.createElement('label'),input=document.createElement('input'),swatch=document.createElement('span');input.type='checkbox';input.checked=preset.visible.includes(layer.key);input.setAttribute('aria-label',`${preset.name}: ${layer.name}`);input.addEventListener('change',redraw);swatch.textContent='● ';swatch.style.color=layer.color;label.append(input,swatch,document.createTextNode(layer.name));switches.append(label);inputs[layer.key]=input;}section.append(h,switches,canvas);panes.append(section);panels.push({name:preset.name,heading:h,canvas,inputs});}
@@ -242,6 +262,10 @@ def main() -> None:
     parser.add_argument("--radar-variant", default="radar_5frames")
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--skip-first", type=int, default=0,
+                        help="Exclude the first N validation frames from preview selection")
+    parser.add_argument("--per-fault", type=int,
+                        help="Geometry baseline: sample this many frames from each mild fault; overrides --limit")
     parser.add_argument("--random-seed", type=int, default=3103)
     parser.add_argument("--sampling-steps", type=int, default=64)
     parser.add_argument("--occupancy-threshold", type=float, default=0.5)
@@ -254,7 +278,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available() or
-            args.limit < 1 or args.sampling_steps < 1 or
+            args.limit < 1 or args.sampling_steps < 1 or args.skip_first < 0 or
+            args.per_fault is not None and args.per_fault < 1 or
             not 0 < args.occupancy_threshold < 1 or
             (args.split == "test" and args.faulty_root is None) or
             (args.faulty_root is None and args.fault_cache_root is None) or
@@ -262,6 +287,8 @@ def main() -> None:
         parser.error("Inference requires CUDA, a severe fog cache for synthetic faults, and real faulty LiDAR for test")
     model, saved2 = load_stage2(args.stage2_checkpoint, args.device)
     geometry_only = saved2.get("geometry_gate_version") == GEOMETRY_GATE_VERSION
+    if args.per_fault is not None and not geometry_only:
+        parser.error("--per-fault currently supports the geometry mild-fault baseline")
     if geometry_only:
         if (args.stage1_checkpoint is not None or args.stage2_cache_root is not None
                 or args.support_cache_root is None or args.fault_region_root is None
@@ -309,6 +336,14 @@ def main() -> None:
                              data_cache_root=(args.data_cache_root
                                               if args.faulty_root is None or geometry_only
                                               else None))
+    geometry_fault_names = None
+    if geometry_only:
+        manifest = json.loads((args.faulty_root / args.split / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        frame_ids = [frame.frame_id for frame in dataset.frames]
+        if manifest.get("frame_ids") != frame_ids:
+            raise ValueError("Mild-fault manifest frame order differs from dataset")
+        geometry_fault_names = manifest["frame_faults"]
     support_cache = None
     region_cache = None
     if geometry_only:
@@ -344,8 +379,11 @@ def main() -> None:
                                                   args.split)
         cache = Stage2FixedCache(args.stage2_cache_root / args.split, expected)
         cache.check_complete()
-    indices = random.Random(args.random_seed).sample(
-        range(len(dataset)), min(args.limit, len(dataset)))
+    if args.skip_first >= len(dataset):
+        parser.error("--skip-first excludes every frame")
+    indices = [args.skip_first + index for index in _sample_indices(
+        [frame.frame_id for frame in dataset.frames[args.skip_first:]],
+        geometry_fault_names, args.per_fault, args.limit, args.random_seed)]
     args.output_root.mkdir(parents=True, exist_ok=True)
     alpha_bars = cosine_alpha_bars(device=args.device)
     summary = []
@@ -353,7 +391,8 @@ def main() -> None:
         row = dataset[index]
         frame_id = row["frame_id"]
         if args.faulty_root:
-            faulty, fault_type = load_faulty(args.faulty_root, args.split, frame_id), "real"
+            faulty = load_faulty(args.faulty_root, args.split, frame_id)
+            fault_type = (geometry_fault_names[frame_id] if geometry_only else "real")
         else:
             faulty, fault_type = severe_fault(
                 row["clean_lidar"], frame_id, 0, fog_cache,
@@ -402,7 +441,7 @@ def main() -> None:
         radar_roi = _roi(row["radar"].cpu().numpy())
         clean_roi = (_roi(row["clean_lidar"][:, :3].numpy())
                      if "clean_lidar" in row else np.empty((0, 3), dtype=np.float32))
-        synthetic = args.faulty_root is None
+        synthetic = args.faulty_root is None or geometry_only
         removed_clean_points = None
         if synthetic:
             if len(faulty_roi) > len(clean_roi):
@@ -491,6 +530,10 @@ def main() -> None:
                        "metric_scope": ("Raw full estimate" if args.full_estimate
                                         else "Faulty plus reconstructed additions"),
                        "gate_coverage": coverage}
+            if geometry_only and not args.full_estimate:
+                metrics.update(summarize_counts(occupancy_counts(
+                    predicted["occupied_coordinates"],
+                    conditions.hierarchy[0][occupied])))
             stats.update(metrics)
         if args.html:
             viewer = stem.with_suffix(".html")
