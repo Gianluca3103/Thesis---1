@@ -20,8 +20,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, bind_faulty_cache_identity,
     identity as radar_support_identity)
 from models.radar_lidar_stage2.geometry_gate import (
-    RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
-    geometry_gate_output)
+    RADIUS_M as GEOMETRY_RADIUS_M, geometry_gate_output,
+    version_for_min_radar_voxels)
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity as fault_region_identity,
     footprint_mask)
@@ -288,7 +288,11 @@ def main() -> None:
             (args.faulty_root is not None and args.fault_type != "auto")):
         parser.error("Inference requires CUDA, a severe fog cache for synthetic faults, and real faulty LiDAR for test")
     model, saved2 = load_stage2(args.stage2_checkpoint, args.device)
-    geometry_only = saved2.get("geometry_gate_version") == GEOMETRY_GATE_VERSION
+    geometry_version = saved2.get("geometry_gate_version")
+    geometry_min_radar_voxels = int(saved2.get("min_distinct_radar_voxels", 3))
+    geometry_only = (geometry_version is not None and
+                     geometry_version == version_for_min_radar_voxels(
+                         geometry_min_radar_voxels))
     if args.per_fault is not None and not geometry_only:
         parser.error("--per-fault currently supports the geometry mild-fault baseline")
     if geometry_only:
@@ -298,7 +302,7 @@ def main() -> None:
                 or args.split == "test"):
             parser.error("Geometry baseline needs mild faults, injector footprints and support; train/val only")
         stage1 = None
-        saved1 = {"version": GEOMETRY_GATE_VERSION,
+        saved1 = {"version": geometry_version,
                   "radar_variant": args.radar_variant}
     elif args.stage1_checkpoint is None:
         parser.error("This Stage-II checkpoint requires --stage1-checkpoint")
@@ -352,7 +356,8 @@ def main() -> None:
         expected = radar_support_identity(
             args.split, [frame.frame_id for frame in dataset.frames],
             args.radar_variant, data_cache_root=args.data_cache_root,
-            radius_m=GEOMETRY_RADIUS_M)
+            radius_m=GEOMETRY_RADIUS_M,
+            min_radar_voxels=geometry_min_radar_voxels)
         support_cache = RadarSupportCache(args.support_cache_root / args.split,
                                           expected)
         support_cache.check_complete()
@@ -405,7 +410,8 @@ def main() -> None:
             radar = row["radar"].to(args.device)
             output = (geometry_gate_output(
                 radar, faulty, region_cache.get(frame_id),
-                support_cache.load(frame_id)) if geometry_only else
+                support_cache.load(frame_id),
+                geometry_min_radar_voxels) if geometry_only else
                 stage1_frame(stage1, radar, float(saved1.get("radius_m", saved1.get(
                     "support_radius_m", 3.2))), faulty=faulty))
             targets = None

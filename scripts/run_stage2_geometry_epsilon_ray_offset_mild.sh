@@ -16,6 +16,7 @@ OUT=${OUT:-$DATA/stage2_geometry1p6m_injector_region_epsilon_ray_offset_mild_bat
 WORKERS=${WORKERS:-2}
 RAY_WORKERS=${RAY_WORKERS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
+MIN_RADAR_VOXELS=${MIN_RADAR_VOXELS:-3}
 RAY_LABELS=${RAY_LABELS:-}
 EPOCHS=${EPOCHS:-25}
 VAL_LIMIT=${VAL_LIMIT:-64}
@@ -42,8 +43,8 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
 export STAGE2_RAY_WORKERS="$RAY_WORKERS"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-printf 'GPU batch size=%s; ray query workers=%s; data loader workers=%s\n' \
-  "$BATCH_SIZE" "$RAY_WORKERS" "$WORKERS"
+printf 'GPU batch size=%s; min radar voxels=%s at 1.6 m; ray query workers=%s; data loader workers=%s\n' \
+  "$BATCH_SIZE" "$MIN_RADAR_VOXELS" "$RAY_WORKERS" "$WORKERS"
 
 resume=()
 log_mode=()
@@ -78,6 +79,7 @@ fi
 
 "$PY" -u -m scripts.train_stage2_sparse \
   --phase diffusion --diffusion-target epsilon --ray-offset-baseline \
+  --geometry-min-radar-voxels "$MIN_RADAR_VOXELS" \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --faulty-root "$MILD" --support-cache-root "$SUPPORT" \
   --fault-region-root "$REGIONS" "${ray_args[@]}" \

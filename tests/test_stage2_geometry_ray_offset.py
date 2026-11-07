@@ -8,8 +8,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from models.radar_lidar_crossmodal_v1.radar_pruner import SHAPE
-from models.radar_lidar_stage2.geometry_gate import geometry_gate_output, offset_targets
+from models.radar_lidar_crossmodal_v1.radar_pruner import SHAPE, radar_support_mask
+from models.radar_lidar_stage2.geometry_gate import (
+    VERSION, geometry_gate_output, offset_targets,
+    version_for_min_radar_voxels,
+)
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, footprint_mask, partial_azimuth_region)
 from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
@@ -24,6 +27,26 @@ from scripts.train_stage2_sparse import _combine_conditions, _combine_points
 
 
 class GeometryGateTest(unittest.TestCase):
+    def test_twelve_voxel_gate_has_separate_checkpoint_version(self):
+        self.assertEqual(version_for_min_radar_voxels(3), VERSION)
+        self.assertNotEqual(version_for_min_radar_voxels(12), VERSION)
+        with self.assertRaises(ValueError):
+            version_for_min_radar_voxels(5)
+
+    def test_twelve_voxel_gate_emits_only_supported_cells(self):
+        radar = torch.zeros((12, 7), dtype=torch.float32)
+        radar[:, 0] = torch.tensor([10.05 + 0.2 * i for i in range(12)])
+        radar[:, 1:3] = 0.05
+        support = radar_support_mask(radar, 1.6, 12)
+        output = geometry_gate_output(
+            radar, torch.empty((0, 3)), {"kind": "full_scan"},
+            min_radar_voxels=12)
+        fine, _ = select_allowed(output["confidence_coords"],
+                                 output["confidence_probabilities"], 0.5)
+        self.assertEqual(len(fine), int(support.sum()))
+        chosen = fine[:, 1:].numpy()
+        self.assertTrue(support[chosen[:, 0], chosen[:, 1], chosen[:, 2]].all())
+
     def test_only_supported_unobserved_cells_are_selected(self):
         mask = np.zeros(SHAPE, dtype=bool)
         mask[8, 80, 80:83] = True

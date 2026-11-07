@@ -19,7 +19,8 @@ from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity as fault_region_identity)
 from models.radar_lidar_stage2.geometry_gate import (
-    RADIUS_M, VERSION, geometry_gate_output, offset_targets)
+    RADIUS_M, geometry_gate_output, offset_targets,
+    version_for_min_radar_voxels)
 from models.radar_lidar_stage2.sparse_geometry import GRID, voxelize_means
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_io import load_stage2, sha256
@@ -100,7 +101,8 @@ def main() -> None:
             or args.limit < 2 or args.sampling_steps < 1 or args.bins < 16):
         parser.error("Evaluation requires CUDA, at least two frames and valid bins/steps")
     model, saved = load_stage2(args.checkpoint, args.device)
-    if (saved.get("geometry_gate_version") != VERSION
+    min_radar_voxels = int(saved.get("min_distinct_radar_voxels", 3))
+    if (saved.get("geometry_gate_version") != version_for_min_radar_voxels(min_radar_voxels)
             or not saved.get("ray_offset_baseline")
             or saved.get("radius_m") != RADIUS_M):
         raise ValueError("Expected the 1.6 m geometry epsilon/ray/offset checkpoint")
@@ -119,7 +121,8 @@ def main() -> None:
         raise ValueError("Support cache differs from checkpoint")
     expected = support_identity("val", frame_ids, variant,
                                 data_cache_root=args.data_cache_root,
-                                radius_m=RADIUS_M)
+                                radius_m=RADIUS_M,
+                                min_radar_voxels=min_radar_voxels)
     support = RadarSupportCache(args.support_cache_root / "val", expected)
     support.check_complete()
     region_expected = fault_region_identity(
@@ -155,7 +158,8 @@ def main() -> None:
         faulty = load_faulty(args.faulty_root, "val", frame_id).to(args.device)
         clean = row["clean_lidar"][:, :3].to(args.device)
         mask = support.load(frame_id)
-        output = geometry_gate_output(radar, faulty, regions.get(frame_id), mask)
+        output = geometry_gate_output(radar, faulty, regions.get(frame_id), mask,
+                                      min_radar_voxels)
         conditions = model.conditions(output, float(saved["gate_threshold"]))
         fine = conditions.hierarchy[0]
         clean_coords, _ = voxelize_means(clean, grid=GRID)
@@ -195,6 +199,7 @@ def main() -> None:
                       calibration["eligible_target"])
     report = {"checkpoint": str(args.checkpoint), "checkpoint_epoch": saved["epoch"],
               "objective": saved["diffusion_objective"], "radar_variant": variant,
+              "min_distinct_radar_voxels": min_radar_voxels,
               "sampling_steps": args.sampling_steps, "histogram_bins": args.bins,
               "injector_footprint_oracle": True,
               "model_selection_frames_excluded": 64,

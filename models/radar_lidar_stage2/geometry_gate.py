@@ -19,11 +19,21 @@ from .sparse_geometry import GRID, voxelize_means
 
 VERSION = "stage2_geometry_3radarvox_1p6m_injector_region_v2"
 RADIUS_M = 1.6
+MIN_RADAR_VOXELS = 3
+
+
+def version_for_min_radar_voxels(min_radar_voxels: int) -> str:
+    if min_radar_voxels == 3:
+        return VERSION
+    if min_radar_voxels == 12:
+        return "stage2_geometry_12radarvox_1p6m_injector_region_v1"
+    raise ValueError("Geometry Stage II supports 3 or 12 distinct radar voxels")
 
 
 def geometry_gate_output(radar: torch.Tensor, faulty_xyz: torch.Tensor,
                          region: dict,
-                         support_mask: np.ndarray | None = None) -> dict:
+                         support_mask: np.ndarray | None = None,
+                         min_radar_voxels: int = MIN_RADAR_VOXELS) -> dict:
     """Supported cells inside the injector footprint, excluding observed cells.
 
     Radar features are simple pooled measurements on the old stride-8 grid.
@@ -34,8 +44,9 @@ def geometry_gate_output(radar: torch.Tensor, faulty_xyz: torch.Tensor,
         raise ValueError("Geometry gate requires radar [N,7] and faulty LiDAR XYZ")
     if radar.device != faulty_xyz.device:
         raise ValueError("Radar and faulty LiDAR must share a device")
+    version_for_min_radar_voxels(min_radar_voxels)
     if support_mask is None:
-        support_mask = radar_support_mask(radar, RADIUS_M)
+        support_mask = radar_support_mask(radar, RADIUS_M, min_radar_voxels)
     fine = supported_coordinates(support_mask, radar.device)
     fine = torch.cat((torch.zeros((len(fine), 1), device=radar.device,
                                   dtype=torch.long), fine), dim=1)

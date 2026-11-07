@@ -17,12 +17,18 @@ from .radar_pruner import (CELL_COUNT, SHAPE, SUPPORT_MIN_VOXELS,
 
 def identity(split: str, frame_ids: list[str], radar_variant: str,
              *, data_cache_root: Path | None = None,
-             radius_m: float = SUPPORT_RADIUS_M) -> dict:
-    result = {"version": version_for_radius(radius_m) + "_support_cache_v1",
+             radius_m: float = SUPPORT_RADIUS_M,
+             min_radar_voxels: int = SUPPORT_MIN_VOXELS) -> dict:
+    if isinstance(min_radar_voxels, bool) or not isinstance(min_radar_voxels, int) or min_radar_voxels < 1:
+        raise ValueError("Minimum distinct radar voxels must be a positive integer")
+    radius_version = version_for_radius(radius_m)
+    version = (radius_version if min_radar_voxels == SUPPORT_MIN_VOXELS else
+               radius_version.replace("radar3vox", f"radar{min_radar_voxels}vox"))
+    result = {"version": version + "_support_cache_v1",
             "split": split,
             "frame_ids": frame_ids, "radar_variant": radar_variant,
             "grid": asdict(GRID), "radius_m": radius_m,
-            "min_distinct_radar_voxels": SUPPORT_MIN_VOXELS}
+            "min_distinct_radar_voxels": min_radar_voxels}
     if data_cache_root is not None:
         manifest = Path(data_cache_root) / split / "manifest.json"
         result["fixed_frame_manifest_sha256"] = hashlib.sha256(

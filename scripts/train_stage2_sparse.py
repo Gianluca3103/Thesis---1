@@ -31,8 +31,8 @@ from models.radar_lidar_stage2.full_lpcr import full_region_training_conditions
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity as fault_region_identity)
 from models.radar_lidar_stage2.geometry_gate import (
-    RADIUS_M as GEOMETRY_RADIUS_M, VERSION as GEOMETRY_GATE_VERSION,
-    geometry_gate_output)
+    RADIUS_M as GEOMETRY_RADIUS_M, geometry_gate_output,
+    version_for_min_radar_voxels)
 from models.radar_lidar_stage2.lpcr_eval import evaluate_full_region
 from models.radar_lidar_stage2.ray_label_cache import (
     RayLabelCache, identity as ray_label_identity)
@@ -156,7 +156,7 @@ def _epoch(model, stage1, fixed_cache, fog_cache, loader, optimizer, args, epoch
                         with torch.no_grad():
                             output = geometry_gate_output(
                                 radar, stage1_faulty.to(args.device), region,
-                                support)
+                                support, args.geometry_min_radar_voxels)
                         targets = None
                     elif fixed_cache is not None:
                         output = {key: value.to(args.device, non_blocking=True)
@@ -354,9 +354,12 @@ def main() -> None:
     parser.add_argument("--stage1-checkpoint", type=Path,
                         help="Required only for radar-conditioned diffusion")
     parser.add_argument("--ray-offset-baseline", action="store_true",
-                        help="Fixed 3-radar-voxel/1.6 m gate; epsilon MSE, rays, offsets only")
+                        help="Fixed radar-voxel/1.6 m gate; epsilon MSE, rays, offsets only")
+    parser.add_argument("--geometry-min-radar-voxels", type=int,
+                        choices=(3, 12), default=3,
+                        help="Distinct radar voxels within 1.6 m for the geometry baseline")
     parser.add_argument("--support-cache-root", type=Path,
-                        help="Precomputed 3-radar-voxel/1.6 m support masks")
+                        help="Precomputed radar-voxel/1.6 m support masks")
     parser.add_argument("--fault-region-root", type=Path,
                         help="Cached synthetic injector footprint; required for geometry baseline")
     parser.add_argument("--ray-label-cache-root", type=Path,
@@ -418,6 +421,7 @@ def main() -> None:
                 args.addition_weight, args.healthy_weight,
                 args.ray_hit_weight, args.ray_extra_weight) < 0 or
             args.phase == "lpcr" and args.diffusion_target != "residual" or
+            not args.ray_offset_baseline and args.geometry_min_radar_voxels != 3 or
             args.ray_angular_tolerance_deg <= 0 or
             args.ray_lateral_tolerance_m <= 0 or
             args.ray_range_margin_m is not None and args.ray_range_margin_m < 0 or
@@ -457,7 +461,8 @@ def main() -> None:
         radius_m = None
     elif args.ray_offset_baseline:
         stage1 = None
-        stage1_saved = {"version": GEOMETRY_GATE_VERSION,
+        stage1_saved = {"version": version_for_min_radar_voxels(
+                            args.geometry_min_radar_voxels),
                         "radar_variant": args.radar_variant}
         radius_m = GEOMETRY_RADIUS_M
     elif args.stage2_cache_root:
@@ -504,7 +509,8 @@ def main() -> None:
                 "radar_variant": (args.radar_variant if args.phase == "diffusion" else None),
                 "gate_threshold": (args.gate_threshold if args.phase == "diffusion" else None),
                 "radius_m": radius_m,
-                "geometry_gate_version": (GEOMETRY_GATE_VERSION
+                "geometry_gate_version": (version_for_min_radar_voxels(
+                                              args.geometry_min_radar_voxels)
                                           if args.ray_offset_baseline else None),
                 "lpcr_sites_per_frame": (args.lpcr_sites_per_frame
                                           if args.phase == "lpcr" else None),
@@ -540,7 +546,7 @@ def main() -> None:
                              "epsilon_shared_timestep_per_batch": True})
         if args.ray_offset_baseline:
             identity.update({"ray_offset_baseline": True,
-                             "min_distinct_radar_voxels": 3,
+                             "min_distinct_radar_voxels": args.geometry_min_radar_voxels,
                              "observed_faulty_cells_excluded": True,
                              "untouched_injector_region_excluded": True,
                              "healthy_region_loss_enabled": False,
@@ -617,7 +623,8 @@ def main() -> None:
             expected = radar_support_identity(
                 split, [frame.frame_id for frame in dataset.frames],
                 args.radar_variant, data_cache_root=args.data_cache_root,
-                radius_m=GEOMETRY_RADIUS_M)
+                radius_m=GEOMETRY_RADIUS_M,
+                min_radar_voxels=args.geometry_min_radar_voxels)
             cache = RadarSupportCache(args.support_cache_root / split, expected)
             cache.check_complete()
             args.support_caches[split] = cache
@@ -721,7 +728,8 @@ def main() -> None:
                 fault_names=args.fault_names["val"], alpha_bars=alpha_bars,
                 gate_threshold=args.gate_threshold,
                 occupancy_threshold=args.full_val_occupancy_threshold,
-                sampling_steps=args.full_val_sampling_steps, device=args.device)
+                sampling_steps=args.full_val_sampling_steps, device=args.device,
+                min_radar_voxels=args.geometry_min_radar_voxels)
             report["epoch"] = epoch_number
             temporary = report_path.with_name(
                 report_path.name + f".{os.getpid()}.tmp")

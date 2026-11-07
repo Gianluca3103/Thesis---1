@@ -35,6 +35,31 @@ def test_three_distinct_voxels_and_exact_radius():
     assert bool(mask[coords[:, 0], coords[:, 1], coords[:, 2]].all())
 
 
+def test_twelve_voxel_support_has_distinct_cache_identity():
+    radar = _radar([(10.05 + 0.2 * i, 0.05, 0.05) for i in range(12)])
+    three = radar_support_mask(radar, 1.6)
+    twelve = radar_support_mask(radar, 1.6, 12)
+    assert twelve.any() and twelve.sum() < three.sum()
+    assert bool((~twelve | three).all())
+    old_identity = identity("val", ["00001"], "radar20", radius_m=1.6)
+    new_identity = identity("val", ["00001"], "radar20", radius_m=1.6,
+                            min_radar_voxels=12)
+    assert old_identity["min_distinct_radar_voxels"] == 3
+    assert new_identity["min_distinct_radar_voxels"] == 12
+    assert old_identity["version"] != new_identity["version"]
+
+
+def test_single_voxel_support_and_invalid_minimum():
+    radar = _radar([(10.0, 0.0, 0.0)])
+    assert radar_support_mask(radar, 1.6, 1).any()
+    try:
+        radar_support_mask(radar, 1.6, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Zero radar voxels should be rejected")
+
+
 def test_radar_outside_roi_can_support_boundary_voxel():
     radar = _radar([(10.0, 0.0, 4.5), (10.4, 0.0, 4.5),
                     (10.8, 0.0, 4.5)])

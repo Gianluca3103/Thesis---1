@@ -76,21 +76,25 @@ def version_for_radius(radius_m: float) -> str:
 
 
 def radar_support_mask(radar_xyz: torch.Tensor | np.ndarray,
-                       radius_m: float = SUPPORT_RADIUS_M) -> np.ndarray:
-    """True where >=3 distinct radar voxel centres lie within radius_m."""
+                       radius_m: float = SUPPORT_RADIUS_M,
+                       min_radar_voxels: int = SUPPORT_MIN_VOXELS) -> np.ndarray:
+    """True where enough distinct radar voxel centres lie within radius_m."""
     if not math.isfinite(radius_m) or radius_m <= 0:
         raise ValueError("Radar support radius must be positive and finite")
+    if isinstance(min_radar_voxels, bool) or not isinstance(min_radar_voxels, int) or min_radar_voxels < 1:
+        raise ValueError("Minimum distinct radar voxels must be a positive integer")
     radar_centers = unique_radar_voxel_centers(radar_xyz)
-    if len(radar_centers) < SUPPORT_MIN_VOXELS:
+    if len(radar_centers) < min_radar_voxels:
         return np.zeros(SHAPE, dtype=np.bool_)
     tree = cKDTree(radar_centers)
     mask = np.empty(CELL_COUNT, dtype=np.bool_)
     for start in range(0, CELL_COUNT, 65536):
         stop = min(start + 65536, CELL_COUNT)
-        distance, _ = tree.query(_CENTERS[start:stop], k=SUPPORT_MIN_VOXELS,
+        distance, _ = tree.query(_CENTERS[start:stop], k=min_radar_voxels,
                                  distance_upper_bound=radius_m + 1e-9,
                                  workers=1)
-        mask[start:stop] = distance[:, -1] <= radius_m + 1e-9
+        kth = distance if min_radar_voxels == 1 else distance[:, -1]
+        mask[start:stop] = kth <= radius_m + 1e-9
     return mask.reshape(SHAPE)
 
 

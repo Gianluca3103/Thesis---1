@@ -14,7 +14,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 from models.radar_lidar_stage2.eligible_validation import evaluate_all_eligible
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity as region_identity)
-from models.radar_lidar_stage2.geometry_gate import RADIUS_M, VERSION
+from models.radar_lidar_stage2.geometry_gate import (
+    RADIUS_M, version_for_min_radar_voxels)
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_io import load_stage2, sha256
 
@@ -38,7 +39,8 @@ def main() -> None:
         parser.error("Evaluation requires CUDA and valid diffusion settings")
 
     model, saved = load_stage2(args.checkpoint, args.device)
-    if (saved.get("geometry_gate_version") != VERSION
+    min_radar_voxels = int(saved.get("min_distinct_radar_voxels", 3))
+    if (saved.get("geometry_gate_version") != version_for_min_radar_voxels(min_radar_voxels)
             or not saved.get("ray_offset_baseline")
             or saved.get("radius_m") != RADIUS_M):
         raise ValueError("Expected the 1.6 m geometry-only Stage II checkpoint")
@@ -61,7 +63,8 @@ def main() -> None:
         args.support_cache_root / "val",
         support_identity("val", frame_ids, saved["radar_variant"],
                          data_cache_root=args.data_cache_root,
-                         radius_m=RADIUS_M))
+                         radius_m=RADIUS_M,
+                         min_radar_voxels=min_radar_voxels))
     support.check_complete()
     regions = FaultRegionCache(
         args.fault_region_root / "val",
@@ -76,9 +79,11 @@ def main() -> None:
         alpha_bars=cosine_alpha_bars(device=args.device),
         gate_threshold=float(saved["gate_threshold"]),
         occupancy_threshold=args.occupancy_threshold,
-        sampling_steps=args.sampling_steps, device=args.device)
+        sampling_steps=args.sampling_steps, device=args.device,
+        min_radar_voxels=min_radar_voxels)
     report.update({"checkpoint": str(args.checkpoint),
-                   "checkpoint_epoch": int(saved["epoch"])})
+                   "checkpoint_epoch": int(saved["epoch"]),
+                   "min_distinct_radar_voxels": min_radar_voxels})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Epoch {saved['epoch']}, {report['frames']} validation frames: "

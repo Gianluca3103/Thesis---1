@@ -30,6 +30,8 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
+    parser.add_argument("--geometry-min-radar-voxels", type=int,
+                        choices=(3, 12), default=3)
     parser.add_argument("--fault-region-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant",
@@ -66,7 +68,8 @@ def main() -> None:
             args.support_cache_root / split,
             support_identity(split, ids, args.radar_variant,
                              data_cache_root=args.data_cache_root,
-                             radius_m=RADIUS_M))
+                             radius_m=RADIUS_M,
+                             min_radar_voxels=args.geometry_min_radar_voxels))
         support.check_complete()
         regions = FaultRegionCache(
             args.fault_region_root / split,
@@ -102,7 +105,8 @@ def main() -> None:
             faulty = load_faulty(args.faulty_root, split, frame_id).to(args.device)
             with torch.no_grad():
                 output = geometry_gate_output(
-                    radar, faulty, regions.get(frame_id), support.load(frame_id))
+                    radar, faulty, regions.get(frame_id), support.load(frame_id),
+                    args.geometry_min_radar_voxels)
                 fine, _ = select_allowed(
                     output["confidence_coords"],
                     output["confidence_probabilities"], args.gate_threshold)

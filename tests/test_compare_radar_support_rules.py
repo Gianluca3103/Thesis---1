@@ -73,6 +73,9 @@ def test_extra_radar_voxel_distances_match_direct_query():
         CENTERS[sample], k=(6, 8, 10, 12),
         distance_upper_bound=1.6 + 1e-9)
     np.testing.assert_allclose(distance[sample, 5:], direct)
+    np.testing.assert_array_equal(
+        selected_mask(distance, 12, 1.6),
+        radar_support_mask(radar, 1.6, 12).ravel())
     with pytest.raises(ValueError, match="Invalid radar rule"):
         selected_mask(distance, 12, 3.2)
 

@@ -26,7 +26,7 @@ def evaluate_all_eligible(model, dataset, *, faulty_root: Path, support_cache,
                           region_cache, fault_names: dict[str, str],
                           alpha_bars: torch.Tensor, gate_threshold: float,
                           occupancy_threshold: float, sampling_steps: int,
-                          device: str) -> dict:
+                          device: str, min_radar_voxels: int = 3) -> dict:
     """Micro IoU over all gated missing-clean voxels, using sampled occupancy."""
     if (not 0 < occupancy_threshold < 1 or sampling_steps < 1
             or sampling_steps > len(alpha_bars)):
@@ -49,7 +49,7 @@ def evaluate_all_eligible(model, dataset, *, faulty_root: Path, support_cache,
             clean = row["clean_lidar"][:, :3].to(device)
             output = geometry_gate_output(
                 radar, faulty, region_cache.get(frame_id),
-                support_cache.load(frame_id))
+                support_cache.load(frame_id), min_radar_voxels)
             conditions = model.conditions(output, gate_threshold)
             fine = conditions.hierarchy[0]
             candidate_cells += len(fine)
