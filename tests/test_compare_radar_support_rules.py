@@ -1,4 +1,4 @@
-"""Fourteen-rule geometry comparison and toggleable viewer invariants."""
+"""Seventeen-rule geometry comparison and toggleable viewer invariants."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner import (
 )
 from scripts.compare_radar_geometry_radii import CENTERS
 from scripts.compare_radar_support_rules import (
-    OBSERVED_BIT, RULES, RULE_NAMES, _viewer_html, nearest_distances, selected_mask,
+    NEAREST_COUNTS, OBSERVED_BIT, RULES, RULE_NAMES,
+    _viewer_html, nearest_distances, selected_mask,
     write_viewer_frame,
 )
 
@@ -29,14 +30,16 @@ def _radar(points):
 
 def test_distinct_voxels_and_nested_rules():
     assert RULE_NAMES[:5] == tuple(f"{count}@0.8m" for count in range(1, 6))
-    assert len(RULES) == 14
+    assert len(RULES) == 17
+    assert NEAREST_COUNTS == (1, 2, 3, 4, 5, 6, 8, 10, 12)
     assert OBSERVED_BIT == 1 << len(RULES)
     radar = _radar([(10.0, 0, 0)] * 4 + [(10.6, 0, 0), (11.2, 0, 0)])
     distance = nearest_distances(radar)
     assert np.isinf(distance[:, 3:]).all()
     masks = {name: selected_mask(distance, count, radius)
              for name, (count, radius) in zip(RULE_NAMES, RULES)}
-    for radius, counts in ((0.8, (1, 2, 3, 4, 5)), (1.6, (1, 2, 3, 10)),
+    for radius, counts in ((0.8, (1, 2, 3, 4, 5)),
+                           (1.6, (1, 2, 3, 6, 8, 10, 12)),
                            (3.2, (1, 2, 3, 4, 5))):
         for small, large in zip(counts, counts[1:]):
             assert np.all(~masks[f"{large}@{radius:g}m"] |
@@ -56,23 +59,25 @@ def test_empty_radar_selects_nothing():
                    for count, radius in RULES)
 
 
-def test_tenth_radar_voxel_distance_matches_direct_query():
-    radar = _radar([(10.05 + 0.2 * i, 0.05, 0.05) for i in range(10)])
+def test_extra_radar_voxel_distances_match_direct_query():
+    radar = _radar([(10.05 + 0.2 * i, 0.05, 0.05) for i in range(12)])
     radar_centers = unique_radar_voxel_centers(radar)
-    assert len(radar_centers) == 10
+    assert len(radar_centers) == 12
     distance = nearest_distances(radar)
-    ten_mask = selected_mask(distance, 10, 1.6)
-    assert ten_mask.any()
-    assert np.all(~ten_mask | selected_mask(distance, 5, 1.6))
+    for count in (6, 8, 10, 12):
+        mask = selected_mask(distance, count, 1.6)
+        assert mask.any()
+        assert np.all(~mask | selected_mask(distance, 5, 1.6))
     sample = np.flatnonzero(selected_mask(distance, 5, 1.6))[:1000]
     direct, _ = cKDTree(radar_centers).query(
-        CENTERS[sample], k=10, distance_upper_bound=1.6 + 1e-9)
-    np.testing.assert_allclose(distance[sample, 5], direct[:, -1])
+        CENTERS[sample], k=(6, 8, 10, 12),
+        distance_upper_bound=1.6 + 1e-9)
+    np.testing.assert_allclose(distance[sample, 5:], direct)
     with pytest.raises(ValueError, match="Invalid radar rule"):
-        selected_mask(distance, 10, 3.2)
+        selected_mask(distance, 12, 3.2)
 
 
-def test_viewer_has_all_fourteen_toggles_and_escapes_payload():
+def test_viewer_has_all_seventeen_toggles_and_escapes_payload():
     payload = {"frame_id": "<script>", "fault": "fog_sim_2",
                "rules": [{"label": name, "raw_cells": 0, "candidates": 0,
                           "missing_recall": 0} for name in RULE_NAMES],
@@ -90,7 +95,8 @@ def test_viewer_has_all_fourteen_toggles_and_escapes_payload():
 
 
 def test_viewer_encodes_raw_and_addition_cells(tmp_path):
-    distances = np.full((len(CENTERS), 6), np.inf, dtype=np.float64)
+    distances = np.full((len(CENTERS), len(NEAREST_COUNTS)), np.inf,
+                        dtype=np.float64)
     distances[0, 0] = distances[1, 0] = 0.5
     path = tmp_path / "sample.html"
     observed = torch.tensor([[0, 0, 0]])
@@ -108,17 +114,18 @@ def test_viewer_encodes_raw_and_addition_cells(tmp_path):
     assert data["rules"][0]["raw_cells"] == 2
     assert data["rules"][0]["missing_recall"] == 100
     packed = np.frombuffer(base64.b64decode(data["packed_candidates"]),
-                           dtype=[("index", "<u4"), ("membership", "<u2")])
+                           dtype=[("index", "<u4"), ("membership", "<u4")])
     assert packed["index"].tolist() == [0, 1]
     assert packed["membership"].tolist() == [
-        2**0 + 2**5 + 2**9 + OBSERVED_BIT,
-        2**0 + 2**5 + 2**9,
+        2**0 + 2**5 + 2**12 + OBSERVED_BIT,
+        2**0 + 2**5 + 2**12,
     ]
     assert not any(value & OBSERVED_BIT for value in packed["membership"][1:])
 
 
 def test_viewer_never_subsamples_eligible_cells(tmp_path):
-    distances = np.full((len(CENTERS), 6), np.inf, dtype=np.float64)
+    distances = np.full((len(CENTERS), len(NEAREST_COUNTS)), np.inf,
+                        dtype=np.float64)
     distances[:15001, 0] = 0.5
     path = tmp_path / "all.html"
     empty = torch.empty((0, 3), dtype=torch.long)
@@ -130,4 +137,4 @@ def test_viewer_never_subsamples_eligible_cells(tmp_path):
         'id="data" type="application/json">')[1].split("</script>")[0]
     data = json.loads(embedded)
     assert data["candidate_count"] == 15001
-    assert len(base64.b64decode(data["packed_candidates"])) == 15001 * 6
+    assert len(base64.b64decode(data["packed_candidates"])) == 15001 * 8

@@ -1,4 +1,4 @@
-"""Compare fourteen geometry-only radar support rules on mild-fault validation.
+"""Compare seventeen geometry-only radar support rules on mild-fault validation.
 
 Radar returns are deduplicated into radar voxels before neighbor counting.
 These are full Stage-II ROI gates, before the synthetic injector footprint.
@@ -29,19 +29,22 @@ from scripts.compare_radar_geometry_radii import CENTERS, SHAPE, _empty_counts, 
 
 
 RULES = tuple((count, radius) for radius, counts in ((0.8, (1, 2, 3, 4, 5)),
-                                                  (1.6, (1, 2, 3, 10)),
+                                                  (1.6, (1, 2, 3, 6, 8, 10, 12)),
                                                   (3.2, (1, 2, 3, 4, 5)))
               for count in counts)
 RULE_NAMES = tuple(f"{count}@{radius:g}m" for count, radius in RULES)
 OBSERVED_BIT = 1 << len(RULES)
-assert OBSERVED_BIT < 1 << 16
+assert OBSERVED_BIT < 1 << 31
+NEAREST_COUNTS = (1, 2, 3, 4, 5, 6, 8, 10, 12)
+NEAREST_COLUMN = {count: column for column, count in enumerate(NEAREST_COUNTS)}
+TAIL_COUNTS = NEAREST_COUNTS[5:]
 CELL_COUNT = len(CENTERS)
 
 
 def nearest_distances(radar) -> np.ndarray:
-    """First five radar-voxel distances, plus the tenth inside 1.6 m."""
+    """First five radar-voxel distances, plus 6/8/10/12 inside 1.6 m."""
     radar_centers = unique_radar_voxel_centers(radar)
-    result = np.full((CELL_COUNT, 6), np.inf, dtype=np.float64)
+    result = np.full((CELL_COUNT, len(NEAREST_COUNTS)), np.inf, dtype=np.float64)
     if not len(radar_centers):
         return result
     tree = cKDTree(radar_centers)
@@ -50,21 +53,21 @@ def nearest_distances(radar) -> np.ndarray:
         distances, _ = tree.query(CENTERS[start:stop], k=5,
                                   distance_upper_bound=3.2 + 1e-9, workers=1)
         result[start:stop, :5] = distances
-    # Only cells already within five radar voxels at 1.6 m can satisfy ten.
+    # Only cells already within five radar voxels at 1.6 m can satisfy 6–12.
     eligible = np.flatnonzero(result[:, 4] <= 1.6 + 1e-9)
     for start in range(0, len(eligible), 65536):
         positions = eligible[start:start + 65536]
-        tenth, _ = tree.query(CENTERS[positions], k=10,
-                              distance_upper_bound=1.6 + 1e-9, workers=1)
-        result[positions, 5] = tenth[:, -1]
+        tail, _ = tree.query(CENTERS[positions], k=TAIL_COUNTS,
+                             distance_upper_bound=1.6 + 1e-9, workers=1)
+        result[positions, 5:] = tail
     return result
 
 
 def selected_mask(distances: np.ndarray, count: int, radius: float) -> np.ndarray:
-    if (count not in (*range(1, 6), 10) or radius <= 0 or
-            (count == 10 and radius > 1.6)):
+    if (count not in NEAREST_COLUMN or radius <= 0 or
+            (count > 5 and radius > 1.6)):
         raise ValueError("Invalid radar rule")
-    return distances[:, 5 if count == 10 else count - 1] <= radius + 1e-9
+    return distances[:, NEAREST_COLUMN[count]] <= radius + 1e-9
 
 
 def flat_indices(coords) -> np.ndarray:
@@ -118,8 +121,8 @@ button{background:#253847;color:inherit;border:1px solid #637b8b;border-radius:4
 const d=JSON.parse(document.getElementById('data').textContent),c=document.getElementById('view'),ctx=c.getContext('2d');
 document.getElementById('title').textContent=`Frame ${d.frame_id} · ${d.fault}`;
 const binary=atob(d.packed_candidates),raw=new Uint8Array(binary.length);for(let i=0;i<binary.length;i++)raw[i]=binary.charCodeAt(i);
-const records=new DataView(raw.buffer),indices=new Uint32Array(d.candidate_count),membership=new Uint16Array(d.candidate_count);
-for(let i=0;i<d.candidate_count;i++){indices[i]=records.getUint32(i*6,true);membership[i]=records.getUint16(i*6+4,true);}
+const records=new DataView(raw.buffer),indices=new Uint32Array(d.candidate_count),membership=new Uint32Array(d.candidate_count);
+for(let i=0;i<d.candidate_count;i++){indices[i]=records.getUint32(i*8,true);membership[i]=records.getUint32(i*8+4,true);}
 const rules=document.getElementById('rules'),checks=[];
 for(let i=0;i<d.rules.length;i++){let row=document.createElement('div');row.className='rule';let label=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.checked=i===0;box.onchange=redraw;checks.push(box);label.append(box,document.createTextNode(' '+d.rules[i].label));row.append(label);let sub=document.createElement('div');sub.className='small';sub.textContent=`${d.rules[i].raw_cells.toLocaleString()} supported · ${d.rules[i].candidates.toLocaleString()} additions · ${d.rules[i].missing_recall}% missing recall`;row.append(sub);rules.append(row);}
 const layers=document.getElementById('layers'),layerNames=[['faulty','Faulty LiDAR','#65d798'],['missing','Missing clean LiDAR','#ff856a'],['radar','Radar voxel centers','#ffd166']];
@@ -144,21 +147,21 @@ def write_viewer_frame(path: Path, *, frame_id: str, fault: str, distances: np.n
     # The largest requested rule contains every other rule.
     union = selected_mask(distances, 1, 3.2)
     candidate_index = np.flatnonzero(union)
-    membership = np.zeros(len(candidate_index), dtype=np.uint16)
+    membership = np.zeros(len(candidate_index), dtype=np.uint32)
     rules = []
     missing_index = flat_indices(missing)
     for i, (count, radius) in enumerate(RULES):
         mask = selected_mask(distances, count, radius)
-        membership |= (mask[candidate_index].astype(np.uint16) << i)
+        membership |= (mask[candidate_index].astype(np.uint32) << i)
         candidates = int(mask.sum()) - int(mask[observed_index].sum())
         eligible = int(mask[missing_index].sum())
         rules.append({"label": f"≥{count} radar voxel{'s' if count != 1 else ''} within {radius:g} m",
                       "raw_cells": int(mask.sum()), "candidates": candidates,
                       "missing_recall": round(100 * eligible / max(len(missing), 1), 2)})
     membership |= (np.isin(candidate_index, observed_index,
-                            assume_unique=True).astype(np.uint16) << len(RULES))
+                            assume_unique=True).astype(np.uint32) << len(RULES))
     packed = np.empty(len(candidate_index),
-                      dtype=np.dtype([("index", "<u4"), ("membership", "<u2")]))
+                      dtype=np.dtype([("index", "<u4"), ("membership", "<u4")]))
     packed["index"] = candidate_index
     packed["membership"] = membership
     radar_xyz = unique_radar_voxel_centers(radar)
