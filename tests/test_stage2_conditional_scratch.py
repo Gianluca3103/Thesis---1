@@ -21,3 +21,22 @@ def test_fixed_half_threshold_combines_all_validation_frames():
     assert result["target"] == 17
     assert result["iou"] == 10 / 21
     assert result["faulty_baseline_iou"] == 8 / 20
+
+
+def test_fixed_half_reports_separate_0p2m_occupancy_iou():
+    empty = {"tp": 0, "predicted": 0, "target": 0}
+    calibration = [dict(empty) for _ in range(THRESHOLD_STEPS + 2)]
+    heldout = [dict(empty) for _ in range(THRESHOLD_STEPS + 2)]
+    calibration[THRESHOLD_STEPS // 2] = {
+        "tp": 2, "predicted": 4, "target": 5}
+    heldout[THRESHOLD_STEPS // 2] = {
+        "tp": 3, "predicted": 6, "target": 7}
+    report = {"curves": {"calibration": calibration, "heldout": heldout},
+              "fixed_half_tolerant": {
+                  "calibration": {"predicted": 4, "eligible_target": 5,
+                                  "exact_tp": 2, "tolerant_tp_0p2m": 3},
+                  "heldout": {"predicted": 6, "eligible_target": 7,
+                              "exact_tp": 3, "tolerant_tp_0p2m": 4}}}
+    result = full_iou_at_half(report)
+    assert result["iou"] == 5 / 17
+    assert result["iou_0p2m"] == 7 / 15

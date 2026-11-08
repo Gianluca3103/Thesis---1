@@ -613,6 +613,11 @@ exact IoU at a fixed 0.5 threshold. After 125 epochs by default, the runner
 calibrates a full-scene threshold on validation and scores all official test
 frames. This is a long GPU run because validation performs a full reverse
 chain every epoch; `EPOCHS` and `VAL_STEPS` can be overridden explicitly.
+Each epoch logs exact voxel IoU and separate 0.2 m voxel-center IoU for the
+completed full scene. The `0.5` cutoff is an occupancy probability, not a
+distance tolerance. It also prints held-out exact IoU at the probability
+threshold selected by the validation calibration frames, so a poor fixed
+cutoff can be distinguished from poor reconstruction.
 The prior BCE addition head is excluded from this run because it was trained
 with clean-seeded decoder features; it needs its own generated-feature trial.
 

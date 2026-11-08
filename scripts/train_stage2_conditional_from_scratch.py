@@ -42,10 +42,24 @@ def full_iou_at_half(sweep_report: dict) -> dict:
     base_predicted = sum(row["predicted"] for row in baseline)
     base_target = sum(row["target"] for row in baseline)
     base_union = base_predicted + base_target - base_tp
-    return {"threshold": 0.5, "tp": tp, "predicted": predicted,
-            "target": target, "iou": tp / union if union else 0.0,
-            "faulty_baseline_iou": (base_tp / base_union
-                                    if base_union else 0.0)}
+    result = {"threshold": 0.5, "tp": tp, "predicted": predicted,
+              "target": target, "iou": tp / union if union else 0.0,
+              "faulty_baseline_iou": (base_tp / base_union
+                                      if base_union else 0.0)}
+    if "fixed_half_tolerant" in sweep_report:
+        tolerant = {key: sum(sweep_report["fixed_half_tolerant"][role][key]
+                             for role in ("calibration", "heldout"))
+                    for key in ("predicted", "eligible_target", "exact_tp",
+                                "tolerant_tp_0p2m")}
+        if (tolerant["predicted"] != predicted or
+                tolerant["eligible_target"] != target or
+                tolerant["exact_tp"] != tp):
+            raise RuntimeError("Exact and 0.2 m validation counts differ")
+        tolerant_union = (predicted + target -
+                          tolerant["tolerant_tp_0p2m"])
+        result["iou_0p2m"] = (tolerant["tolerant_tp_0p2m"] /
+                              tolerant_union if tolerant_union else 0.0)
+    return result
 
 
 def fresh_model(lpcr_path: Path, device: str) -> SparseResidualStage2:
@@ -196,7 +210,8 @@ def main() -> None:
         model.eval()
         validation, _ = sweep(
             model, val_loader, val_ids, args.data_cache_root, alpha_bars,
-            device=args.device, seed=args.seed, steps=args.validation_steps)
+            device=args.device, seed=args.seed, steps=args.validation_steps,
+            fixed_half_tolerance=True)
         full = full_iou_at_half(validation)
         improved = full["iou"] > best_iou
         best_iou = max(best_iou, full["iou"])
@@ -218,9 +233,13 @@ def main() -> None:
         if improved:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
         print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
-              f"val_full_IoU@0.5={full['iou']:.2%} "
-              f"faulty_baseline={full['faulty_baseline_iou']:.2%} "
-              f"best={best_iou:.2%}", flush=True)
+              f"val_full_exact_IoU={full['iou']:.2%} "
+              f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
+              f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "
+              f"heldout_calibrated_exact_IoU={validation['heldout']['iou']:.2%} "
+              f"calibrated_probability_threshold={validation['threshold']:.3f} "
+              f"occupancy_probability_threshold=0.5 "
+              f"best_fixed_threshold_exact_IoU={best_iou:.2%}", flush=True)
     print(f"Best checkpoint: {args.output_root / 'best_iou.ckpt'}", flush=True)
 
 
