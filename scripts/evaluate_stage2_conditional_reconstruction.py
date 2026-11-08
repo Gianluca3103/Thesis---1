@@ -69,6 +69,19 @@ def _frame_candidates(fine: torch.Tensor, logits: torch.Tensor, frame: int,
     return cells[~observed], logits[selected][~observed]
 
 
+def _within_gate(voxels: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Keep occupied cells inside one frame's complete active coordinate gate."""
+    gate_keys = encode_keys(gate, GRID.shape_zyx)
+    voxel_keys = encode_keys(voxels, GRID.shape_zyx)
+    return voxels[torch.isin(voxel_keys, gate_keys)]
+
+
+def _iou_from_matches(matches: dict, *, tolerant: bool = False) -> float:
+    tp = matches["tolerant_tp_0p2m" if tolerant else "exact_tp"]
+    union = matches["predicted"] + matches["eligible_target"] - tp
+    return tp / union if union else 0.0
+
+
 def _empty_active_counts() -> dict[str, int]:
     return {"frames": 0, "predicted": 0, "eligible_target": 0,
             "exact_tp": 0, "tolerant_tp_0p2m": 0,
@@ -196,7 +209,11 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
     """Validate generated occupancy at 0.5 without a threshold sweep."""
     totals = {"frames": 0, "tp": 0, "predicted": 0, "target": 0,
               "tolerant_tp_0p2m": 0, "faulty_tp": 0,
-              "faulty_predicted": 0}
+              "faulty_predicted": 0, "faulty_tolerant_tp_0p2m": 0}
+    fault_area = {
+        phase: {key: 0 for key in ("predicted", "eligible_target",
+                                    "exact_tp", "tolerant_tp_0p2m")}
+        for phase in ("faulty", "completed")}
     errors = {"positive_error_sum": 0.0, "negative_error_sum": 0.0,
               "positive_count": 0, "negative_count": 0}
     for rows in tqdm(loader, desc="Conditional fixed-0.5 validation",
@@ -215,16 +232,36 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
             baseline = counts(faulty, clean)
             tolerant = tolerant_occupancy_counts(
                 completed, clean, tolerance_m=0.2)
+            baseline_tolerant = tolerant_occupancy_counts(
+                faulty, clean, tolerance_m=0.2)
             if (tolerant["predicted"] != current["predicted"] or
                     tolerant["eligible_target"] != current["target"] or
-                    tolerant["exact_tp"] != current["tp"]):
+                    tolerant["exact_tp"] != current["tp"] or
+                    baseline_tolerant["predicted"] != baseline["predicted"] or
+                    baseline_tolerant["eligible_target"] != baseline["target"] or
+                    baseline_tolerant["exact_tp"] != baseline["tp"]):
                 raise RuntimeError("Exact and 0.2 m validation counts differ")
+            gate = output["fine"][output["fine"][:, 0] == frame].cpu().clone()
+            gate[:, 0] = 0
+            gated_clean = _within_gate(clean, gate)
+            gated_faulty = _within_gate(faulty, gate)
+            gated_completed = _within_gate(completed, gate)
+            gated_metrics = {
+                "faulty": tolerant_occupancy_counts(
+                    gated_faulty, gated_clean, tolerance_m=0.2),
+                "completed": tolerant_occupancy_counts(
+                    gated_completed, gated_clean, tolerance_m=0.2)}
+            for phase, matches in gated_metrics.items():
+                for key, value in matches.items():
+                    fault_area[phase][key] += value
             totals["frames"] += 1
             for key in ("tp", "predicted", "target"):
                 totals[key] += current[key]
             totals["tolerant_tp_0p2m"] += tolerant["tolerant_tp_0p2m"]
             totals["faulty_tp"] += baseline["tp"]
             totals["faulty_predicted"] += baseline["predicted"]
+            totals["faulty_tolerant_tp_0p2m"] += (
+                baseline_tolerant["tolerant_tp_0p2m"])
             if decoder_loss_fp_weight is not None:
                 target = torch.isin(
                     encode_keys(candidates, GRID.shape_zyx),
@@ -239,12 +276,28 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
                       totals["tolerant_tp_0p2m"])
     baseline_union = (totals["faulty_predicted"] + totals["target"] -
                       totals["faulty_tp"])
+    baseline_tolerant_union = (
+        totals["faulty_predicted"] + totals["target"] -
+        totals["faulty_tolerant_tp_0p2m"])
+    gate_summary = {
+        phase: {**matches,
+                "iou": _iou_from_matches(matches),
+                "iou_0p2m": _iou_from_matches(matches, tolerant=True)}
+        for phase, matches in fault_area.items()}
     result = {"threshold": 0.5, **totals,
               "iou": totals["tp"] / union if union else 0.0,
               "iou_0p2m": (totals["tolerant_tp_0p2m"] / tolerant_union
                             if tolerant_union else 0.0),
               "faulty_baseline_iou": (totals["faulty_tp"] / baseline_union
-                                      if baseline_union else 0.0)}
+                                      if baseline_union else 0.0),
+              "faulty_baseline_iou_0p2m": (
+                  totals["faulty_tolerant_tp_0p2m"] /
+                  baseline_tolerant_union if baseline_tolerant_union else 0.0),
+              "fault_area": gate_summary}
+    result["full_iou_improvement_pp"] = (
+        100 * (result["iou"] - result["faulty_baseline_iou"]))
+    result["full_iou_0p2m_improvement_pp"] = (
+        100 * (result["iou_0p2m"] - result["faulty_baseline_iou_0p2m"]))
     if decoder_loss_fp_weight is not None:
         positive = errors["positive_error_sum"] / max(errors["positive_count"], 1)
         negative = errors["negative_error_sum"] / max(errors["negative_count"], 1)

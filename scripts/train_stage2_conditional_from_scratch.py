@@ -70,6 +70,27 @@ def reconstruction_validation_due(epoch: int, epochs: int, every: int) -> bool:
     return epoch == 1 or epoch % every == 0 or epoch == epochs
 
 
+def mse_epoch_log(epoch: int, train_mse: float, val_mse: float,
+                  full: dict | None, best_iou: float) -> str:
+    """Report noise loss and before/after occupancy on the same fixed gate."""
+    prefix = (f"Epoch {epoch:03d}: train_noise_MSE={train_mse:.4f} "
+              f"val_noise_MSE={val_mse:.4f}")
+    if full is None:
+        return prefix + " reconstruction_val=skipped"
+    faulty = full["fault_area"]["faulty"]
+    completed = full["fault_area"]["completed"]
+    return (prefix +
+            f" fault_area_exact_IoU={faulty['iou']:.2%}->{completed['iou']:.2%}"
+            f" fault_area_IoU@0.2m={faulty['iou_0p2m']:.2%}->"
+            f"{completed['iou_0p2m']:.2%}"
+            f" full_exact_IoU={full['faulty_baseline_iou']:.2%}->"
+            f"{full['iou']:.2%} ({full['full_iou_improvement_pp']:+.2f} pp)"
+            f" full_IoU@0.2m={full['faulty_baseline_iou_0p2m']:.2%}->"
+            f"{full['iou_0p2m']:.2%} "
+            f"({full['full_iou_0p2m_improvement_pp']:+.2f} pp)"
+            f" best_full_exact_IoU@0.5={best_iou:.2%}")
+
+
 def resume_batch_size_change(saved_identity: dict, identity: dict,
                              *, allow_change: bool) -> int | None:
     """Accept an explicitly requested batch-size-only resume change."""
@@ -396,11 +417,17 @@ def main() -> None:
                            f"{validation['heldout']['iou']:.2%} "
                            f"calibrated_probability_threshold="
                            f"{validation['threshold']:.3f} ")
-        print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
-              f"val_noise_MSE={val_loss['noise_mse']:.4f} "
-              f"{decoder_log}{metric_log}"
-              f"occupancy_probability_threshold=0.5 "
-              f"best_fixed_threshold_exact_IoU={best_iou:.2%}", flush=True)
+        if args.fixed_validation_only:
+            print(mse_epoch_log(epoch, train["noise_mse"],
+                                val_loss["noise_mse"], full, best_iou),
+                  flush=True)
+        else:
+            print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
+                  f"val_noise_MSE={val_loss['noise_mse']:.4f} "
+                  f"{decoder_log}{metric_log}"
+                  f"occupancy_probability_threshold=0.5 "
+                  f"best_fixed_threshold_exact_IoU={best_iou:.2%}",
+                  flush=True)
     print(f"Best checkpoint: {args.output_root / 'best_iou.ckpt'}", flush=True)
 
 
