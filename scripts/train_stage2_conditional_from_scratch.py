@@ -23,12 +23,13 @@ from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.conditional_stage2 import (
     CONDITIONED_FRESH_REVISION, CONDITIONED_FRESH_FAULT_ONLY_REVISION,
     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
+    CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION,
     deployment_loader)
 from scripts.evaluate_stage2_conditional_reconstruction import (
     fixed_threshold_validation, sweep)
 from scripts.train_stage2_clean_denoiser import (
-    MIN_RADAR_VOXELS, RADIUS_M, DecoderOccupancyConfig, _CleanRows, _atomic_save,
-    _rows, _run_epoch)
+    MIN_RADAR_VOXELS, RADIUS_M, DecoderOccupancyConfig, GeneratedBCEConfig,
+    _CleanRows, _atomic_save, _rows, _run_epoch)
 
 
 def full_iou_at_half(sweep_report: dict) -> dict:
@@ -71,12 +72,25 @@ def reconstruction_validation_due(epoch: int, epochs: int, every: int) -> bool:
 
 
 def mse_epoch_log(epoch: int, train_mse: float, val_mse: float,
-                  full: dict | None, best_iou: float) -> str:
+                  full: dict | None, best_iou: float,
+                  *, train_bce: float | None = None,
+                  train_total: float | None = None,
+                  bce_weight: float | None = None) -> str:
     """Report noise loss and before/after occupancy on the same fixed gate."""
     prefix = (f"Epoch {epoch:03d}: train_noise_MSE={train_mse:.4f} "
               f"val_noise_MSE={val_mse:.4f}")
+    if train_bce is not None:
+        if train_total is None or bce_weight is None:
+            raise ValueError("BCE logging requires the weight and total loss")
+        prefix += (f" train_BCE={train_bce:.4f} "
+                   f"train_total_loss={train_total:.4f}")
     if full is None:
-        return prefix + " reconstruction_val=skipped"
+        return prefix + (" val_BCE=skipped" if train_bce is not None else "") + \
+            " reconstruction_val=skipped"
+    if train_bce is not None:
+        val_bce = full["generated_bce"]["loss"]
+        prefix += (f" val_BCE={val_bce:.4f} "
+                   f"val_total_loss={val_mse + bce_weight * val_bce:.4f}")
     faulty = full["fault_area"]["faulty"]
     completed = full["fault_area"]["completed"]
     return (prefix +
@@ -88,7 +102,8 @@ def mse_epoch_log(epoch: int, train_mse: float, val_mse: float,
             f" full_IoU@0.2m={full['faulty_baseline_iou_0p2m']:.2%}->"
             f"{full['iou_0p2m']:.2%} "
             f"({full['full_iou_0p2m_improvement_pp']:+.2f} pp)"
-            f" best_full_exact_IoU@0.5={best_iou:.2%}")
+            f" best_full_exact_IoU@0.5={best_iou:.2%}"
+            f" additions@0.5={full['added']:,}")
 
 
 def resume_batch_size_change(saved_identity: dict, identity: dict,
@@ -136,11 +151,14 @@ def main() -> None:
     parser.add_argument("--fault-region-root", type=Path)
     parser.add_argument("--generated-occupancy-loss", action="store_true",
                         help="Supervise frozen LPCR after a Gaussian-start rollout")
+    parser.add_argument("--generated-bce-loss", action="store_true",
+                        help="Standard BCE on final generated LPCR occupancy logits")
     parser.add_argument("--fixed-validation-only", action="store_true",
                         help="Use periodic fixed-0.5 validation without epoch sweeps")
     parser.add_argument("--rollout-steps", type=int, default=64)
     parser.add_argument("--gradient-steps", type=int, default=4)
     parser.add_argument("--occupancy-loss-weight", type=float, default=0.05)
+    parser.add_argument("--bce-loss-weight", type=float, default=0.1)
     parser.add_argument("--false-positive-weight", type=float, default=2.0)
     parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
@@ -161,9 +179,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.generated_occupancy_loss and args.fault_region_root is None:
         parser.error("Generated occupancy trial requires --fault-region-root")
+    if args.generated_bce_loss and args.fault_region_root is None:
+        parser.error("Generated BCE trial requires --fault-region-root")
+    if args.generated_bce_loss and args.generated_occupancy_loss:
+        parser.error("Choose standard BCE or the old asymmetric margin")
     if args.initialize_from is not None and not args.generated_occupancy_loss:
         parser.error("--initialize-from is for the generated occupancy trial")
-    if args.fixed_validation_only and args.generated_occupancy_loss:
+    if args.fixed_validation_only and (
+            args.generated_occupancy_loss or args.generated_bce_loss):
         parser.error("Generated occupancy already uses fixed validation")
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
@@ -173,6 +196,9 @@ def main() -> None:
              (not 1 <= args.gradient_steps <= args.rollout_steps <= 1000 or
               args.occupancy_loss_weight <= 0 or
               args.false_positive_weight <= 0)) or
+            (args.generated_bce_loss and
+             (not 1 <= args.gradient_steps <= args.rollout_steps <= 1000 or
+              args.bce_loss_weight <= 0)) or
             any(value is not None and value < 1 for value in
                 (args.train_limit, args.val_limit))):
         parser.error("Invalid settings or CUDA unavailable")
@@ -210,7 +236,9 @@ def main() -> None:
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     identity = {
-        "revision": (CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION
+        "revision": (CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION
+                     if args.generated_bce_loss else
+                     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION
                      if args.generated_occupancy_loss else
                      CONDITIONED_FRESH_FAULT_ONLY_REVISION
                      if train_regions is not None else CONDITIONED_FRESH_REVISION),
@@ -233,7 +261,20 @@ def main() -> None:
         "validation_model_inputs": "faulty_LiDAR_radar_Gaussian_noise",
         "fresh_diffusion_and_radar_adapter": args.initialize_from is None}
     decoder_config = None
-    if args.generated_occupancy_loss:
+    if args.generated_bce_loss:
+        decoder_config = GeneratedBCEConfig(
+            rollout_steps=args.rollout_steps,
+            gradient_steps=args.gradient_steps,
+            loss_weight=args.bce_loss_weight)
+        identity.update({
+            "training_loss": "epsilon_mse_plus_generated_standard_bce",
+            "decoder_rollout_steps": args.rollout_steps,
+            "decoder_gradient_steps": args.gradient_steps,
+            "decoder_bce_weight": args.bce_loss_weight,
+            "decoder_loss_sites": "unobserved_fault_gated_fine_cells",
+            "reconstruction_val_every": args.reconstruction_val_every,
+            "checkpoint_selection": "fixed_0p5_full_validation_exact_iou"})
+    elif args.generated_occupancy_loss:
         decoder_config = DecoderOccupancyConfig(
             rollout_steps=args.rollout_steps,
             gradient_steps=args.gradient_steps,
@@ -360,7 +401,8 @@ def main() -> None:
                 model, val_loader, args.data_cache_root, alpha_bars,
                 device=args.device, seed=args.seed, steps=args.validation_steps,
                 decoder_loss_fp_weight=(args.false_positive_weight
-                                        if decoder_config is not None else None))
+                                        if args.generated_occupancy_loss else None),
+                generated_bce=args.generated_bce_loss)
             if full["frames"] != len(val_ids):
                 raise RuntimeError("Fixed-threshold validation skipped frames")
         selection_iou = full["iou"] if full is not None else None
@@ -386,9 +428,18 @@ def main() -> None:
                 "train_decoder_occupancy_loss": train["decoder_occupancy_loss"],
                 "train_total_loss": train["total_loss"],
                 "train_decoder_positive_sites": train["decoder_positive_sites"],
-                "train_decoder_negative_sites": train["decoder_negative_sites"],
-                "val_generated_decoder_occupancy_loss": (
-                    full["generated_decoder_loss"] if full else None)})
+                "train_decoder_negative_sites": train["decoder_negative_sites"]})
+            if args.generated_bce_loss:
+                record["train_generated_bce"] = train["decoder_occupancy_loss"]
+                record["val_generated_bce"] = (
+                    full["generated_bce"] if full else None)
+                record["val_total_loss"] = (
+                    val_loss["noise_mse"] +
+                    args.bce_loss_weight * full["generated_bce"]["loss"]
+                    if full else None)
+            else:
+                record["val_generated_decoder_occupancy_loss"] = (
+                    full["generated_decoder_loss"] if full else None)
         with (args.output_root / "history.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         checkpoint = {"identity": identity, "epoch": epoch,
@@ -409,7 +460,7 @@ def main() -> None:
                       f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
                       f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "
                       if full is not None else "reconstruction_val=skipped ")
-        if decoder_config is not None and full is not None:
+        if args.generated_occupancy_loss and full is not None:
             metric_log += (f"val_generated_decoder_loss="
                            f"{full['generated_decoder_loss']['loss']:.4f} ")
         if decoder_config is None and validation is not None:
@@ -417,9 +468,15 @@ def main() -> None:
                            f"{validation['heldout']['iou']:.2%} "
                            f"calibrated_probability_threshold="
                            f"{validation['threshold']:.3f} ")
-        if args.fixed_validation_only:
+        if args.fixed_validation_only or args.generated_bce_loss:
             print(mse_epoch_log(epoch, train["noise_mse"],
-                                val_loss["noise_mse"], full, best_iou),
+                                val_loss["noise_mse"], full, best_iou,
+                                train_bce=(train["decoder_occupancy_loss"]
+                                           if args.generated_bce_loss else None),
+                                train_total=(train["total_loss"]
+                                             if args.generated_bce_loss else None),
+                                bce_weight=(args.bce_loss_weight
+                                            if args.generated_bce_loss else None)),
                   flush=True)
         else:
             print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "

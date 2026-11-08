@@ -33,6 +33,7 @@ from models.radar_lidar_stage2.addition import addition_context
 from models.radar_lidar_stage2.conditional_sampling import sample_from_noise_truncated
 from models.radar_lidar_stage2.decoder_occupancy_loss import (
     asymmetric_occupancy_loss)
+from models.radar_lidar_stage2.generated_bce_loss import generated_occupancy_bce
 from models.radar_lidar_stage2.geometry_gate import offset_targets
 from models.radar_lidar_stage2.geometry_gate import geometry_gate_output
 from models.radar_lidar_stage2.sparse_residual import (
@@ -57,6 +58,13 @@ class DecoderOccupancyConfig:
     gradient_steps: int
     loss_weight: float
     false_positive_weight: float
+
+
+@dataclass(frozen=True)
+class GeneratedBCEConfig:
+    rollout_steps: int
+    gradient_steps: int
+    loss_weight: float
 
 
 class _CleanRows:
@@ -242,7 +250,7 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                reverse_val_steps: int = 0,
                condition_faulty_radar: bool = False,
                train_radar_adapter: bool = False,
-               decoder_occupancy: DecoderOccupancyConfig | None = None,
+               decoder_occupancy: DecoderOccupancyConfig | GeneratedBCEConfig | None = None,
                eval_random_timesteps: bool = False,
                eval_loss_only: bool = False) -> dict:
     training = optimizer is not None
@@ -251,7 +259,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
             not 1 <= decoder_occupancy.gradient_steps <=
             decoder_occupancy.rollout_steps <= len(alpha_bars) or
             decoder_occupancy.loss_weight <= 0 or
-            decoder_occupancy.false_positive_weight <= 0):
+            (isinstance(decoder_occupancy, DecoderOccupancyConfig) and
+             decoder_occupancy.false_positive_weight <= 0)):
         raise ValueError("Generated occupancy loss needs conditional single-pass training")
     if eval_loss_only and (training or not eval_random_timesteps or
                            reverse_val_steps):
@@ -372,10 +381,14 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                             for index, cloud in enumerate(faulty_clouds)]).to(device)
                         observed = addition_context(
                             faulty_xyz, hierarchy[0], faulty_ids).observed
-                        decoder_loss, decoder_parts = asymmetric_occupancy_loss(
-                            logits, target, ~observed,
-                            false_positive_weight=(
-                                decoder_occupancy.false_positive_weight))
+                        if isinstance(decoder_occupancy, GeneratedBCEConfig):
+                            decoder_loss, decoder_parts = generated_occupancy_bce(
+                                logits, target, ~observed)
+                        else:
+                            decoder_loss, decoder_parts = asymmetric_occupancy_loss(
+                                logits, target, ~observed,
+                                false_positive_weight=(
+                                    decoder_occupancy.false_positive_weight))
                         total_loss = (loss + decoder_occupancy.loss_weight *
                                       decoder_loss)
                     optimizer.zero_grad(set_to_none=True)

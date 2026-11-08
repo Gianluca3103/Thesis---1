@@ -12,6 +12,7 @@ from tqdm import tqdm
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_stage2.addition import addition_context
 from models.radar_lidar_stage2.decoder_occupancy_loss import error_sums
+from models.radar_lidar_stage2.generated_bce_loss import generated_occupancy_bce
 from models.radar_lidar_stage2.clean_selected_metrics import (
     add_frame, completion_summary, empty_accumulator, full_frame_voxels)
 from models.radar_lidar_stage2.clean_thresholds import (
@@ -205,26 +206,34 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
 @torch.no_grad()
 def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
                                *, device: str, seed: int, steps: int,
-                               decoder_loss_fp_weight: float | None = None) -> dict:
+                               decoder_loss_fp_weight: float | None = None,
+                               generated_bce: bool = False) -> dict:
     """Validate generated occupancy at 0.5 without a threshold sweep."""
+    if decoder_loss_fp_weight is not None and generated_bce:
+        raise ValueError("Choose either margin or standard BCE validation")
     totals = {"frames": 0, "tp": 0, "predicted": 0, "target": 0,
               "tolerant_tp_0p2m": 0, "faulty_tp": 0,
-              "faulty_predicted": 0, "faulty_tolerant_tp_0p2m": 0}
+              "faulty_predicted": 0, "faulty_tolerant_tp_0p2m": 0,
+              "added": 0, "candidate_cells": 0}
     fault_area = {
         phase: {key: 0 for key in ("predicted", "eligible_target",
                                     "exact_tp", "tolerant_tp_0p2m")}
         for phase in ("faulty", "completed")}
     errors = {"positive_error_sum": 0.0, "negative_error_sum": 0.0,
               "positive_count": 0, "negative_count": 0}
+    bce_total = bce_frames = bce_positive = bce_negative = 0
     for rows in tqdm(loader, desc="Conditional fixed-0.5 validation",
                      unit="batch"):
         output = predict_batch(model, rows, alpha_bars, device=device,
                                seed=seed, steps=steps)
+        batch_bce_sum = batch_bce_sites = 0
         for frame, row in enumerate(rows):
             candidates, logits = _frame_candidates(
                 output["fine"], output["logits"], frame,
                 row["faulty_xyz"], device)
             additions = candidates[logits >= 0].cpu()
+            totals["added"] += len(additions)
+            totals["candidate_cells"] += len(candidates)
             clean_xyz = reference_clean(raw_root, "val", row["frame_id"])
             clean, faulty, completed = full_frame_voxels(
                 clean_xyz, row["faulty_xyz"], additions)
@@ -262,15 +271,27 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
             totals["faulty_predicted"] += baseline["predicted"]
             totals["faulty_tolerant_tp_0p2m"] += (
                 baseline_tolerant["tolerant_tp_0p2m"])
-            if decoder_loss_fp_weight is not None:
+            if decoder_loss_fp_weight is not None or generated_bce:
                 target = torch.isin(
                     encode_keys(candidates, GRID.shape_zyx),
                     encode_keys(clean.to(device), GRID.shape_zyx))
+            if generated_bce:
+                bce, parts = generated_occupancy_bce(
+                    logits, target, torch.ones_like(target))
+                sites = parts["positive_count"] + parts["negative_count"]
+                batch_bce_sum += float(bce) * sites
+                batch_bce_sites += sites
+                bce_positive += parts["positive_count"]
+                bce_negative += parts["negative_count"]
+            if decoder_loss_fp_weight is not None:
                 parts = error_sums(logits, target)
                 for key in errors:
                     value = parts[key]
                     errors[key] += (float(value) if isinstance(value, torch.Tensor)
                                     else value)
+        if generated_bce:
+            bce_total += (batch_bce_sum / max(batch_bce_sites, 1)) * len(rows)
+            bce_frames += len(rows)
     union = totals["predicted"] + totals["target"] - totals["tp"]
     tolerant_union = (totals["predicted"] + totals["target"] -
                       totals["tolerant_tp_0p2m"])
@@ -307,6 +328,11 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
             "negative_mean_error": negative,
             "positive_count": errors["positive_count"],
             "negative_count": errors["negative_count"]}
+    if generated_bce:
+        result["generated_bce"] = {
+            "loss": bce_total / max(bce_frames, 1),
+            "positive_count": bce_positive,
+            "negative_count": bce_negative}
     return result
 
 

@@ -31,7 +31,8 @@ def test_fixed_validation_reports_gate_and_full_scene(monkeypatch):
 
 
 def test_mse_log_includes_requested_metrics_and_skipped_epochs():
-    full = {"fault_area": {"faulty": {"iou": 0.4, "iou_0p2m": 0.5},
+    full = {"added": 0,
+            "fault_area": {"faulty": {"iou": 0.4, "iou_0p2m": 0.5},
                            "completed": {"iou": 0.6, "iou_0p2m": 0.7}},
             "faulty_baseline_iou": 0.68,
             "faulty_baseline_iou_0p2m": 0.69,
