@@ -70,6 +70,19 @@ def reconstruction_validation_due(epoch: int, epochs: int, every: int) -> bool:
     return epoch == 1 or epoch % every == 0 or epoch == epochs
 
 
+def resume_batch_size_change(saved_identity: dict, identity: dict,
+                             *, allow_change: bool) -> int | None:
+    """Accept an explicitly requested batch-size-only resume change."""
+    if saved_identity == identity:
+        return None
+    previous = saved_identity.get("batch_size")
+    if (not allow_change or not isinstance(previous, int) or previous < 1 or
+            previous == identity.get("batch_size") or
+            {**saved_identity, "batch_size": identity.get("batch_size")} != identity):
+        raise ValueError("Resume checkpoint belongs to another training run")
+    return previous
+
+
 def fresh_model(lpcr_path: Path, device: str) -> SparseResidualStage2:
     pretrained = torch.load(lpcr_path, map_location="cpu", weights_only=False)
     if (pretrained.get("version") != VERSION or
@@ -118,6 +131,8 @@ def main() -> None:
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--allow-batch-size-change", action="store_true",
+                        help="Resume with a new batch size if all other settings match")
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -265,8 +280,9 @@ def main() -> None:
     start, best_iou = 1, -1.0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if saved.get("identity") != identity:
-            raise ValueError("Resume checkpoint belongs to another scratch run")
+        previous_batch_size = resume_batch_size_change(
+            saved.get("identity", {}), identity,
+            allow_change=args.allow_batch_size_change)
         model.diffusion.load_state_dict(saved["diffusion"])
         model.radar_adapter.load_state_dict(saved["radar_adapter"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -274,6 +290,10 @@ def main() -> None:
         best_iou = float(saved["best_val_selection_iou"]
                          if decoder_config is not None else
                          saved["best_val_full_iou_at_0p5"])
+        if previous_batch_size is not None:
+            print(f"Resuming epoch {start} with batch size "
+                  f"{previous_batch_size} -> {args.batch_size}; "
+                  "optimizer state preserved.", flush=True)
     if start > args.epochs:
         print(f"Already complete: epoch {start - 1}", flush=True)
         return
@@ -316,7 +336,8 @@ def main() -> None:
         improved = selection_iou is not None and selection_iou > best_iou
         if improved:
             best_iou = selection_iou
-        record = {"epoch": epoch, "train_noise_mse": train["noise_mse"],
+        record = {"epoch": epoch, "batch_size": args.batch_size,
+                  "train_noise_mse": train["noise_mse"],
                   "val_noise_mse": val_loss["noise_mse"],
                   "val_noise_mse_frames": val_loss["frames"],
                   "val_noise_mse_timestep_sampling":

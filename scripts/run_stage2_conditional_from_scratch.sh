@@ -50,6 +50,11 @@ else
   RECON_VAL_EVERY=1
 fi
 VAL_STEPS=${VAL_STEPS:-64}
+WORKERS=${WORKERS:-2}
+ALLOW_BATCH_SIZE_CHANGE=${ALLOW_BATCH_SIZE_CHANGE:-0}
+if [[ "$ALLOW_BATCH_SIZE_CHANGE" != 0 && "$ALLOW_BATCH_SIZE_CHANGE" != 1 ]]; then
+  printf 'ALLOW_BATCH_SIZE_CHANGE must be 0 or 1\n' >&2; exit 1
+fi
 if [[ ! -s "$LPCR" ]]; then
   LPCR=$DATA/stage2_fullregion_lpcr_for_geometry_20261106/best.ckpt
 fi
@@ -98,20 +103,24 @@ common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
   "${region_arg[@]}" "${decoder_arg[@]}"
   --lpcr-checkpoint "$LPCR" --batch-size "$BATCH_SIZE"
-  --num-workers 2 --device cuda)
+  --num-workers "$WORKERS" --device cuda)
 
-printf 'Smoke test: 32 train / 8 validation frames; 4 reverse steps.\n'
-if [[ ! -s "$OUT/smoke/last.ckpt" ]]; then
+smoke_root="$OUT/smoke_batch${BATCH_SIZE}"
+printf 'Smoke test: 32 train / 8 validation frames; 4 reverse steps; batch %s.\n' "$BATCH_SIZE"
+if [[ ! -s "$smoke_root/last.ckpt" ]]; then
   "$PY" -u -m scripts.train_stage2_conditional_from_scratch \
-    "${common[@]}" --output-root "$OUT/smoke" \
+    "${common[@]}" --output-root "$smoke_root" \
     --train-limit 32 --val-limit 8 --validation-steps 4 --epochs 1 \
     "${smoke_decoder_arg[@]}" \
-    2>&1 | tee "$OUT/smoke.log"
+    2>&1 | tee "$OUT/smoke_batch${BATCH_SIZE}.log"
 fi
 
 resume=()
 if [[ -s "$OUT/last.ckpt" ]]; then
   resume=(--resume "$OUT/last.ckpt")
+  if [[ "$ALLOW_BATCH_SIZE_CHANGE" == 1 ]]; then
+    resume+=(--allow-batch-size-change)
+  fi
 fi
 printf 'Training %s epochs; noise loss each epoch; fixed-0.5 reconstruction validation every %s epochs with %s steps.\n' \
   "$EPOCHS" "$RECON_VAL_EVERY" "$VAL_STEPS"
@@ -126,7 +135,7 @@ printf 'Sweeping thresholds once on the best validation-IoU checkpoint, then sco
   --support-cache-root "$SUPPORT" --faulty-root "$MILD" \
   "${region_arg[@]}" \
   --lpcr-checkpoint "$LPCR" --checkpoint "$OUT/best_iou.ckpt" \
-  --steps "$VAL_STEPS" --num-workers 2 --device cuda \
+  --steps "$VAL_STEPS" --num-workers "$WORKERS" --device cuda \
   --output-json "$OUT/best_full_noise_${VAL_STEPS}steps_val_test.json" \
   2>&1 | tee "$OUT/best_full_noise_${VAL_STEPS}steps_val_test.log"
 
