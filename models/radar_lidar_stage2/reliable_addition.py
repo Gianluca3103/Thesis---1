@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 
 from .addition import addition_context, healthy_region_negatives
-from .clean_denoising import frame_mean
 from .geometry_gate import offset_targets
 from .sparse_residual import SparseResidualStage2, cosine_alpha_bars
 from scripts.train_stage2_clean_denoiser import (
@@ -34,32 +33,28 @@ def addition_masks(clean: torch.Tensor, clean_ids: torch.Tensor,
 
 
 def addition_losses(logits: torch.Tensor, fine: torch.Tensor, masks: dict,
-                    batch_size: int, *, positive_weight: float = 1.0,
-                    negative_weight: float = 1.0,
+                    batch_size: int, *, bce_weight: float = 1.0,
                     healthy_weight: float = 1.0) -> dict:
-    """Frame-balanced addition BCE with extra healthy-region emphasis."""
-    if logits.shape != (len(fine),) or batch_size < 1 or any(
-            weight < 0 for weight in (positive_weight, negative_weight,
-                                      healthy_weight)):
+    """Standard mean BCE on addition candidates, plus healthy empty BCE."""
+    if (logits.shape != (len(fine),) or batch_size < 1 or
+            bce_weight < 0 or healthy_weight < 0):
         raise ValueError("Invalid addition scores or loss weights")
-    frame_ids = fine[:, 0].long()
-
-    def term(mask: torch.Tensor, positive: bool) -> torch.Tensor:
-        if not bool(mask.any()):
-            return logits.sum() * 0
-        values = F.softplus(-logits[mask] if positive else logits[mask])
-        return frame_mean(values, frame_ids[mask], batch_size)
-
-    positive = term(masks["positive"], True)
-    negative = term(masks["negative"], False)
-    healthy = term(masks["healthy"], False)
-    total = (positive_weight * positive + negative_weight * negative
-             + healthy_weight * healthy)
-    return {"total": total, "positive": positive, "negative": negative,
+    candidates = masks["candidates"]
+    healthy_mask = masks["healthy"]
+    if bool((healthy_mask & ~candidates).any()):
+        raise ValueError("Healthy negatives must be addition candidates")
+    bce = (F.binary_cross_entropy_with_logits(
+        logits[candidates], masks["occupied"][candidates].to(logits.dtype))
+        if bool(candidates.any()) else logits.sum() * 0)
+    healthy = (F.softplus(logits[healthy_mask]).mean()
+               if bool(healthy_mask.any()) else logits.sum() * 0)
+    total = bce_weight * bce + healthy_weight * healthy
+    return {"total": total, "bce": bce,
             "healthy": healthy,
+            "candidate_sites": int(candidates.sum()),
             "positive_sites": int(masks["positive"].sum()),
             "negative_sites": int(masks["negative"].sum()),
-            "healthy_sites": int(masks["healthy"].sum())}
+            "healthy_sites": int(healthy_mask.sum())}
 
 
 def decoded_addition_batch(model: SparseResidualStage2, rows: list[dict],

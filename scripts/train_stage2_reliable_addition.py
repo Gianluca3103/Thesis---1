@@ -31,7 +31,7 @@ from scripts.train_stage2_clean_denoiser import (
     _CleanRows, _rows)
 
 
-REVISION = "stage2_conditioned_12vox_healthy_addition_head_v2"
+REVISION = "stage2_conditioned_12vox_standard_bce_healthy_head_v3"
 
 
 def exact_counts(predicted: torch.Tensor, clean: torch.Tensor) -> dict[str, int]:
@@ -55,7 +55,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
               optimizer: torch.optim.Optimizer | None,
               alpha_bars: torch.Tensor, *, device: str, epoch: int,
               seed: int, eval_timestep: int,
-              weights: tuple[float, float, float]) -> dict:
+              weights: tuple[float, float]) -> dict:
     training = optimizer is not None
     model.eval()
     model.addition_head.train(training)
@@ -63,7 +63,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
     generator.manual_seed(seed + epoch if training else seed)
     loss_sum = 0.0
     frames = 0
-    sites = {name: 0 for name in ("positive", "negative", "healthy")}
+    sites = {name: 0 for name in ("candidate", "positive", "negative", "healthy")}
     baseline = {"predicted": 0, "target": 0, "tp": 0}
     completed = dict(baseline)
     for rows in loader:
@@ -79,8 +79,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
         else:
             losses = addition_losses(
                 logits, fine, masks, len(rows),
-                positive_weight=weights[0], negative_weight=weights[1],
-                healthy_weight=weights[2])
+                bce_weight=weights[0], healthy_weight=weights[1])
             loss_sum += float(losses["total"].detach()) * len(rows)
             for key in sites:
                 sites[key] += losses[f"{key}_sites"]
@@ -160,15 +159,13 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
-    parser.add_argument("--positive-weight", type=float, default=1.0)
-    parser.add_argument("--negative-weight", type=float, default=1.0)
+    parser.add_argument("--bce-weight", type=float, default=1.0)
     parser.add_argument("--healthy-weight", type=float, default=1.0)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    weights = (args.positive_weight, args.negative_weight,
-               args.healthy_weight)
+    weights = (args.bce_weight, args.healthy_weight)
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or any(weight < 0 for weight in weights) or

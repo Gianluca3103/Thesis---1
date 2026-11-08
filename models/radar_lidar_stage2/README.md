@@ -587,16 +587,17 @@ radar adapter, and LPCR decoder are frozen. Only the existing Stage-II
 LiDAR did not already observe, using decoder features and local faulty-LiDAR
 density. Observed faulty voxels are always retained.
 
-The loss has three frame-balanced components: positive missing-clean cells;
-negative candidates with no clean-LiDAR return; and the previous
-`healthy_region_negatives` for locally well-retained regions. The generic
-negative is a missing return in the clean point cloud, not proof of physical
-free space. Clean LiDAR labels training examples but is not given to the
-addition head at inference. The radar gate alone can include untouched
-regions; there is no injector-footprint term or inference mask. This remains
-an oracle-assisted diagnostic because the frozen denoiser starts from a noisy
-**clean-LiDAR**
-latent, not from faulty LiDAR alone.
+The head loss is the ordinary mean binary cross-entropy over all unobserved
+gated candidates, plus one extra negative BCE on empty candidates in locally
+well-retained regions (`healthy_region_negatives`). The standard BCE includes
+both missing clean cells and cells with no clean-LiDAR return; these are not
+separate balanced terms. A missing return is not proof of physical free space.
+Clean LiDAR labels training examples but is not given to the head as a feature.
+The radar gate alone can include untouched regions; there is no
+injector-footprint term or inference mask. The denoiser's epsilon-MSE objective
+is unchanged and its weights are frozen during head training. This remains an
+oracle-assisted diagnostic because the denoiser starts from a noisy
+**clean-LiDAR** latent, not from faulty LiDAR alone.
 
 Validation each epoch reports exact full-ROI IoU at threshold 0.5 against the
 faulty baseline. The post-training evaluator sweeps 0.000–1.000 on validation,

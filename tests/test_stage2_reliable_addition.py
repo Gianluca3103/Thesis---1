@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from models.radar_lidar_stage2.clean_selected_metrics import voxel_centers
 from models.radar_lidar_stage2.clean_thresholds import score_histograms
@@ -29,6 +30,24 @@ def test_empty_loss_protects_observed_and_missing_clean_cells():
     assert logits.grad[0] == 0
     assert logits.grad[1] < 0
     assert logits.grad[2] > 0
+
+
+def test_standard_bce_and_extra_healthy_penalty_are_the_only_terms():
+    fine = torch.tensor([[0, 8, 80, 10], [0, 8, 80, 11],
+                         [0, 8, 80, 12]])
+    logits = torch.tensor([0.0, 2.0, -1.0])
+    masks = {"candidates": torch.ones(3, dtype=torch.bool),
+             "occupied": torch.tensor([True, False, False]),
+             "positive": torch.tensor([True, False, False]),
+             "negative": torch.tensor([False, True, True]),
+             "healthy": torch.tensor([False, False, True])}
+    losses = addition_losses(logits, fine, masks, 1)
+    expected_bce = F.binary_cross_entropy_with_logits(
+        logits, masks["occupied"].float())
+    expected_healthy = F.softplus(logits[2])
+    assert torch.allclose(losses["bce"], expected_bce)
+    assert torch.allclose(losses["healthy"], expected_healthy)
+    assert torch.allclose(losses["total"], expected_bce + expected_healthy)
 
 
 def test_full_roi_sweep_counts_only_new_cells():
@@ -69,6 +88,6 @@ def test_validation_scores_completed_full_roi(monkeypatch):
     result = trainer.run_epoch(
         Model(), [[row]], None, torch.linspace(0.9, 0.1, 1000),
         device="cpu", epoch=1, seed=3103, eval_timestep=499,
-        weights=(1, 1, 1))
+        weights=(1, 1))
     assert result["baseline"]["iou"] == 0.5
     assert result["completed_at_0p5"]["iou"] == 1.0
