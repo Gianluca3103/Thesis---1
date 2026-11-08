@@ -219,6 +219,9 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
         phase: {key: 0 for key in ("predicted", "eligible_target",
                                     "exact_tp", "tolerant_tp_0p2m")}
         for phase in ("faulty", "completed")}
+    missing_additions = {key: 0 for key in
+                         ("predicted", "eligible_target", "exact_tp",
+                          "tolerant_tp_0p2m")}
     errors = {"positive_error_sum": 0.0, "negative_error_sum": 0.0,
               "positive_count": 0, "negative_count": 0}
     bce_total = bce_frames = bce_positive = bce_negative = 0
@@ -237,6 +240,16 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
             clean_xyz = reference_clean(raw_root, "val", row["frame_id"])
             clean, faulty, completed = full_frame_voxels(
                 clean_xyz, row["faulty_xyz"], additions)
+            # Candidates exclude observed faulty cells. Their baseline
+            # prediction is therefore empty, including on full-scan fog frames.
+            candidate_cpu = candidates.cpu()
+            eligible_missing = candidate_cpu[torch.isin(
+                encode_keys(candidate_cpu, GRID.shape_zyx),
+                encode_keys(clean, GRID.shape_zyx))]
+            addition_matches = tolerant_occupancy_counts(
+                additions, eligible_missing, tolerance_m=0.2)
+            for key, value in addition_matches.items():
+                missing_additions[key] += value
             current = counts(completed, clean)
             baseline = counts(faulty, clean)
             tolerant = tolerant_occupancy_counts(
@@ -314,7 +327,15 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
               "faulty_baseline_iou_0p2m": (
                   totals["faulty_tolerant_tp_0p2m"] /
                   baseline_tolerant_union if baseline_tolerant_union else 0.0),
-              "fault_area": gate_summary}
+              "gate_region_with_observed": gate_summary,
+              "missing_cell_additions": {
+                  **summarize_counts(missing_additions),
+                  "precision": (missing_additions["exact_tp"] /
+                                missing_additions["predicted"]
+                                if missing_additions["predicted"] else 0.0),
+                  "recall": (missing_additions["exact_tp"] /
+                             missing_additions["eligible_target"]
+                             if missing_additions["eligible_target"] else 0.0)}}
     result["full_iou_improvement_pp"] = (
         100 * (result["iou"] - result["faulty_baseline_iou"]))
     result["full_iou_0p2m_improvement_pp"] = (

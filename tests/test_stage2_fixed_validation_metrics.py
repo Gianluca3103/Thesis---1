@@ -21,9 +21,11 @@ def test_fixed_validation_reports_gate_and_full_scene(monkeypatch):
     report = evaluator.fixed_threshold_validation(
         None, rows, None, torch.ones(2), device="cpu", seed=1, steps=2)
 
-    assert report["fault_area"]["faulty"]["iou"] == pytest.approx(0.5)
-    assert report["fault_area"]["completed"]["iou"] == pytest.approx(1.0)
-    assert report["fault_area"]["completed"]["iou_0p2m"] == pytest.approx(1.0)
+    assert report["gate_region_with_observed"]["faulty"]["iou"] == pytest.approx(0.5)
+    assert report["gate_region_with_observed"]["completed"]["iou"] == pytest.approx(1.0)
+    assert report["missing_cell_additions"]["eligible_iou"] == pytest.approx(1.0)
+    assert report["missing_cell_additions"]["eligible_iou_0p2m"] == pytest.approx(1.0)
+    assert report["missing_cell_additions"]["eligible_target"] == 1
     assert report["faulty_baseline_iou"] == pytest.approx(2 / 3)
     assert report["iou"] == pytest.approx(1.0)
     assert report["full_iou_improvement_pp"] == pytest.approx(100 / 3)
@@ -32,8 +34,9 @@ def test_fixed_validation_reports_gate_and_full_scene(monkeypatch):
 
 def test_mse_log_includes_requested_metrics_and_skipped_epochs():
     full = {"added": 0,
-            "fault_area": {"faulty": {"iou": 0.4, "iou_0p2m": 0.5},
-                           "completed": {"iou": 0.6, "iou_0p2m": 0.7}},
+            "missing_cell_additions": {
+                "eligible_iou": 0.6, "eligible_iou_0p2m": 0.7,
+                "precision": 0.8, "recall": 0.9, "eligible_target": 1_000},
             "faulty_baseline_iou": 0.68,
             "faulty_baseline_iou_0p2m": 0.69,
             "iou": 0.70, "iou_0p2m": 0.72,
@@ -41,8 +44,9 @@ def test_mse_log_includes_requested_metrics_and_skipped_epochs():
             "full_iou_0p2m_improvement_pp": 3.0}
     message = mse_epoch_log(5, 0.2, 0.3, full, 0.7)
     for label in ("train_noise_MSE=0.2000", "val_noise_MSE=0.3000",
-                  "fault_area_exact_IoU=40.00%->60.00%",
-                  "fault_area_IoU@0.2m=50.00%->70.00%",
+                  "missing_cell_exact_IoU=60.00%",
+                  "missing_cell_IoU@0.2m=70.00%",
+                  "eligible_missing=1,000",
                   "full_exact_IoU=68.00%->70.00% (+2.00 pp)",
                   "full_IoU@0.2m=69.00%->72.00% (+3.00 pp)"):
         assert label in message

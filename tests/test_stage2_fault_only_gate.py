@@ -9,6 +9,9 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.radar_pruner import SHAPE
 from models.radar_lidar_stage2.fault_only_gate import POLICY, fault_only_support
+from models.radar_lidar_stage2.fault_region import partial_azimuth_region
+from models.radar_lidar_stage2.mild_fault_data import partial_azimuth_loss
+from models.radar_lidar_stage2.sparse_geometry import GRID, voxelize_means
 from scripts import conditional_stage2
 from scripts import evaluate_stage2_conditional_reconstruction as evaluator
 from scripts import train_stage2_clean_denoiser as train_module
@@ -47,6 +50,19 @@ def test_boundary_cell_touching_reliable_sector_is_removed():
         mask, {"kind": "azimuth_sector", "start_rad": 0.0,
                "end_rad": 0.1})
     assert not result.any()
+
+
+def test_partial_loss_interior_gate_contains_no_surviving_faulty_voxels():
+    angles = np.linspace(-1.2, 1.2, 501, dtype=np.float32)
+    radius = np.linspace(8, 12, len(angles), dtype=np.float32)
+    clean = np.stack((radius * np.cos(angles), radius * np.sin(angles),
+                      np.zeros_like(angles)), axis=1)
+    faulty = partial_azimuth_loss(clean, 0.4, seed=17)
+    region = partial_azimuth_region(clean, 0.4, seed=17)
+    gate = fault_only_support(np.ones(SHAPE, dtype=np.bool_), region)
+    coords, _ = voxelize_means(torch.from_numpy(faulty), grid=GRID)
+    assert gate.any()
+    assert not gate[coords[:, 1], coords[:, 2], coords[:, 3]].any()
 
 
 def test_training_and_deployment_get_the_same_filtered_coordinates(monkeypatch):

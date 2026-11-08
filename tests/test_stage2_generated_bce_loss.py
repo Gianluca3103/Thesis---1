@@ -135,8 +135,9 @@ def test_fixed_validation_bce_matches_final_logits_and_counts_additions(monkeypa
 
 def test_bce_epoch_log_keeps_mse_and_occupancy_metrics():
     full = {"generated_bce": {"loss": 0.4}, "added": 25,
-            "fault_area": {"faulty": {"iou": 0.2, "iou_0p2m": 0.3},
-                           "completed": {"iou": 0.4, "iou_0p2m": 0.5}},
+            "missing_cell_additions": {
+                "eligible_iou": 0.4, "eligible_iou_0p2m": 0.5,
+                "precision": 0.6, "recall": 0.7, "eligible_target": 100},
             "faulty_baseline_iou": 0.6, "faulty_baseline_iou_0p2m": 0.6,
             "iou": 0.62, "iou_0p2m": 0.63,
             "full_iou_improvement_pp": 2.0,
@@ -146,7 +147,7 @@ def test_bce_epoch_log_keeps_mse_and_occupancy_metrics():
     for value in ("train_noise_MSE=0.2000", "train_BCE=0.5000",
                   "train_total_loss=0.2500", "val_noise_MSE=0.3000",
                   "val_BCE=0.4000", "val_total_loss=0.3400",
-                  "fault_area_exact_IoU=20.00%->40.00%",
+                  "missing_cell_exact_IoU=40.00%",
                   "full_exact_IoU=60.00%->62.00% (+2.00 pp)",
                   "additions@0.5=25"):
         assert value in log

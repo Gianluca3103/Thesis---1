@@ -76,7 +76,7 @@ def mse_epoch_log(epoch: int, train_mse: float, val_mse: float,
                   *, train_bce: float | None = None,
                   train_total: float | None = None,
                   bce_weight: float | None = None) -> str:
-    """Report noise loss and before/after occupancy on the same fixed gate."""
+    """Report missing-cell additions and full-ROI before/after occupancy."""
     prefix = (f"Epoch {epoch:03d}: train_noise_MSE={train_mse:.4f} "
               f"val_noise_MSE={val_mse:.4f}")
     if train_bce is not None:
@@ -91,12 +91,13 @@ def mse_epoch_log(epoch: int, train_mse: float, val_mse: float,
         val_bce = full["generated_bce"]["loss"]
         prefix += (f" val_BCE={val_bce:.4f} "
                    f"val_total_loss={val_mse + bce_weight * val_bce:.4f}")
-    faulty = full["fault_area"]["faulty"]
-    completed = full["fault_area"]["completed"]
+    missing = full["missing_cell_additions"]
     return (prefix +
-            f" fault_area_exact_IoU={faulty['iou']:.2%}->{completed['iou']:.2%}"
-            f" fault_area_IoU@0.2m={faulty['iou_0p2m']:.2%}->"
-            f"{completed['iou_0p2m']:.2%}"
+            f" missing_cell_exact_IoU={missing['eligible_iou']:.2%}"
+            f" missing_cell_IoU@0.2m={missing['eligible_iou_0p2m']:.2%}"
+            f" missing_cell_precision={missing['precision']:.2%}"
+            f" missing_cell_recall={missing['recall']:.2%}"
+            f" eligible_missing={missing['eligible_target']:,}"
             f" full_exact_IoU={full['faulty_baseline_iou']:.2%}->"
             f"{full['iou']:.2%} ({full['full_iou_improvement_pp']:+.2f} pp)"
             f" full_IoU@0.2m={full['faulty_baseline_iou_0p2m']:.2%}->"
