@@ -200,3 +200,22 @@ def test_validation_sweep_measures_generated_decoder_loss(monkeypatch):
         torch.ones(2, dtype=torch.bool), false_positive_weight=2.0)
     assert parts["positive_count"] == parts["negative_count"] == 1
     assert parts["loss"] == pytest.approx(float(expected))
+
+
+def test_periodic_validation_uses_only_fixed_threshold(monkeypatch):
+    fine = torch.tensor([[0, 0, 80, 50], [0, 0, 80, 51]])
+    logits = torch.tensor([1.0, 1.0])
+    monkeypatch.setattr(evaluator, "predict_batch", lambda *args, **kwargs: {
+        "fine": fine, "logits": logits})
+    monkeypatch.setattr(evaluator, "reference_clean", lambda *args: (
+        torch.tensor([[10.1, 0.1, -1.875]])))
+    rows = [[{"frame_id": "00001", "faulty_xyz": torch.zeros((0, 3))}]]
+    report = evaluator.fixed_threshold_validation(
+        None, rows, None, torch.ones(2), device="cpu", seed=1, steps=2,
+        decoder_loss_fp_weight=2.0)
+    assert report["threshold"] == 0.5
+    assert (report["tp"], report["predicted"], report["target"]) == (1, 2, 1)
+    assert report["iou"] == pytest.approx(0.5)
+    assert report["iou_0p2m"] == pytest.approx(0.5)
+    assert report["faulty_baseline_iou"] == 0.0
+    assert report["generated_decoder_loss"]["loss"] == pytest.approx(3.0)

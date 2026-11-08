@@ -190,6 +190,74 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
 
 
 @torch.no_grad()
+def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
+                               *, device: str, seed: int, steps: int,
+                               decoder_loss_fp_weight: float | None = None) -> dict:
+    """Validate generated occupancy at 0.5 without a threshold sweep."""
+    totals = {"frames": 0, "tp": 0, "predicted": 0, "target": 0,
+              "tolerant_tp_0p2m": 0, "faulty_tp": 0,
+              "faulty_predicted": 0}
+    errors = {"positive_error_sum": 0.0, "negative_error_sum": 0.0,
+              "positive_count": 0, "negative_count": 0}
+    for rows in tqdm(loader, desc="Conditional fixed-0.5 validation",
+                     unit="batch"):
+        output = predict_batch(model, rows, alpha_bars, device=device,
+                               seed=seed, steps=steps)
+        for frame, row in enumerate(rows):
+            candidates, logits = _frame_candidates(
+                output["fine"], output["logits"], frame,
+                row["faulty_xyz"], device)
+            additions = candidates[logits >= 0].cpu()
+            clean_xyz = reference_clean(raw_root, "val", row["frame_id"])
+            clean, faulty, completed = full_frame_voxels(
+                clean_xyz, row["faulty_xyz"], additions)
+            current = counts(completed, clean)
+            baseline = counts(faulty, clean)
+            tolerant = tolerant_occupancy_counts(
+                completed, clean, tolerance_m=0.2)
+            if (tolerant["predicted"] != current["predicted"] or
+                    tolerant["eligible_target"] != current["target"] or
+                    tolerant["exact_tp"] != current["tp"]):
+                raise RuntimeError("Exact and 0.2 m validation counts differ")
+            totals["frames"] += 1
+            for key in ("tp", "predicted", "target"):
+                totals[key] += current[key]
+            totals["tolerant_tp_0p2m"] += tolerant["tolerant_tp_0p2m"]
+            totals["faulty_tp"] += baseline["tp"]
+            totals["faulty_predicted"] += baseline["predicted"]
+            if decoder_loss_fp_weight is not None:
+                target = torch.isin(
+                    encode_keys(candidates, GRID.shape_zyx),
+                    encode_keys(clean.to(device), GRID.shape_zyx))
+                parts = error_sums(logits, target)
+                for key in errors:
+                    value = parts[key]
+                    errors[key] += (float(value) if isinstance(value, torch.Tensor)
+                                    else value)
+    union = totals["predicted"] + totals["target"] - totals["tp"]
+    tolerant_union = (totals["predicted"] + totals["target"] -
+                      totals["tolerant_tp_0p2m"])
+    baseline_union = (totals["faulty_predicted"] + totals["target"] -
+                      totals["faulty_tp"])
+    result = {"threshold": 0.5, **totals,
+              "iou": totals["tp"] / union if union else 0.0,
+              "iou_0p2m": (totals["tolerant_tp_0p2m"] / tolerant_union
+                            if tolerant_union else 0.0),
+              "faulty_baseline_iou": (totals["faulty_tp"] / baseline_union
+                                      if baseline_union else 0.0)}
+    if decoder_loss_fp_weight is not None:
+        positive = errors["positive_error_sum"] / max(errors["positive_count"], 1)
+        negative = errors["negative_error_sum"] / max(errors["negative_count"], 1)
+        result["generated_decoder_loss"] = {
+            "loss": positive + decoder_loss_fp_weight * negative,
+            "positive_mean_error": positive,
+            "negative_mean_error": negative,
+            "positive_count": errors["positive_count"],
+            "negative_count": errors["negative_count"]}
+    return result
+
+
+@torch.no_grad()
 def selected_metrics(model, loader, raw_root: Path, split: str, alpha_bars,
                      *, device: str, seed: int, steps: int,
                      threshold_index: int, role: dict | None,
@@ -338,6 +406,13 @@ def main() -> None:
               "threshold_selection": "full_scene_exact_IoU_on_validation_calibration_frames",
               "val_limit": args.val_limit, "test_limit": args.test_limit,
               "validation_note": (
+                  "Checkpoint selected using full validation at fixed 0.5 "
+                  "every few epochs; threshold swept once after training "
+                  "using validation calibration frames. Threshold-heldout "
+                  "frames also participated in checkpoint selection. "
+                  "Official test was untouched."
+                  if identity.get("checkpoint_selection") ==
+                  "fixed_0p5_full_validation_exact_iou" else
                   "Threshold uses calibration frames; heldout frames selected "
                   "the checkpoint across epochs. Official test was untouched."
                   if identity.get("checkpoint_selection") else

@@ -24,7 +24,8 @@ from scripts.conditional_stage2 import (
     CONDITIONED_FRESH_REVISION, CONDITIONED_FRESH_FAULT_ONLY_REVISION,
     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
     deployment_loader)
-from scripts.evaluate_stage2_conditional_reconstruction import sweep
+from scripts.evaluate_stage2_conditional_reconstruction import (
+    fixed_threshold_validation, sweep)
 from scripts.train_stage2_clean_denoiser import (
     MIN_RADAR_VOXELS, RADIUS_M, DecoderOccupancyConfig, _CleanRows, _atomic_save,
     _rows, _run_epoch)
@@ -62,6 +63,11 @@ def full_iou_at_half(sweep_report: dict) -> dict:
         result["iou_0p2m"] = (tolerant["tolerant_tp_0p2m"] /
                               tolerant_union if tolerant_union else 0.0)
     return result
+
+
+def reconstruction_validation_due(epoch: int, epochs: int, every: int) -> bool:
+    """Check reconstruction at the start, interval, and end of a run."""
+    return epoch == 1 or epoch % every == 0 or epoch == epochs
 
 
 def fresh_model(lpcr_path: Path, device: str) -> SparseResidualStage2:
@@ -108,6 +114,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--validation-steps", type=int, default=64)
+    parser.add_argument("--reconstruction-val-every", type=int, default=1)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--resume", type=Path)
@@ -121,6 +128,7 @@ def main() -> None:
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or not 2 <= args.validation_steps <= 1000 or
+            args.reconstruction_val_every < 1 or
             (args.generated_occupancy_loss and
              (not 1 <= args.gradient_steps <= args.rollout_steps <= 1000 or
               args.occupancy_loss_weight <= 0 or
@@ -199,8 +207,8 @@ def main() -> None:
             "decoder_false_positive_weight": args.false_positive_weight,
             "decoder_logit_margin": LOGIT_MARGIN,
             "decoder_loss_sites": "unobserved_fault_gated_fine_cells",
-            "checkpoint_selection":
-                "calibration_threshold_then_heldout_validation_exact_iou",
+            "reconstruction_val_every": args.reconstruction_val_every,
+            "checkpoint_selection": "fixed_0p5_full_validation_exact_iou",
             "initialize_from_sha256": (sha256(args.initialize_from)
                                        if args.initialize_from else None)})
     val_clean_dataset = paired_dataset(
@@ -288,17 +296,26 @@ def main() -> None:
                 eval_random_timesteps=True, eval_loss_only=True)
         if val_loss["frames"] != len(val_ids):
             raise RuntimeError("Validation noise loss did not cover all selected frames")
-        validation, _ = sweep(
-            model, val_loader, val_ids, args.data_cache_root, alpha_bars,
-            device=args.device, seed=args.seed, steps=args.validation_steps,
-            fixed_half_tolerance=True,
-            decoder_loss_fp_weight=(args.false_positive_weight
-                                    if decoder_config is not None else None))
-        full = full_iou_at_half(validation)
-        selection_iou = (validation["heldout"]["iou"]
-                         if decoder_config is not None else full["iou"])
-        improved = selection_iou > best_iou
-        best_iou = max(best_iou, selection_iou)
+        validation = None
+        full = None
+        if decoder_config is None:
+            validation, _ = sweep(
+                model, val_loader, val_ids, args.data_cache_root, alpha_bars,
+                device=args.device, seed=args.seed, steps=args.validation_steps,
+                fixed_half_tolerance=True)
+            full = full_iou_at_half(validation)
+        elif reconstruction_validation_due(
+                epoch, args.epochs, args.reconstruction_val_every):
+            full = fixed_threshold_validation(
+                model, val_loader, args.data_cache_root, alpha_bars,
+                device=args.device, seed=args.seed, steps=args.validation_steps,
+                decoder_loss_fp_weight=args.false_positive_weight)
+            if full["frames"] != len(val_ids):
+                raise RuntimeError("Fixed-threshold validation skipped frames")
+        selection_iou = full["iou"] if full is not None else None
+        improved = selection_iou is not None and selection_iou > best_iou
+        if improved:
+            best_iou = selection_iou
         record = {"epoch": epoch, "train_noise_mse": train["noise_mse"],
                   "val_noise_mse": val_loss["noise_mse"],
                   "val_noise_mse_frames": val_loss["frames"],
@@ -306,10 +323,10 @@ def main() -> None:
                       val_loss["validation_timestep_sampling"],
                   "val_full_roi_at_0p5": full,
                   "val_frames": len(val_ids),
-                  "val_calibration_selected": validation["calibration"],
-                  "val_threshold_heldout": validation["heldout"],
                   "best_val_selection_iou": best_iou}
         if decoder_config is None:
+            record["val_calibration_selected"] = validation["calibration"]
+            record["val_threshold_heldout"] = validation["heldout"]
             record["best_val_full_iou_at_0p5"] = best_iou
         else:
             record.update({
@@ -317,8 +334,8 @@ def main() -> None:
                 "train_total_loss": train["total_loss"],
                 "train_decoder_positive_sites": train["decoder_positive_sites"],
                 "train_decoder_negative_sites": train["decoder_negative_sites"],
-                "val_generated_decoder_occupancy_loss":
-                    validation["generated_decoder_loss"]["heldout"]})
+                "val_generated_decoder_occupancy_loss": (
+                    full["generated_decoder_loss"] if full else None)})
         with (args.output_root / "history.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         checkpoint = {"identity": identity, "epoch": epoch,
@@ -332,25 +349,26 @@ def main() -> None:
         _atomic_save(args.output_root / "last.ckpt", checkpoint)
         if improved:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
-        decoder_log = (
-            f"train_decoder_loss={train['decoder_occupancy_loss']:.4f} "
-            f"val_generated_decoder_loss="
-            f"{validation['generated_decoder_loss']['heldout']['loss']:.4f} "
-            f"train_total_loss={train['total_loss']:.4f} "
-            if decoder_config is not None else "")
-        selection_name = ("best_calibrated_heldout_exact_IoU" if
-                          decoder_config is not None else
-                          "best_fixed_threshold_exact_IoU")
+        decoder_log = (f"train_decoder_loss={train['decoder_occupancy_loss']:.4f} "
+                       f"train_total_loss={train['total_loss']:.4f} "
+                       if decoder_config is not None else "")
+        metric_log = (f"val_full_exact_IoU={full['iou']:.2%} "
+                      f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
+                      f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "
+                      if full is not None else "reconstruction_val=skipped ")
+        if decoder_config is not None and full is not None:
+            metric_log += (f"val_generated_decoder_loss="
+                           f"{full['generated_decoder_loss']['loss']:.4f} ")
+        if decoder_config is None:
+            metric_log += (f"heldout_calibrated_exact_IoU="
+                           f"{validation['heldout']['iou']:.2%} "
+                           f"calibrated_probability_threshold="
+                           f"{validation['threshold']:.3f} ")
         print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
               f"val_noise_MSE={val_loss['noise_mse']:.4f} "
-              f"{decoder_log}"
-              f"val_full_exact_IoU={full['iou']:.2%} "
-              f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
-              f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "
-              f"heldout_calibrated_exact_IoU={validation['heldout']['iou']:.2%} "
-              f"calibrated_probability_threshold={validation['threshold']:.3f} "
+              f"{decoder_log}{metric_log}"
               f"occupancy_probability_threshold=0.5 "
-              f"{selection_name}={best_iou:.2%}", flush=True)
+              f"best_fixed_threshold_exact_IoU={best_iou:.2%}", flush=True)
     print(f"Best checkpoint: {args.output_root / 'best_iou.ckpt'}", flush=True)
 
 

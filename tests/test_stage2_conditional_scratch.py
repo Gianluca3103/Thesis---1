@@ -1,7 +1,14 @@
 """Full-scene checkpoint selection for a clean-input-free validation pass."""
 
 from models.radar_lidar_stage2.clean_thresholds import THRESHOLD_STEPS
-from scripts.train_stage2_conditional_from_scratch import full_iou_at_half
+from scripts.train_stage2_conditional_from_scratch import (
+    full_iou_at_half, reconstruction_validation_due)
+
+
+def test_reconstruction_validation_is_periodic_and_includes_final_epoch():
+    due = [epoch for epoch in range(1, 13)
+           if reconstruction_validation_due(epoch, 12, 5)]
+    assert due == [1, 5, 10, 12]
 
 
 def test_fixed_half_threshold_combines_all_validation_frames():

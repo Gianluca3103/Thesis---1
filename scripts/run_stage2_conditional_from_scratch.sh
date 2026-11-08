@@ -43,9 +43,11 @@ LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/b
 if [[ "$DECODER_LOSS" == 1 ]]; then
   BATCH_SIZE=${BATCH_SIZE:-8}
   EPOCHS=${EPOCHS:-25}
+  RECON_VAL_EVERY=${RECON_VAL_EVERY:-5}
 else
   BATCH_SIZE=${BATCH_SIZE:-16}
   EPOCHS=${EPOCHS:-125}
+  RECON_VAL_EVERY=1
 fi
 VAL_STEPS=${VAL_STEPS:-64}
 if [[ ! -s "$LPCR" ]]; then
@@ -76,7 +78,8 @@ if [[ "$DECODER_LOSS" == 1 ]]; then
     --rollout-steps "$ROLLOUT_STEPS"
     --gradient-steps "$GRADIENT_STEPS"
     --occupancy-loss-weight "$OCCUPANCY_LOSS_WEIGHT"
-    --false-positive-weight "$FALSE_POSITIVE_WEIGHT")
+    --false-positive-weight "$FALSE_POSITIVE_WEIGHT"
+    --reconstruction-val-every "$RECON_VAL_EVERY")
   smoke_decoder_arg=(--rollout-steps 4 --gradient-steps 2)
   if [[ -n "$INIT" ]]; then
     decoder_arg+=(--initialize-from "$INIT")
@@ -110,14 +113,14 @@ resume=()
 if [[ -s "$OUT/last.ckpt" ]]; then
   resume=(--resume "$OUT/last.ckpt")
 fi
-printf 'Training %s epochs; full validation with %s noise-starting steps every epoch.\n' \
-  "$EPOCHS" "$VAL_STEPS"
+printf 'Training %s epochs; noise loss each epoch; fixed-0.5 reconstruction validation every %s epochs with %s steps.\n' \
+  "$EPOCHS" "$RECON_VAL_EVERY" "$VAL_STEPS"
 "$PY" -u -m scripts.train_stage2_conditional_from_scratch \
   "${common[@]}" --output-root "$OUT" --epochs "$EPOCHS" \
   --validation-steps "$VAL_STEPS" "${resume[@]}" \
   2>&1 | tee -a "$OUT/train.log"
 
-printf 'Scoring the best validation-IoU checkpoint on official validation and test.\n'
+printf 'Sweeping thresholds once on the best validation-IoU checkpoint, then scoring official validation and test.\n'
 "$PY" -u -m scripts.evaluate_stage2_conditional_reconstruction \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --support-cache-root "$SUPPORT" --faulty-root "$MILD" \
