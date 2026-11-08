@@ -580,6 +580,22 @@ training run is interrupted. The existing Stage-II export is reused.
 
 ### Conditional reconstruction without clean LiDAR at prediction time
 
+`scripts/run_stage2_conditional_from_scratch.sh` trains a fresh conditional
+epsilon-prediction sparse U-Net and radar adapter from random initialization.
+The pretrained LiDAR encoder and LPCR decoder remain frozen. Training uses
+clean LiDAR only to form a noisy target latent and its epsilon target;
+faulty LiDAR and measured radar condition the U-Net. No previous denoiser
+checkpoint is loaded. Every epoch validates all 1,296 frames by starting
+from Gaussian noise and running 64 DDIM steps with only faulty LiDAR and
+radar entering the prediction path. The best checkpoint maximizes full-scene
+exact IoU at a fixed 0.5 threshold. After 125 epochs by default, the runner
+calibrates a full-scene threshold on validation and scores all official test
+frames. This is a long GPU run because validation performs a full reverse
+chain every epoch; `EPOCHS` and `VAL_STEPS` can be overridden explicitly.
+The prior BCE addition head is excluded from this run because it was trained
+with clean-seeded decoder features; it needs its own generated-feature trial.
+
+For a valid evaluation of the older conditioned denoiser without retraining,
 `scripts/run_stage2_conditional_reconstruction.sh` evaluates the saved
 faulty-LiDAR/radar-conditioned epsilon denoiser as a conditional generator.
 The model receives only the measured radar, cached faulty LiDAR, the fixed

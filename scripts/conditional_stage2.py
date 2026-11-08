@@ -23,6 +23,9 @@ from scripts.train_stage2_clean_denoiser import (
     _conditioned_inputs, _rows)
 
 
+CONDITIONED_FRESH_REVISION = "stage2_conditioned_fresh_epsilon_full_noise_validation_v1"
+
+
 class DeploymentRows:
     """Supply radar gate, measured radar, and faulty LiDAR; no clean points."""
 
@@ -52,9 +55,10 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     identity = saved.get("identity")
     if (not isinstance(identity, dict) or
-            identity.get("revision") != CONDITIONED_ONE_STEP_REVISION or
+            identity.get("revision") not in
+            (CONDITIONED_ONE_STEP_REVISION, CONDITIONED_FRESH_REVISION) or
             identity.get("lpcr_sha256") != sha256(lpcr_path)):
-        raise ValueError("Expected a conditioned one-step denoiser checkpoint")
+        raise ValueError("Expected a conditioned epsilon-denoiser checkpoint")
     pretrained = torch.load(lpcr_path, map_location="cpu", weights_only=False)
     if (pretrained.get("version") != VERSION or
             pretrained.get("model_revision") != LPCR_REVISION or
