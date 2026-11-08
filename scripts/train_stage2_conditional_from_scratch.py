@@ -176,14 +176,15 @@ def main() -> None:
         identity.update({"training_loss": "epsilon_mse_plus_regular_occupancy_bce",
                          "occupancy_bce_timestep": 499,
                          "occupancy_bce_sites": "all_fault_gated_fine_cells"})
+    val_clean_dataset = paired_dataset(
+        args.vod_root, "val", identity["radar_variant"],
+        include_clean=True, data_cache_root=args.data_cache_root)
+    val_clean_ids = [frame.frame_id for frame in val_clean_dataset.frames]
+    val_regions = None
     if train_regions is not None:
-        val_dataset_for_regions = paired_dataset(
-            args.vod_root, "val", identity["radar_variant"],
-            include_clean=False, data_cache_root=args.data_cache_root)
-        val_region_ids = [frame.frame_id for frame in val_dataset_for_regions.frames]
         val_regions = FaultRegionCache(
             args.fault_region_root / "val",
-            cache_identity("val", val_region_ids,
+            cache_identity("val", val_clean_ids,
                            args.faulty_root / "val" / "manifest.json",
                            args.data_cache_root / "val" / "manifest.json"))
         if val_regions.regions is None:
@@ -192,10 +193,25 @@ def main() -> None:
                          "fault_region_sha256": {
                              "train": sha256(train_regions.regions_path),
                              "val": sha256(val_regions.regions_path)}})
+    val_support = RadarSupportCache(
+        args.support_cache_root / "val",
+        support_identity("val", val_clean_ids, identity["radar_variant"],
+                         data_cache_root=args.data_cache_root,
+                         radius_m=RADIUS_M,
+                         min_radar_voxels=MIN_RADAR_VOXELS))
+    val_support.check_complete()
+    val_loss_loader = DataLoader(
+        _CleanRows(val_clean_dataset, val_support, args.val_limit,
+                   args.faulty_root, "val", fault_regions=val_regions),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
+        persistent_workers=args.num_workers > 0)
     val_loader, val_ids, _ = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, "val", identity, args.num_workers, args.val_limit,
         fault_region_root=args.fault_region_root)
+    if val_clean_ids[:args.val_limit] != val_ids:
+        raise ValueError("Validation loss and deployment frames differ")
     args.output_root.mkdir(parents=True, exist_ok=True)
     start, best_iou = 1, -1.0
     if args.resume:
@@ -219,6 +235,16 @@ def main() -> None:
             seed=args.seed, condition_faulty_radar=True,
             train_radar_adapter=True, occupancy_bce=args.occupancy_bce)
         model.eval()
+        with torch.no_grad():
+            val_loss = _run_epoch(
+                model, tqdm(val_loss_loader,
+                            desc=f"Conditional noise-MSE val {epoch:03d}",
+                            unit="batch"), None, alpha_bars,
+                device=args.device, epoch=epoch, eval_timestep=499,
+                seed=args.seed, condition_faulty_radar=True,
+                eval_random_timesteps=True, eval_loss_only=True)
+        if val_loss["frames"] != len(val_ids):
+            raise RuntimeError("Validation noise loss did not cover all selected frames")
         validation, _ = sweep(
             model, val_loader, val_ids, args.data_cache_root, alpha_bars,
             device=args.device, seed=args.seed, steps=args.validation_steps,
@@ -227,6 +253,10 @@ def main() -> None:
         improved = full["iou"] > best_iou
         best_iou = max(best_iou, full["iou"])
         record = {"epoch": epoch, "train_noise_mse": train["noise_mse"],
+                  "val_noise_mse": val_loss["noise_mse"],
+                  "val_noise_mse_frames": val_loss["frames"],
+                  "val_noise_mse_timestep_sampling":
+                      val_loss["validation_timestep_sampling"],
                   "val_full_roi_at_0p5": full,
                   "val_frames": len(val_ids),
                   "val_calibration_selected": validation["calibration"],
@@ -250,6 +280,7 @@ def main() -> None:
                    f"train_total_loss={train['total_loss']:.4f} "
                    if args.occupancy_bce else "")
         print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
+              f"val_noise_MSE={val_loss['noise_mse']:.4f} "
               f"{bce_log}"
               f"val_full_exact_IoU={full['iou']:.2%} "
               f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "

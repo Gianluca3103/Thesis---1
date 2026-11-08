@@ -230,10 +230,15 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                reverse_val_steps: int = 0,
                condition_faulty_radar: bool = False,
                train_radar_adapter: bool = False,
-               occupancy_bce: bool = False) -> dict:
+               occupancy_bce: bool = False,
+               eval_random_timesteps: bool = False,
+               eval_loss_only: bool = False) -> dict:
     training = optimizer is not None
     if occupancy_bce and (not training or reverse_train_steps):
         raise ValueError("Occupancy BCE requires single-pass training")
+    if eval_loss_only and (training or not eval_random_timesteps or
+                           reverse_val_steps):
+        raise ValueError("Loss-only validation requires random single-pass timesteps")
     model.eval()
     model.diffusion.train(training)
     generator = torch.Generator(device=device)
@@ -303,7 +308,7 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                 torch.nn.utils.clip_grad_norm_(model.diffusion.parameters(), 1.0)
                 optimizer.step()
         else:
-            if training:
+            if training or eval_random_timesteps:
                 steps = torch.randint(len(alpha_bars), (len(rows),),
                                       device=device, generator=generator)
             else:
@@ -357,7 +362,7 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                         bce_sum += float(bce_loss.detach()) * len(rows)
                         total_sum += float(total_loss.detach()) * len(rows)
         loss_sum += float(loss.detach()) * len(rows)
-        if not training:
+        if not training and not eval_loss_only:
             with torch.no_grad():
                 if not reverse_count:
                     recovered = ((xt - (1 - alpha).sqrt() * predicted_noise)
@@ -385,12 +390,15 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
         output.update({"occupancy_bce": bce_sum / max(frames, 1),
                        "total_loss": total_sum / max(frames, 1),
                        "bce_timestep": eval_timestep})
-    if not training:
+    if not training and not eval_loss_only:
         output.update({"recovered_clean_latent_mse": latent_mse_sum / max(frames, 1),
                        "eligible_occupancy": occupancy_metrics(counts),
                        "frozen_lpcr_oracle": occupancy_metrics(oracle),
                        "occupancy_threshold": 0.5,
                        "eval_timestep": eval_timestep if not reverse_count else None})
+    if eval_loss_only:
+        output.update({"validation_timestep_sampling": "uniform_over_training_schedule",
+                       "validation_seed": seed})
     if reverse_count:
         output.update({"sampling": "sequential_DDIM_from_Gaussian_noise",
                        "reverse_steps": reverse_count,
