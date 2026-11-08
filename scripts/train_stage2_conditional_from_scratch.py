@@ -21,6 +21,7 @@ from models.radar_lidar_stage2.sparse_residual import (
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.conditional_stage2 import (
     CONDITIONED_FRESH_REVISION, CONDITIONED_FRESH_FAULT_ONLY_REVISION,
+    CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
     deployment_loader)
 from scripts.evaluate_stage2_conditional_reconstruction import sweep
 from scripts.train_stage2_clean_denoiser import (
@@ -92,6 +93,8 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--fault-region-root", type=Path)
+    parser.add_argument("--occupancy-bce", action="store_true",
+                        help="Add ordinary clean-occupancy BCE on fault-gated cells")
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=125)
@@ -105,6 +108,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.occupancy_bce and args.fault_region_root is None:
+        parser.error("Occupancy BCE trial requires --fault-region-root")
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or not 2 <= args.validation_steps <= 1000 or
@@ -145,7 +150,9 @@ def main() -> None:
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     identity = {
-        "revision": (CONDITIONED_FRESH_FAULT_ONLY_REVISION
+        "revision": (CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION
+                     if args.occupancy_bce else
+                     CONDITIONED_FRESH_FAULT_ONLY_REVISION
                      if train_regions is not None else CONDITIONED_FRESH_REVISION),
         "lpcr_sha256": sha256(args.lpcr_checkpoint),
         "radar_variant": "radar_20frames_verified_doppler_radial",
@@ -165,6 +172,10 @@ def main() -> None:
         "validation_steps": args.validation_steps,
         "validation_model_inputs": "faulty_LiDAR_radar_Gaussian_noise",
         "fresh_diffusion_and_radar_adapter": True}
+    if args.occupancy_bce:
+        identity.update({"training_loss": "epsilon_mse_plus_regular_occupancy_bce",
+                         "occupancy_bce_timestep": 499,
+                         "occupancy_bce_sites": "all_fault_gated_fine_cells"})
     if train_regions is not None:
         val_dataset_for_regions = paired_dataset(
             args.vod_root, "val", identity["radar_variant"],
@@ -206,7 +217,7 @@ def main() -> None:
                         unit="batch"), optimizer, alpha_bars,
             device=args.device, epoch=epoch, eval_timestep=499,
             seed=args.seed, condition_faulty_radar=True,
-            train_radar_adapter=True)
+            train_radar_adapter=True, occupancy_bce=args.occupancy_bce)
         model.eval()
         validation, _ = sweep(
             model, val_loader, val_ids, args.data_cache_root, alpha_bars,
@@ -221,6 +232,9 @@ def main() -> None:
                   "val_calibration_selected": validation["calibration"],
                   "val_threshold_heldout": validation["heldout"],
                   "best_val_full_iou_at_0p5": best_iou}
+        if args.occupancy_bce:
+            record.update({"train_occupancy_bce": train["occupancy_bce"],
+                           "train_total_loss": train["total_loss"]})
         with (args.output_root / "history.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         checkpoint = {"identity": identity, "epoch": epoch,
@@ -232,7 +246,11 @@ def main() -> None:
         _atomic_save(args.output_root / "last.ckpt", checkpoint)
         if improved:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
+        bce_log = (f"train_occupancy_BCE={train['occupancy_bce']:.4f} "
+                   f"train_total_loss={train['total_loss']:.4f} "
+                   if args.occupancy_bce else "")
         print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
+              f"{bce_log}"
               f"val_full_exact_IoU={full['iou']:.2%} "
               f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
               f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "

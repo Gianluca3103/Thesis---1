@@ -29,6 +29,8 @@ from scripts.train_stage2_clean_denoiser import (
 CONDITIONED_FRESH_REVISION = "stage2_conditioned_fresh_epsilon_full_noise_validation_v1"
 CONDITIONED_FRESH_FAULT_ONLY_REVISION = (
     "stage2_conditioned_fresh_epsilon_fault_only_gate_v1")
+CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION = (
+    "stage2_conditioned_fresh_epsilon_bce_fault_only_gate_v1")
 CONDITIONED_FAULTY_START_REVISION = "stage2_conditioned_faulty_start_clean_target_v1"
 CONDITIONED_FAULT_ONLY_REVISION = "stage2_conditioned_faulty_start_fault_only_gate_v1"
 
@@ -71,6 +73,7 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
             identity.get("revision") not in
             (CONDITIONED_ONE_STEP_REVISION, CONDITIONED_FRESH_REVISION,
              CONDITIONED_FRESH_FAULT_ONLY_REVISION,
+             CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
              CONDITIONED_FAULTY_START_REVISION,
              CONDITIONED_FAULT_ONLY_REVISION) or
             identity.get("lpcr_sha256") != sha256(lpcr_path)):
@@ -100,7 +103,8 @@ def deployment_loader(vod_root: Path, raw_root: Path, support_root: Path,
     if (identity.get("fault_region_policy") not in (None, POLICY) or
             (identity.get("revision") in
              (CONDITIONED_FAULT_ONLY_REVISION,
-              CONDITIONED_FRESH_FAULT_ONLY_REVISION) and
+              CONDITIONED_FRESH_FAULT_ONLY_REVISION,
+              CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION) and
              identity.get("fault_region_policy") != POLICY)):
         raise ValueError("Unknown or incomplete fault-region gate policy")
     if split in ("train", "val"):
