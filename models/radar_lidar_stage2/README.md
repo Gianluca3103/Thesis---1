@@ -595,6 +595,11 @@ directory and writes a test report and, if the Gaussian-start report exists,
 `comparison_with_gaussian_start.json`. The two runs share data, gate, frozen
 LPCR, and evaluation metrics, but use different starting states and samplers;
 compare the final validation/test IoU rather than their training MSE values.
+Each epoch logs the sole optimized loss (noise-equivalent MSE) for training
+and validation. Validation uses a fixed noise draw for a stable loss curve.
+It also logs full-scene exact IoU and 0.2 m voxel-center occupancy IoU; both
+use a fixed 0.5 *occupancy probability* cutoff. The checkpoint selection
+remains based on full-scene exact IoU at that cutoff.
 
 `scripts/run_stage2_conditional_from_scratch.sh` trains a fresh conditional
 epsilon-prediction sparse U-Net and radar adapter from random initialization.

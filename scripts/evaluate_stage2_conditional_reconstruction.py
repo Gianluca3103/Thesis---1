@@ -15,7 +15,9 @@ from models.radar_lidar_stage2.clean_selected_metrics import (
     add_frame, completion_summary, empty_accumulator, full_frame_voxels)
 from models.radar_lidar_stage2.clean_thresholds import (
     THRESHOLD_STEPS, score_histograms, sweep_rows)
-from models.radar_lidar_stage2.sparse_geometry import GRID
+from models.radar_lidar_stage2.eligible_occupancy_metrics import (
+    occupancy_counts as tolerant_occupancy_counts)
+from models.radar_lidar_stage2.sparse_geometry import GRID, sorted_unique
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.conditional_stage2 import (
@@ -67,7 +69,8 @@ def _frame_candidates(fine: torch.Tensor, logits: torch.Tensor, frame: int,
 @torch.no_grad()
 def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
           *, device: str, seed: int, steps: int,
-          sampler: str = "gaussian_ddim", timestep: int = 499):
+          sampler: str = "gaussian_ddim", timestep: int = 499,
+          fixed_half_tolerance: bool = False):
     role = {frame_id: ("calibration" if (index // 20) % 5 == 0 else "heldout")
             for index, frame_id in enumerate(ids)}
     stores = {name: {"positive": torch.zeros(THRESHOLD_STEPS + 1,
@@ -75,6 +78,9 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
                      "negative": torch.zeros(THRESHOLD_STEPS + 1,
                                             dtype=torch.long),
                      "baseline": {"tp": 0, "predicted": 0, "target": 0},
+                     "fixed_half_tolerant": {
+                         "predicted": 0, "eligible_target": 0,
+                         "exact_tp": 0, "tolerant_tp_0p2m": 0},
                      "frames": 0}
               for name in ("calibration", "heldout")}
     for rows in tqdm(loader, desc="Conditional Stage II validation sweep",
@@ -101,18 +107,34 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
             positive, negative = score_histograms(logits.sigmoid(), target)
             store["positive"] += positive
             store["negative"] += negative
+            if fixed_half_tolerance:
+                # The 0.5 here is the occupancy decision threshold. The
+                # distance tolerance for matching voxel centers is 0.2 m.
+                bucket = (torch.floor(logits.sigmoid() * THRESHOLD_STEPS)
+                          .long().clamp(0, THRESHOLD_STEPS))
+                additions = candidates[bucket >= THRESHOLD_STEPS // 2].cpu()
+                completed = sorted_unique(
+                    torch.cat((faulty, additions), 0), GRID.shape_zyx)
+                matched = tolerant_occupancy_counts(
+                    completed, clean, tolerance_m=0.2)
+                for key, value in matched.items():
+                    store["fixed_half_tolerant"][key] += value
     curves = {name: curve(store["positive"], store["negative"],
                           store["baseline"])
               for name, store in stores.items()}
     index = max(range(THRESHOLD_STEPS + 2),
                 key=lambda i: (curves["calibration"][i]["iou"],
                                curves["calibration"][i]["threshold"]))
-    return {"threshold": curves["calibration"][index]["threshold"],
+    result = {"threshold": curves["calibration"][index]["threshold"],
             "selected_index": index,
             "frames": {name: store["frames"] for name, store in stores.items()},
             "calibration": curves["calibration"][index],
             "heldout": curves["heldout"][index],
-            "curves": curves}, role
+            "curves": curves}
+    if fixed_half_tolerance:
+        result["fixed_half_tolerant"] = {
+            name: store["fixed_half_tolerant"] for name, store in stores.items()}
+    return result, role
 
 
 @torch.no_grad()

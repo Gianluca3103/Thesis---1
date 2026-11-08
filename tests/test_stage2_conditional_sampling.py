@@ -126,7 +126,27 @@ def test_validation_predicts_before_loading_clean_reference(monkeypatch):
     row = {"frame_id": "00164", "faulty_xyz": clean[:0]}
     report, role = evaluator.sweep(
         None, [[row]], ["00164"], Path("."), torch.ones(1000),
-        device="cpu", seed=3103, steps=4)
+        device="cpu", seed=3103, steps=4,
+        fixed_half_tolerance=True)
     assert events == ["prediction", "reference"]
     assert report["calibration"]["iou"] == 1.0
+    assert report["fixed_half_tolerant"]["calibration"] == {
+        "predicted": 1, "eligible_target": 1,
+        "exact_tp": 1, "tolerant_tp_0p2m": 1}
     assert role["00164"] == "calibration"
+
+
+def test_fixed_half_validation_reports_0p2m_voxel_center_iou(monkeypatch):
+    fine = torch.tensor([[0, 8, 80, 10], [0, 8, 80, 11]])
+    clean = torch.from_numpy(voxel_centers(fine[:1])).float()
+    monkeypatch.setattr(evaluator, "predict_batch", lambda *args, **kwargs: {
+        "fine": fine, "logits": torch.tensor([-10.0, 10.0])})
+    monkeypatch.setattr(evaluator, "reference_clean",
+                        lambda *args: clean)
+    report, _ = evaluator.sweep(
+        None, [[{"frame_id": "00164", "faulty_xyz": clean[:0]}]],
+        ["00164"], Path("."), torch.ones(1000), device="cpu", seed=3103,
+        steps=4, fixed_half_tolerance=True)
+    counts = report["fixed_half_tolerant"]["calibration"]
+    assert counts == {"predicted": 1, "eligible_target": 1,
+                      "exact_tp": 0, "tolerant_tp_0p2m": 1}
