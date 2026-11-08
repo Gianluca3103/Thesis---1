@@ -56,7 +56,9 @@ def _fog_cache(root: Path, split: str, seed: int) -> SevereFogCache:
 def _build_frame(job: tuple) -> tuple[str, str, str, int, int, int]:
     (frame_id, split, fault_type, seed, clean_path, fog_root, destination,
      source_hash) = job
-    expected = {"version": MILD_FAULT_VERSION, "frame_id": frame_id,
+    expected = {"version": MILD_FAULT_VERSION,
+                "fog_return_policy": "original_xyz_presence_ignore_intensity_v2",
+                "frame_id": frame_id,
                 "split": split, "fault_type": fault_type, "seed": seed,
                 "encoding": MILD_FAULT_ENCODING,
                 "source_manifest_sha256": source_hash}
@@ -139,7 +141,9 @@ def main() -> None:
         source_hash = hashlib.sha256((
             _sha256(args.data_cache_root / split / "manifest.json")
             + _sha256(fog_manifest_path)).encode()).hexdigest()
-        manifest = {"version": MILD_FAULT_VERSION, "split": split,
+        manifest = {"version": MILD_FAULT_VERSION,
+                    "fog_return_policy": "original_xyz_presence_ignore_intensity_v2",
+                    "split": split,
                     "seed": args.seed, "radar_variant": args.radar_variant,
                     "vod_root": str(args.vod_root.resolve()),
                     "data_cache_root": str(args.data_cache_root.resolve()),

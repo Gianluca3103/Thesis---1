@@ -6,9 +6,14 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage2.fault_data import (
-    decode_fog_points, encode_fog_points, fog_detection_floor,
+    decode_fog_points, encode_fog_points,
     retain_original_fog_returns,
     severe_fault,
+)
+from models.radar_lidar_stage2.addition import addition_context
+from models.radar_lidar_stage2.mild_fault_data import (
+    LEGACY_MILD_FOG2_VERSION, MILD_FOG2_TYPES, MILD_FOG2_VERSION,
+    fault_types_for_version,
 )
 from models.radar_lidar_stage2.sparse_batch import voxelize_means_batched
 
@@ -43,16 +48,30 @@ class TestStage2LidarFeatures(unittest.TestCase):
         np.testing.assert_array_equal(retained, clean[:, :3])
         self.assertEqual(retained.shape[1], 3)
 
-    def test_fog_attenuation_removes_unchanged_xyz(self):
+    def test_fog_attenuation_does_not_remove_unchanged_xyz(self):
         clean = np.array([[1, 0, 0, 100], [2, 0, 0, 80],
                           [3, 0, 0, 40]], dtype=np.float32)
-        self.assertEqual(fog_detection_floor(clean), 48.0)
         simulated = np.array([[1, 0, 0, 80], [2, 0, 0, 20],
                               [3, 0, 0, 0]], dtype=np.float32)
         np.testing.assert_array_equal(
-            retain_original_fog_returns(clean, simulated), clean[:1, :3])
+            retain_original_fog_returns(clean, simulated), clean[:, :3])
         with self.assertRaisesRegex(ValueError, "attenuated intensity"):
             retain_original_fog_returns(clean, simulated[:, :3])
+
+    def test_only_xyz_absence_makes_an_eligible_voxel_unobserved(self):
+        clean = np.array([[1, 0, 0, 100], [2, 0, 0, 80]], dtype=np.float32)
+        simulated = np.array([[1, 0, 0, 0]], dtype=np.float32)
+        faulty = retain_original_fog_returns(clean, simulated)
+        allowed = torch.tensor([[0, 8, 80, 5], [0, 8, 80, 10]])
+        observed = addition_context(torch.from_numpy(faulty), allowed).observed
+        self.assertEqual(observed.tolist(), [True, False])
+
+    def test_old_and_new_cache_versions_are_readable_but_distinct(self):
+        self.assertNotEqual(LEGACY_MILD_FOG2_VERSION, MILD_FOG2_VERSION)
+        self.assertEqual(fault_types_for_version(LEGACY_MILD_FOG2_VERSION),
+                         MILD_FOG2_TYPES)
+        self.assertEqual(fault_types_for_version(MILD_FOG2_VERSION),
+                         MILD_FOG2_TYPES)
 
     def test_fog_fault_exposes_only_original_xyz(self):
         clean = torch.tensor([[1.0, 2.0, 3.0, 120.0],
@@ -65,7 +84,7 @@ class TestStage2LidarFeatures(unittest.TestCase):
         faulty, name = severe_fault(clean, "00001", 0, Cache(),
                                     fault_type="fog_sim")
         self.assertEqual(name, "fog_sim")
-        torch.testing.assert_close(faulty, clean[:1, :3])
+        torch.testing.assert_close(faulty, clean[:, :3])
 
     def test_fog_cache_shuffle_preserves_float32_bits(self):
         points = np.array([[1.125, -0.0, 3.5, 28.0],

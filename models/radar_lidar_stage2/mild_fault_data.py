@@ -7,19 +7,21 @@ import hashlib
 import numpy as np
 
 
-MILD_FAULT_VERSION = "stage2_mild_fog5_partial_v1"
+MILD_FAULT_VERSION = "stage2_mild_fog5_partial_xyz_presence_v2"
+LEGACY_MILD_FAULT_VERSION = "stage2_mild_fog5_partial_v1"
 MILD_FAULT_TYPES = ("fog_sim_5", "partial_loss_30", "partial_loss_40",
                     "partial_loss_50")
-MILD_FOG2_VERSION = "stage2_mild_fog2_partial_v1"
+MILD_FOG2_VERSION = "stage2_mild_fog2_partial_xyz_presence_v2"
+LEGACY_MILD_FOG2_VERSION = "stage2_mild_fog2_partial_v1"
 MILD_FOG2_TYPES = ("fog_sim_2", "partial_loss_30", "partial_loss_40",
                    "partial_loss_50")
 MILD_FAULT_ENCODING = "xyz_float32_byte_shuffle_v1"
 
 
 def fault_types_for_version(version: str) -> tuple[str, ...]:
-    if version == MILD_FAULT_VERSION:
+    if version in (MILD_FAULT_VERSION, LEGACY_MILD_FAULT_VERSION):
         return MILD_FAULT_TYPES
-    if version == MILD_FOG2_VERSION:
+    if version in (MILD_FOG2_VERSION, LEGACY_MILD_FOG2_VERSION):
         return MILD_FOG2_TYPES
     raise ValueError(f"Unknown mild-fault dataset version: {version}")
 

@@ -10,7 +10,7 @@ import torch
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_stage2.fault_data import (
-    FAULT_NAMES, SevereFogCache, fog_detection_floor, selected_fault,
+    FAULT_NAMES, SevereFogCache, selected_fault,
     severe_fault,
 )
 from models.radar_lidar_stage2.sparse_geometry import GRID
@@ -76,19 +76,12 @@ def main() -> None:
     if len(fog) > len(clean) or not fog_from_clean.all():
         raise AssertionError("Fog input contains a synthetic point or extra return")
     counts["faults"]["fog_sim"]["clean_points_removed"] = len(clean) - len(fog)
-    counts["faults"]["fog_sim"]["detection_floor"] = fog_detection_floor(
-        clean.numpy())
-    counts["faults"]["fog_sim"]["simulated_below_floor"] = int((
-        cache.load(row["frame_id"])[:, 3] <
-        counts["faults"]["fog_sim"]["detection_floor"]).sum())
     clean_voxels, fog_voxels = _roi_voxel_count(clean), _roi_voxel_count(fog)
     counts["faults"]["fog_sim"]["roi_clean_occupied_voxels"] = clean_voxels
     counts["faults"]["fog_sim"]["roi_occupied_voxels_removed"] = (
         clean_voxels - fog_voxels)
     counts["faults"]["fog_sim"]["roi_faulty_baseline_iou"] = (
         fog_voxels / clean_voxels if clean_voxels else 1.0)
-    if len(clean) and len(fog) == len(clean):
-        raise AssertionError("Fog did not remove any returns in this frame")
     combined, batch_ids = _combine_points(faulty_clouds)
     if len(combined) != sum(len(cloud) for cloud in faulty_clouds):
         raise AssertionError("Empty total-loss frame broke physical batching")

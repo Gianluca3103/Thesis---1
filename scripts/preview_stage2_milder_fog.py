@@ -1,7 +1,7 @@
 """Compare lighter fog (severity 2 by default) against severity 5.
 
 The preview applies the original simulator to raw VoD LiDAR, crops to the
-Stage-II radar sector, and retains only original detectable XYZ returns. It
+Stage-II radar sector, and retains only original XYZ returns still present. It
 does not alter an existing training cache.
 """
 
@@ -129,8 +129,8 @@ def preview(vod_root: Path, fog_root: Path, output_root: Path, *, split: str,
             "border-bottom:1px solid #3b5164;text-align:left}</style>"
             f"<h1>Stage II fog: severity 5 versus {severity}</h1>"
             "<p>Same validation frames and Stage II radar-sector crop. Each link opens "
-            "an interactive clean/faulty/removed 3D view. Retention counts original "
-            "clean XYZ returns after fog detection. This is a preview, not a training cache.</p>"
+    "an interactive clean/faulty/removed 3D view. Retention counts original "
+    "clean XYZ returns still present regardless of intensity. This is a preview, not a training cache.</p>"
             "<table><tr><th>Frame</th><th>Current fog</th><th>Lighter fog</th></tr>"
             + "\n".join(lines) + "</table></html>")
     (output_root / "index.html").write_text(page, encoding="utf-8")

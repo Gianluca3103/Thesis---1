@@ -171,9 +171,18 @@ same validation frames, run `python -m scripts.preview_stage2_milder_fog` with
 `--search-root` (or `--mild-root`), `--fog-simulator-root`, and `--output-root`.
 The default lighter setting is severity 2 (alpha 0.01); `--severity 3` uses
 alpha 0.02. The script applies the original fog simulator to raw VoD LiDAR,
-crops to the Stage-II radar sector, filters to original detectable returns,
+crops to the Stage-II radar sector, retains original XYZ returns regardless of
+intensity (including zero intensity),
 and writes interactive HTML and full-resolution PLY files. It creates a
 preview for inspection, not a replacement training cache.
+
+The current fog cache policy preserves every original XYZ return that the
+simulator still emits, even when its intensity is reduced to zero. An occupied
+voxel is missing only when no retained faulty LiDAR return remains in that
+voxel. The earlier mild-fog cache used an intensity cutoff; its manifest is
+version 1 and must not be reused for a missing-only trial. On the professor
+machine, `bash scripts/run_stage2_missing_xyz_fog_trial.sh` writes a distinct
+version 2 cache and trains a separate Stage II checkpoint.
 
 For a separate training-ready severity-2 mixed-fault cache and a fresh
 hierarchical Stage-I model, run

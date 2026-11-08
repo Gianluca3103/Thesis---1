@@ -1,9 +1,9 @@
 """Build a separate mixed-fault dataset with severity-2 fog and 30/40/50% loss.
 
 One balanced deterministic fault is assigned per VoD frame. Fog is simulated
-on the raw scan before the Stage-II radar-sector crop; only original detectable
-returns are retained. Output is compatible with --faulty-root and the
-hierarchical Stage-I mild_dataset training mode.
+on the raw scan before the Stage-II radar-sector crop; only original XYZ
+returns still present are retained, regardless of intensity. Output is
+compatible with --faulty-root and the hierarchical Stage-I mild_dataset mode.
 """
 
 from __future__ import annotations
@@ -36,7 +36,9 @@ def _sha256(path: Path) -> str:
 
 def _build_frame(job: tuple) -> tuple[str, str, str, int, int, int]:
     (frame, fault_type, clean_path, fog_root, destination, seed, source_hash) = job
-    expected = {"version": MILD_FOG2_VERSION, "frame_id": frame.frame_id,
+    expected = {"version": MILD_FOG2_VERSION,
+                "fog_return_policy": "original_xyz_presence_ignore_intensity_v2",
+                "frame_id": frame.frame_id,
                 "split": frame.split, "fault_type": fault_type, "seed": seed,
                 "encoding": MILD_FAULT_ENCODING,
                 "source_manifest_sha256": source_hash}
@@ -118,7 +120,9 @@ def main() -> None:
         source_hash = hashlib.sha256((
             _sha256(args.data_cache_root / split / "manifest.json")
             + _sha256(source) + _sha256(lookup)).encode()).hexdigest()
-        manifest = {"version": MILD_FOG2_VERSION, "split": split,
+        manifest = {"version": MILD_FOG2_VERSION,
+                    "fog_return_policy": "original_xyz_presence_ignore_intensity_v2",
+                    "split": split,
                     "seed": args.seed, "radar_variant": args.radar_variant,
                     "vod_root": str(args.vod_root.resolve()),
                     "data_cache_root": str(args.data_cache_root.resolve()),

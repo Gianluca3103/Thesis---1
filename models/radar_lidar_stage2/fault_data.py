@@ -3,7 +3,8 @@
 The fault plan matches the established reconstruction injector: total_loss:1,
 fov_filter:5, and fog_sim:5. Fog is generated from the full raw scan once and
 cached after the same calibrated radar-FOV crop used by clean Stage-II data.
-Only detected original XYZ returns are exposed to the model.
+Only original XYZ returns still present in the simulated scan are exposed to
+the model. Intensity attenuation alone does not delete a return.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import numpy as np
 import torch
 
 
-FAULT_POLICY_VERSION = "stage2_fog_intensity_detection_xyz_v3"
+FAULT_POLICY_VERSION = "stage2_fog_original_xyz_presence_v4"
 # Raw simulator archives retain their old on-disk format so existing caches work.
 FOG_CACHE_VERSION = "stage2_severe_faults_v1"
 FAULT_PLAN = (("total_loss", 1), ("fov_filter", 5), ("fog_sim", 5))
@@ -24,11 +25,6 @@ FAULT_NAMES = tuple(name for name, _ in FAULT_PLAN)
 FOG_ALPHA = 0.06
 FOG_NOISE = 10
 FOG_CACHE_ENCODING = "float32_byte_shuffle_v1"
-# The established laser-degradation injector uses the clean scan's 10th
-# intensity percentile as its detection threshold. The fog simulator rounds
-# attenuated intensity to integer units, so a zero response is never a return.
-FOG_DETECTION_QUANTILE = 0.10
-FOG_MIN_DETECTABLE_INTENSITY = 1.0
 
 
 def encode_fog_points(points: np.ndarray) -> np.ndarray:
@@ -120,43 +116,31 @@ class SevereFogCache:
                 or len(points) != metadata.get("cropped_points")
                 or not np.isfinite(points).all()):
             raise ValueError(f"Invalid severe fog cache entry: {self.path(frame_id)}")
-        # Keep the simulated intensity until the return-detection decision.
-        # severe_fault exposes XYZ only after filtering.
+        # Keep the raw simulated rows so severe_fault can distinguish an
+        # original XYZ return from a shifted synthetic echo.
         return torch.from_numpy(points.copy())
-
-
-def fog_detection_floor(clean_lidar: np.ndarray) -> float:
-    """Per-frame receiver floor, in the simulator's original intensity units."""
-    clean = np.asarray(clean_lidar, dtype=np.float32)
-    if clean.ndim != 2 or clean.shape[1] < 4:
-        raise ValueError("Clean LiDAR must contain XYZ and original intensity")
-    if not np.isfinite(clean[:, :4]).all():
-        raise ValueError("Clean LiDAR contains nonfinite XYZ or intensity")
-    if not len(clean):
-        return FOG_MIN_DETECTABLE_INTENSITY
-    return max(FOG_MIN_DETECTABLE_INTENSITY,
-               float(np.quantile(clean[:, 3], FOG_DETECTION_QUANTILE)))
 
 
 def retain_original_fog_returns(clean_lidar: np.ndarray,
                                 simulated_fog: np.ndarray) -> np.ndarray:
-    """Keep detectable original XYZ returns, respecting duplicate multiplicity.
+    """Keep original XYZ returns still present, respecting duplicate multiplicity.
 
-    Hard fog attenuates and rounds intensity without moving most XYZ points.
-    Those below the detection floor must disappear. Soft fog also replaces
-    some original rays with shifted echoes; exact XYZ matching removes those
-    synthetic returns without exposing intensity to the model.
+    Hard fog can attenuate intensity without removing XYZ. Such returns stay
+    observed even if intensity is zero. Soft fog can replace original rays
+    with shifted echoes; exact XYZ matching excludes those synthetic returns.
     """
     clean_lidar = np.asarray(clean_lidar, dtype=np.float32)
     simulated_fog = np.asarray(simulated_fog, dtype=np.float32)
-    floor = fog_detection_floor(clean_lidar)
+    if clean_lidar.ndim != 2 or clean_lidar.shape[1] < 3:
+        raise ValueError("Clean LiDAR must contain XYZ")
+    if not np.isfinite(clean_lidar[:, :3]).all():
+        raise ValueError("Clean LiDAR contains nonfinite XYZ")
     if simulated_fog.ndim != 2 or simulated_fog.shape[1] < 4:
         raise ValueError("Simulated fog must contain XYZ and attenuated intensity")
     if not np.isfinite(simulated_fog[:, :4]).all():
         raise ValueError("Simulated fog contains nonfinite XYZ or intensity")
     clean = np.ascontiguousarray(clean_lidar[:, :3])
-    detected = simulated_fog[simulated_fog[:, 3] >= floor]
-    fog = np.ascontiguousarray(detected[:, :3])
+    fog = np.ascontiguousarray(simulated_fog[:, :3])
     if not len(clean) or not len(fog):
         return fog[:0].copy()
     row_type = np.dtype((np.void, 3 * np.dtype(np.float32).itemsize))
