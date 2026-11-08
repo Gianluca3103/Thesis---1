@@ -5,6 +5,7 @@ from pathlib import Path
 
 from models.radar_lidar_stage2.clean_selected_metrics import voxel_centers
 from models.radar_lidar_stage2.conditional_sampling import (
+    faulty_to_clean_noise_target, sample_from_faulty,
     sample_from_noise, sampling_schedule)
 from scripts import conditional_stage2
 from scripts import evaluate_stage2_conditional_reconstruction as evaluator
@@ -34,6 +35,30 @@ def test_schedule_reaches_zero_and_sampler_is_frame_deterministic():
         (zero[2:], present[2:], zero[2:]), alpha,
         ["00205"], steps=8, seed=3103)
     assert torch.equal(joint[2:], alone)
+
+
+def test_faulty_start_target_recovers_clean_and_sampler_never_uses_clean():
+    faulty = torch.full((3, 32), 0.2)
+    clean = torch.full((3, 32), 0.8)
+    noise = torch.linspace(-1, 1, 96).reshape(3, 32)
+    alpha = torch.tensor(0.5)
+    xt, target = faulty_to_clean_noise_target(faulty, clean, noise, alpha)
+    recovered = (xt - (1 - alpha).sqrt() * target) / alpha.sqrt()
+    assert torch.allclose(recovered, clean, atol=1e-6)
+    assert not torch.allclose(target, noise)
+
+    class Model:
+        @staticmethod
+        def diffusion(xt, faulty, radar, probability, present, timestep, coarse):
+            assert bool((timestep == 499).all())
+            return (xt - alpha.sqrt() * clean[coarse[:, 0]]) / (1 - alpha).sqrt()
+
+    coarse = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0]])
+    fixed = sample_from_faulty(
+        Model(), coarse, (faulty[:2], torch.ones(2, dtype=torch.bool),
+                          faulty[:2]), torch.full((1000,), 0.5),
+        ["00164", "00205"], timestep=499, seed=3103)
+    assert torch.allclose(fixed, clean[:2], atol=1e-6)
 
 
 def test_prediction_rejects_clean_points_and_accepts_faulty_radar_only(monkeypatch):

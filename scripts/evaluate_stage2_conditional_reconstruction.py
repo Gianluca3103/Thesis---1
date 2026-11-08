@@ -66,7 +66,8 @@ def _frame_candidates(fine: torch.Tensor, logits: torch.Tensor, frame: int,
 
 @torch.no_grad()
 def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
-          *, device: str, seed: int, steps: int):
+          *, device: str, seed: int, steps: int,
+          sampler: str = "gaussian_ddim", timestep: int = 499):
     role = {frame_id: ("calibration" if (index // 20) % 5 == 0 else "heldout")
             for index, frame_id in enumerate(ids)}
     stores = {name: {"positive": torch.zeros(THRESHOLD_STEPS + 1,
@@ -79,7 +80,8 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
     for rows in tqdm(loader, desc="Conditional Stage II validation sweep",
                      unit="batch"):
         output = predict_batch(model, rows, alpha_bars, device=device,
-                               seed=seed, steps=steps)
+                               seed=seed, steps=steps, sampler=sampler,
+                               timestep=timestep)
         for frame, row in enumerate(rows):
             store = stores[role[row["frame_id"]]]
             store["frames"] += 1
@@ -117,7 +119,9 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
 def selected_metrics(model, loader, raw_root: Path, split: str, alpha_bars,
                      *, device: str, seed: int, steps: int,
                      threshold_index: int, role: dict | None,
-                     fault_names: dict[str, str]) -> dict:
+                     fault_names: dict[str, str],
+                     sampler: str = "gaussian_ddim",
+                     timestep: int = 499) -> dict:
     groups = ("calibration", "heldout") if role is not None else ("test",)
     overall = {name: {"faulty": empty_accumulator(),
                       "completed": empty_accumulator()}
@@ -128,7 +132,8 @@ def selected_metrics(model, loader, raw_root: Path, split: str, alpha_bars,
     for rows in tqdm(loader, desc=f"Conditional Stage II {split} metrics",
                      unit="batch"):
         output = predict_batch(model, rows, alpha_bars, device=device,
-                               seed=seed, steps=steps)
+                               seed=seed, steps=steps, sampler=sampler,
+                               timestep=timestep)
         for frame, row in enumerate(rows):
             candidates, logits = _frame_candidates(
                 output["fine"], output["logits"], frame,
@@ -174,24 +179,32 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if (args.device != "cuda" or not torch.cuda.is_available() or
-            args.num_workers < 0 or not 2 <= args.steps <= 1000 or
+            args.num_workers < 0 or not 1 <= args.steps <= 1000 or
             any(value is not None and value < 1 for value in
                 (args.val_limit, args.test_limit))):
-        parser.error("CUDA, nonnegative workers, and 2–1000 steps required")
+        parser.error("CUDA, nonnegative workers, and 1–1000 steps required")
     model, identity, saved = load_model(
         args.lpcr_checkpoint, args.checkpoint, args.device)
+    sampler = identity.get("sampler", "gaussian_ddim")
+    timestep = identity.get("eval_timestep", 499)
+    if ((sampler == "faulty_latent_one_step" and args.steps != 1) or
+            (sampler == "gaussian_ddim" and args.steps < 2) or
+            sampler not in ("faulty_latent_one_step", "gaussian_ddim")):
+        parser.error("Sampling steps differ from checkpoint sampler")
     alpha_bars = cosine_alpha_bars(device=args.device)
     val_loader, val_ids, val_manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, "val", identity, args.num_workers, args.val_limit)
     sweep_report, role = sweep(
         model, val_loader, val_ids, args.data_cache_root, alpha_bars,
-        device=args.device, seed=args.seed, steps=args.steps)
+        device=args.device, seed=args.seed, steps=args.steps,
+        sampler=sampler, timestep=timestep)
     validation = selected_metrics(
         model, val_loader, args.data_cache_root, "val", alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
         threshold_index=sweep_report["selected_index"], role=role,
-        fault_names=val_manifest["frame_faults"])
+        fault_names=val_manifest["frame_faults"], sampler=sampler,
+        timestep=timestep)
     for group in ("calibration", "heldout"):
         actual = validation["overall"][group]["completed"]
         expected = sweep_report[group]
@@ -208,8 +221,11 @@ def main() -> None:
         model, test_loader, args.data_cache_root, "test", alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
         threshold_index=sweep_report["selected_index"], role=None,
-        fault_names=test_manifest["frame_faults"])
-    report = {"model": "conditional_epsilon_denoiser_full_noise_DDIM",
+        fault_names=test_manifest["frame_faults"], sampler=sampler,
+        timestep=timestep)
+    report = {"model": ("conditional_faulty_latent_to_clean_one_step"
+                        if sampler == "faulty_latent_one_step" else
+                        "conditional_epsilon_denoiser_full_noise_DDIM"),
               "oracle_clean_latent": False,
               "addition_head": "disabled_pending_training_on_generated_latents",
               "prediction_inputs": ["faulty_LiDAR", "measured_radar",
@@ -219,6 +235,8 @@ def main() -> None:
               "checkpoint_sha256": sha256(args.checkpoint),
               "checkpoint_epoch": int(saved["epoch"]),
               "sampling_steps": args.steps,
+              "sampler": sampler, "eval_timestep": timestep,
+              "training_target": identity.get("training_target", "pure_epsilon"),
               "threshold_selection": "full_scene_exact_IoU_on_validation_calibration_frames",
               "val_limit": args.val_limit, "test_limit": args.test_limit,
               "validation_note": "All validation frames may have selected the denoiser checkpoint; heldout only means held out from threshold selection.",
@@ -231,8 +249,8 @@ def main() -> None:
         temporary.replace(args.output_json)
     finally:
         temporary.unlink(missing_ok=True)
-    print(f"Checkpoint epoch {saved['epoch']}; {args.steps} DDIM steps from "
-          f"Gaussian noise; threshold={sweep_report['threshold']:.3f}",
+    print(f"Checkpoint epoch {saved['epoch']}; {sampler}; "
+          f"threshold={sweep_report['threshold']:.3f}",
           flush=True)
     for name, value in (("validation heldout", validation["overall"]["heldout"]),
                         ("all validation", validation["overall"]["all_validation"]),

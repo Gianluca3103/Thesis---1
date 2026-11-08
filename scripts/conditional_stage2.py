@@ -13,7 +13,8 @@ from models.radar_lidar_crossmodal_v1.radar_pruner import supported_coordinates
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as support_identity)
 from models.radar_lidar_stage2.clean_denoising import batched_hierarchy
-from models.radar_lidar_stage2.conditional_sampling import sample_from_noise
+from models.radar_lidar_stage2.conditional_sampling import (
+    sample_from_faulty, sample_from_noise)
 from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2)
@@ -24,6 +25,7 @@ from scripts.train_stage2_clean_denoiser import (
 
 
 CONDITIONED_FRESH_REVISION = "stage2_conditioned_fresh_epsilon_full_noise_validation_v1"
+CONDITIONED_FAULTY_START_REVISION = "stage2_conditioned_faulty_start_clean_target_v1"
 
 
 class DeploymentRows:
@@ -56,7 +58,8 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
     identity = saved.get("identity")
     if (not isinstance(identity, dict) or
             identity.get("revision") not in
-            (CONDITIONED_ONE_STEP_REVISION, CONDITIONED_FRESH_REVISION) or
+            (CONDITIONED_ONE_STEP_REVISION, CONDITIONED_FRESH_REVISION,
+             CONDITIONED_FAULTY_START_REVISION) or
             identity.get("lpcr_sha256") != sha256(lpcr_path)):
         raise ValueError("Expected a conditioned epsilon-denoiser checkpoint")
     pretrained = torch.load(lpcr_path, map_location="cpu", weights_only=False)
@@ -119,7 +122,9 @@ def deployment_loader(vod_root: Path, raw_root: Path, support_root: Path,
 
 @torch.no_grad()
 def predict_batch(model, rows: list[dict], alpha_bars: torch.Tensor,
-                  *, device: str, seed: int, steps: int) -> dict:
+                  *, device: str, seed: int, steps: int,
+                  sampler: str = "gaussian_ddim",
+                  timestep: int = 499) -> dict:
     """Predict from radar and faulty LiDAR without reading clean LiDAR."""
     if any("clean_xyz" in row or "clean_lidar" in row or
            "full_clean_xyz" in row for row in rows):
@@ -130,9 +135,17 @@ def predict_batch(model, rows: list[dict], alpha_bars: torch.Tensor,
         return {"fine": fine, "logits": torch.empty(0, device=device),
                 "hidden": torch.empty((0, 16), device=device)}
     conditions = _conditioned_inputs(model, rows, hierarchy, device)
-    latent = sample_from_noise(
-        model, coarse, conditions, alpha_bars,
-        [row["frame_id"] for row in rows], steps=steps, seed=seed)
+    frame_ids = [row["frame_id"] for row in rows]
+    if sampler == "gaussian_ddim":
+        latent = sample_from_noise(model, coarse, conditions, alpha_bars,
+                                   frame_ids, steps=steps, seed=seed)
+    elif sampler == "faulty_latent_one_step":
+        if steps != 1:
+            raise ValueError("Faulty-start sampling requires one step")
+        latent = sample_from_faulty(model, coarse, conditions, alpha_bars,
+                                    frame_ids, timestep=timestep, seed=seed)
+    else:
+        raise ValueError(f"Unknown Stage II sampler: {sampler}")
     logits, _, hidden = model.lpcr(
         latent, hierarchy, latent.new_ones((len(fine), 1)),
         return_hidden=True)

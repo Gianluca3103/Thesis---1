@@ -580,6 +580,22 @@ training run is interrupted. The existing Stage-II export is reused.
 
 ### Conditional reconstruction without clean LiDAR at prediction time
 
+`scripts/run_stage2_conditional_faulty_start.sh` is a separate 125-epoch
+faulty-start experiment. It reuses the frozen LiDAR encoder and LPCR decoder,
+but randomly initializes the conditional sparse U-Net and radar adapter. On
+the same ≥12-radar-voxel/1.6 m gate and mild-fault data, it encodes the faulty
+LiDAR as the starting latent, adds Gaussian noise at fixed timestep 499, and
+trains against the clean-LiDAR latent. The MSE target is the noise-equivalent
+correction `(x_t - sqrt(alpha_t) * clean_latent) / sqrt(1-alpha_t)`; it is not
+pure Gaussian epsilon because it also corrects the fault. Validation and test
+use only faulty LiDAR, radar, and deterministic noise for a one-step clean
+latent estimate, then load clean LiDAR solely for metrics. All 1,296
+validation frames are evaluated every epoch. The run uses its own output
+directory and writes a test report and, if the Gaussian-start report exists,
+`comparison_with_gaussian_start.json`. The two runs share data, gate, frozen
+LPCR, and evaluation metrics, but use different starting states and samplers;
+compare the final validation/test IoU rather than their training MSE values.
+
 `scripts/run_stage2_conditional_from_scratch.sh` trains a fresh conditional
 epsilon-prediction sparse U-Net and radar adapter from random initialization.
 The pretrained LiDAR encoder and LPCR decoder remain frozen. Training uses
