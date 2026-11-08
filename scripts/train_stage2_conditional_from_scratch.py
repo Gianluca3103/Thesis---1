@@ -1,4 +1,4 @@
-"""Train fresh conditional epsilon denoiser; validate from Gaussian noise."""
+"""Train or fine-tune conditional Stage II; validate from Gaussian noise."""
 
 from __future__ import annotations
 
@@ -21,11 +21,11 @@ from models.radar_lidar_stage2.sparse_residual import (
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.conditional_stage2 import (
     CONDITIONED_FRESH_REVISION, CONDITIONED_FRESH_FAULT_ONLY_REVISION,
-    CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
+    CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
     deployment_loader)
 from scripts.evaluate_stage2_conditional_reconstruction import sweep
 from scripts.train_stage2_clean_denoiser import (
-    MIN_RADAR_VOXELS, RADIUS_M, _CleanRows, _atomic_save,
+    MIN_RADAR_VOXELS, RADIUS_M, DecoderOccupancyConfig, _CleanRows, _atomic_save,
     _rows, _run_epoch)
 
 
@@ -93,8 +93,13 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--fault-region-root", type=Path)
-    parser.add_argument("--occupancy-bce", action="store_true",
-                        help="Add ordinary clean-occupancy BCE on fault-gated cells")
+    parser.add_argument("--generated-occupancy-loss", action="store_true",
+                        help="Supervise frozen LPCR after a Gaussian-start rollout")
+    parser.add_argument("--rollout-steps", type=int, default=64)
+    parser.add_argument("--gradient-steps", type=int, default=4)
+    parser.add_argument("--occupancy-loss-weight", type=float, default=0.1)
+    parser.add_argument("--false-positive-weight", type=float, default=2.0)
+    parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=125)
@@ -108,11 +113,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    if args.occupancy_bce and args.fault_region_root is None:
-        parser.error("Occupancy BCE trial requires --fault-region-root")
+    if args.generated_occupancy_loss and args.fault_region_root is None:
+        parser.error("Generated occupancy trial requires --fault-region-root")
+    if args.initialize_from is not None and not args.generated_occupancy_loss:
+        parser.error("--initialize-from is for the generated occupancy trial")
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or not 2 <= args.validation_steps <= 1000 or
+            (args.generated_occupancy_loss and
+             (not 1 <= args.gradient_steps <= args.rollout_steps <= 1000 or
+              args.occupancy_loss_weight <= 0 or
+              args.false_positive_weight <= 0)) or
             any(value is not None and value < 1 for value in
                 (args.train_limit, args.val_limit))):
         parser.error("Invalid settings or CUDA unavailable")
@@ -150,8 +161,8 @@ def main() -> None:
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     identity = {
-        "revision": (CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION
-                     if args.occupancy_bce else
+        "revision": (CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION
+                     if args.generated_occupancy_loss else
                      CONDITIONED_FRESH_FAULT_ONLY_REVISION
                      if train_regions is not None else CONDITIONED_FRESH_REVISION),
         "lpcr_sha256": sha256(args.lpcr_checkpoint),
@@ -171,11 +182,25 @@ def main() -> None:
         "batch_size": args.batch_size, "lr": args.lr, "seed": args.seed,
         "validation_steps": args.validation_steps,
         "validation_model_inputs": "faulty_LiDAR_radar_Gaussian_noise",
-        "fresh_diffusion_and_radar_adapter": True}
-    if args.occupancy_bce:
-        identity.update({"training_loss": "epsilon_mse_plus_regular_occupancy_bce",
-                         "occupancy_bce_timestep": 499,
-                         "occupancy_bce_sites": "all_fault_gated_fine_cells"})
+        "fresh_diffusion_and_radar_adapter": args.initialize_from is None}
+    decoder_config = None
+    if args.generated_occupancy_loss:
+        decoder_config = DecoderOccupancyConfig(
+            rollout_steps=args.rollout_steps,
+            gradient_steps=args.gradient_steps,
+            loss_weight=args.occupancy_loss_weight,
+            false_positive_weight=args.false_positive_weight)
+        identity.update({
+            "training_loss": "epsilon_mse_plus_generated_asymmetric_probability_error",
+            "decoder_rollout_steps": args.rollout_steps,
+            "decoder_gradient_steps": args.gradient_steps,
+            "decoder_loss_weight": args.occupancy_loss_weight,
+            "decoder_false_positive_weight": args.false_positive_weight,
+            "decoder_loss_sites": "unobserved_fault_gated_fine_cells",
+            "checkpoint_selection":
+                "calibration_threshold_then_heldout_validation_exact_iou",
+            "initialize_from_sha256": (sha256(args.initialize_from)
+                                       if args.initialize_from else None)})
     val_clean_dataset = paired_dataset(
         args.vod_root, "val", identity["radar_variant"],
         include_clean=True, data_cache_root=args.data_cache_root)
@@ -212,6 +237,20 @@ def main() -> None:
         fault_region_root=args.fault_region_root)
     if val_clean_ids[:args.val_limit] != val_ids:
         raise ValueError("Validation loss and deployment frames differ")
+    if args.initialize_from is not None:
+        source = torch.load(args.initialize_from, map_location="cpu",
+                            weights_only=False)
+        source_identity = source.get("identity", {})
+        if source_identity.get("revision") != CONDITIONED_FRESH_FAULT_ONLY_REVISION:
+            raise ValueError("Initialization needs an MSE-only fault-gated checkpoint")
+        for key in ("lpcr_sha256", "radar_variant", "radius_m",
+                    "min_distinct_radar_voxels", "data_manifest_sha256",
+                    "support_manifest_sha256", "faulty_manifest_sha256",
+                    "fault_region_policy", "fault_region_sha256"):
+            if source_identity.get(key) != identity.get(key):
+                raise ValueError(f"Initialization checkpoint differs: {key}")
+        model.diffusion.load_state_dict(source["diffusion"])
+        model.radar_adapter.load_state_dict(source["radar_adapter"])
     args.output_root.mkdir(parents=True, exist_ok=True)
     start, best_iou = 1, -1.0
     if args.resume:
@@ -222,7 +261,9 @@ def main() -> None:
         model.radar_adapter.load_state_dict(saved["radar_adapter"])
         optimizer.load_state_dict(saved["optimizer"])
         start = int(saved["epoch"]) + 1
-        best_iou = float(saved["best_val_full_iou_at_0p5"])
+        best_iou = float(saved["best_val_selection_iou"]
+                         if decoder_config is not None else
+                         saved["best_val_full_iou_at_0p5"])
     if start > args.epochs:
         print(f"Already complete: epoch {start - 1}", flush=True)
         return
@@ -233,7 +274,7 @@ def main() -> None:
                         unit="batch"), optimizer, alpha_bars,
             device=args.device, epoch=epoch, eval_timestep=499,
             seed=args.seed, condition_faulty_radar=True,
-            train_radar_adapter=True, occupancy_bce=args.occupancy_bce)
+            train_radar_adapter=True, decoder_occupancy=decoder_config)
         model.eval()
         with torch.no_grad():
             val_loss = _run_epoch(
@@ -248,10 +289,14 @@ def main() -> None:
         validation, _ = sweep(
             model, val_loader, val_ids, args.data_cache_root, alpha_bars,
             device=args.device, seed=args.seed, steps=args.validation_steps,
-            fixed_half_tolerance=True)
+            fixed_half_tolerance=True,
+            decoder_loss_fp_weight=(args.false_positive_weight
+                                    if decoder_config is not None else None))
         full = full_iou_at_half(validation)
-        improved = full["iou"] > best_iou
-        best_iou = max(best_iou, full["iou"])
+        selection_iou = (validation["heldout"]["iou"]
+                         if decoder_config is not None else full["iou"])
+        improved = selection_iou > best_iou
+        best_iou = max(best_iou, selection_iou)
         record = {"epoch": epoch, "train_noise_mse": train["noise_mse"],
                   "val_noise_mse": val_loss["noise_mse"],
                   "val_noise_mse_frames": val_loss["frames"],
@@ -261,34 +306,49 @@ def main() -> None:
                   "val_frames": len(val_ids),
                   "val_calibration_selected": validation["calibration"],
                   "val_threshold_heldout": validation["heldout"],
-                  "best_val_full_iou_at_0p5": best_iou}
-        if args.occupancy_bce:
-            record.update({"train_occupancy_bce": train["occupancy_bce"],
-                           "train_total_loss": train["total_loss"]})
+                  "best_val_selection_iou": best_iou}
+        if decoder_config is None:
+            record["best_val_full_iou_at_0p5"] = best_iou
+        else:
+            record.update({
+                "train_decoder_occupancy_loss": train["decoder_occupancy_loss"],
+                "train_total_loss": train["total_loss"],
+                "train_decoder_positive_sites": train["decoder_positive_sites"],
+                "train_decoder_negative_sites": train["decoder_negative_sites"],
+                "val_generated_decoder_occupancy_loss":
+                    validation["generated_decoder_loss"]["heldout"]})
         with (args.output_root / "history.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         checkpoint = {"identity": identity, "epoch": epoch,
                       "diffusion": model.diffusion.state_dict(),
                       "radar_adapter": model.radar_adapter.state_dict(),
                       "optimizer": optimizer.state_dict(),
-                      "best_val_full_iou_at_0p5": best_iou,
+                      "best_val_selection_iou": best_iou,
                       "record": record}
+        if decoder_config is None:
+            checkpoint["best_val_full_iou_at_0p5"] = best_iou
         _atomic_save(args.output_root / "last.ckpt", checkpoint)
         if improved:
             _atomic_save(args.output_root / "best_iou.ckpt", checkpoint)
-        bce_log = (f"train_occupancy_BCE={train['occupancy_bce']:.4f} "
-                   f"train_total_loss={train['total_loss']:.4f} "
-                   if args.occupancy_bce else "")
+        decoder_log = (
+            f"train_decoder_loss={train['decoder_occupancy_loss']:.4f} "
+            f"val_generated_decoder_loss="
+            f"{validation['generated_decoder_loss']['heldout']['loss']:.4f} "
+            f"train_total_loss={train['total_loss']:.4f} "
+            if decoder_config is not None else "")
+        selection_name = ("best_calibrated_heldout_exact_IoU" if
+                          decoder_config is not None else
+                          "best_fixed_threshold_exact_IoU")
         print(f"Epoch {epoch:03d}: train_noise_MSE={train['noise_mse']:.4f} "
               f"val_noise_MSE={val_loss['noise_mse']:.4f} "
-              f"{bce_log}"
+              f"{decoder_log}"
               f"val_full_exact_IoU={full['iou']:.2%} "
               f"val_full_IoU@0.2m={full['iou_0p2m']:.2%} "
               f"faulty_full_exact_IoU={full['faulty_baseline_iou']:.2%} "
               f"heldout_calibrated_exact_IoU={validation['heldout']['iou']:.2%} "
               f"calibrated_probability_threshold={validation['threshold']:.3f} "
               f"occupancy_probability_threshold=0.5 "
-              f"best_fixed_threshold_exact_IoU={best_iou:.2%}", flush=True)
+              f"{selection_name}={best_iou:.2%}", flush=True)
     print(f"Best checkpoint: {args.output_root / 'best_iou.ckpt'}", flush=True)
 
 

@@ -3,8 +3,8 @@
 The original diagnostic uses one forward-noised clean latent per update. The
 full-noise trial rolls out five/three DDIM reverse steps. Its optional
 faulty/radar conditioning uses cached mild faults and measured radar features;
-clean LiDAR remains the target only. The fresh conditional fault-only trial
-can additionally train with ordinary clean-occupancy BCE through frozen LPCR.
+clean LiDAR remains the target only. The optional conditional trial supervises
+generated occupancy after a Gaussian-start rollout through frozen LPCR.
 No ray or offset loss enters training.
 """
 
@@ -13,10 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
@@ -29,6 +29,10 @@ from models.radar_lidar_stage2.clean_denoising import (
 from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.fault_only_gate import fault_only_support
 from models.radar_lidar_stage2.fault_region import FaultRegionCache
+from models.radar_lidar_stage2.addition import addition_context
+from models.radar_lidar_stage2.conditional_sampling import sample_from_noise_truncated
+from models.radar_lidar_stage2.decoder_occupancy_loss import (
+    asymmetric_occupancy_loss)
 from models.radar_lidar_stage2.geometry_gate import offset_targets
 from models.radar_lidar_stage2.geometry_gate import geometry_gate_output
 from models.radar_lidar_stage2.sparse_residual import (
@@ -45,6 +49,14 @@ CONDITIONED_ONE_STEP_REVISION = (
 RADIUS_M = 1.6
 MIN_RADAR_VOXELS = 12
 RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
+
+
+@dataclass(frozen=True)
+class DecoderOccupancyConfig:
+    rollout_steps: int
+    gradient_steps: int
+    loss_weight: float
+    false_positive_weight: float
 
 
 class _CleanRows:
@@ -230,12 +242,17 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                reverse_val_steps: int = 0,
                condition_faulty_radar: bool = False,
                train_radar_adapter: bool = False,
-               occupancy_bce: bool = False,
+               decoder_occupancy: DecoderOccupancyConfig | None = None,
                eval_random_timesteps: bool = False,
                eval_loss_only: bool = False) -> dict:
     training = optimizer is not None
-    if occupancy_bce and (not training or reverse_train_steps):
-        raise ValueError("Occupancy BCE requires single-pass training")
+    if decoder_occupancy is not None and (
+            not training or reverse_train_steps or not condition_faulty_radar or
+            not 1 <= decoder_occupancy.gradient_steps <=
+            decoder_occupancy.rollout_steps <= len(alpha_bars) or
+            decoder_occupancy.loss_weight <= 0 or
+            decoder_occupancy.false_positive_weight <= 0):
+        raise ValueError("Generated occupancy loss needs conditional single-pass training")
     if eval_loss_only and (training or not eval_random_timesteps or
                            reverse_val_steps):
         raise ValueError("Loss-only validation requires random single-pass timesteps")
@@ -243,7 +260,8 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
     model.diffusion.train(training)
     generator = torch.Generator(device=device)
     generator.manual_seed(seed + epoch if training else seed)
-    loss_sum = latent_mse_sum = bce_sum = total_sum = 0.0
+    loss_sum = latent_mse_sum = decoder_sum = total_sum = 0.0
+    decoder_positive = decoder_negative = 0
     frames = fine_sites = latent_sites = present_latents = 0
     counts = {"tp": 0, "predicted": 0, "target": 0}
     oracle = dict(counts)
@@ -326,41 +344,51 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
                                   latent_ids, len(rows))
                 if training:
                     total_loss = loss
-                    if occupancy_bce:
-                        # A second, moderate noise level gives the ordinary
-                        # occupancy BCE a stable x0 estimate on every batch.
-                        # Noise MSE still trains over the full timestep range.
-                        bce_steps = torch.full(
-                            (len(rows),), eval_timestep, device=device,
-                            dtype=torch.long)
-                        bce_alpha = alpha_bars[eval_timestep]
-                        bce_noise = torch.randn(
-                            x0.shape, dtype=x0.dtype, device=device,
-                            generator=generator)
-                        bce_xt = (bce_alpha.sqrt() * x0 +
-                                  (1 - bce_alpha).sqrt() * bce_noise)
-                        bce_prediction = model.diffusion(
-                            bce_xt, faulty_condition, radar_condition,
-                            site_probability, faulty_present, bce_steps, coarse)
-                        bce_x0 = ((bce_xt - (1 - bce_alpha).sqrt() *
-                                   bce_prediction) / bce_alpha.sqrt())
+                    if decoder_occupancy is not None:
+                        # The rollout starts without a clean latent. Its
+                        # no-gradient prefix matches inference exactly, while
+                        # the final steps retain an affordable autograd graph.
+                        model.diffusion.eval()
+                        try:
+                            generated = sample_from_noise_truncated(
+                                model, coarse,
+                                (faulty_condition, faulty_present,
+                                 radar_condition), alpha_bars,
+                                [row["frame_id"] for row in rows],
+                                steps=decoder_occupancy.rollout_steps,
+                                seed=seed + epoch,
+                                gradient_steps=decoder_occupancy.gradient_steps)
+                        finally:
+                            model.diffusion.train(True)
                         site_features = x0.new_ones((len(hierarchy[0]), 1))
                         logits, _ = model.lpcr(
-                            bce_x0.clamp(-1, 1), hierarchy, site_features)
+                            generated, hierarchy, site_features)
                         target, _, _ = offset_targets(
                             clean, hierarchy[0], point_ids)
-                        bce_loss = F.binary_cross_entropy_with_logits(
-                            logits, target.to(logits.dtype))
-                        total_loss = loss + bce_loss
+                        faulty_clouds = [row["faulty_xyz"] for row in rows]
+                        faulty_xyz = torch.cat(faulty_clouds).to(device)
+                        faulty_ids = torch.cat([
+                            torch.full((len(cloud),), index, dtype=torch.long)
+                            for index, cloud in enumerate(faulty_clouds)]).to(device)
+                        observed = addition_context(
+                            faulty_xyz, hierarchy[0], faulty_ids).observed
+                        decoder_loss, decoder_parts = asymmetric_occupancy_loss(
+                            logits, target, ~observed,
+                            false_positive_weight=(
+                                decoder_occupancy.false_positive_weight))
+                        total_loss = (loss + decoder_occupancy.loss_weight *
+                                      decoder_loss)
                     optimizer.zero_grad(set_to_none=True)
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         (parameter for parameter in model.parameters()
                          if parameter.requires_grad), 1.0)
                     optimizer.step()
-                    if occupancy_bce:
-                        bce_sum += float(bce_loss.detach()) * len(rows)
+                    if decoder_occupancy is not None:
+                        decoder_sum += float(decoder_loss.detach()) * len(rows)
                         total_sum += float(total_loss.detach()) * len(rows)
+                        decoder_positive += decoder_parts["positive_count"]
+                        decoder_negative += decoder_parts["negative_count"]
         loss_sum += float(loss.detach()) * len(rows)
         if not training and not eval_loss_only:
             with torch.no_grad():
@@ -386,10 +414,13 @@ def _run_epoch(model: SparseResidualStage2, loader: DataLoader,
               "mean_candidate_cells": fine_sites / max(frames, 1),
               "mean_latent_sites": latent_sites / max(frames, 1),
               "present_latent_fraction": present_latents / max(latent_sites, 1)}
-    if occupancy_bce:
-        output.update({"occupancy_bce": bce_sum / max(frames, 1),
+    if decoder_occupancy is not None:
+        output.update({"decoder_occupancy_loss": decoder_sum / max(frames, 1),
                        "total_loss": total_sum / max(frames, 1),
-                       "bce_timestep": eval_timestep})
+                       "decoder_positive_sites": decoder_positive,
+                       "decoder_negative_sites": decoder_negative,
+                       "decoder_rollout_steps": decoder_occupancy.rollout_steps,
+                       "decoder_gradient_steps": decoder_occupancy.gradient_steps})
     if not training and not eval_loss_only:
         output.update({"recovered_clean_latent_mse": latent_mse_sum / max(frames, 1),
                        "eligible_occupancy": occupancy_metrics(counts),

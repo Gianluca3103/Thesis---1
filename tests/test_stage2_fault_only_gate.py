@@ -95,6 +95,7 @@ def test_bad_region_and_mask_fail_closed():
 @pytest.mark.parametrize("revision", [
     conditional_stage2.CONDITIONED_FRESH_FAULT_ONLY_REVISION,
     conditional_stage2.CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
+    conditional_stage2.CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
 ])
 def test_clean_start_fault_only_checkpoint_requires_footprint_at_inference(revision):
     identity = {"revision": revision,

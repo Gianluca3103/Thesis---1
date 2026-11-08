@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_stage2.addition import addition_context
+from models.radar_lidar_stage2.decoder_occupancy_loss import error_sums
 from models.radar_lidar_stage2.clean_selected_metrics import (
     add_frame, completion_summary, empty_accumulator, full_frame_voxels)
 from models.radar_lidar_stage2.clean_thresholds import (
@@ -94,7 +95,8 @@ def _active_summary(values: dict[str, int]) -> dict:
 def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
           *, device: str, seed: int, steps: int,
           sampler: str = "gaussian_ddim", timestep: int = 499,
-          fixed_half_tolerance: bool = False):
+          fixed_half_tolerance: bool = False,
+          decoder_loss_fp_weight: float | None = None):
     role = {frame_id: ("calibration" if (index // 20) % 5 == 0 else "heldout")
             for index, frame_id in enumerate(ids)}
     stores = {name: {"positive": torch.zeros(THRESHOLD_STEPS + 1,
@@ -105,6 +107,11 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
                      "fixed_half_tolerant": {
                          "predicted": 0, "eligible_target": 0,
                          "exact_tp": 0, "tolerant_tp_0p2m": 0},
+                     "decoder_errors": {
+                         "positive_error_sum": 0.0,
+                         "negative_error_sum": 0.0,
+                         "positive_count": 0,
+                         "negative_count": 0},
                      "frames": 0}
               for name in ("calibration", "heldout")}
     for rows in tqdm(loader, desc="Conditional Stage II validation sweep",
@@ -131,6 +138,13 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
             positive, negative = score_histograms(logits.sigmoid(), target)
             store["positive"] += positive
             store["negative"] += negative
+            if decoder_loss_fp_weight is not None:
+                parts = error_sums(logits, target)
+                for key in store["decoder_errors"]:
+                    value = parts[key]
+                    store["decoder_errors"][key] += (
+                        float(value) if isinstance(value, torch.Tensor)
+                        else value)
             if fixed_half_tolerance:
                 # The 0.5 here is the occupancy decision threshold. The
                 # distance tolerance for matching voxel centers is 0.2 m.
@@ -158,6 +172,20 @@ def sweep(model, loader, ids: list[str], raw_root: Path, alpha_bars,
     if fixed_half_tolerance:
         result["fixed_half_tolerant"] = {
             name: store["fixed_half_tolerant"] for name, store in stores.items()}
+    if decoder_loss_fp_weight is not None:
+        result["generated_decoder_loss"] = {}
+        for name, store in stores.items():
+            parts = store["decoder_errors"]
+            positive = (parts["positive_error_sum"] /
+                        max(parts["positive_count"], 1))
+            negative = (parts["negative_error_sum"] /
+                        max(parts["negative_count"], 1))
+            result["generated_decoder_loss"][name] = {
+                "loss": positive + decoder_loss_fp_weight * negative,
+                "positive_mean_error": positive,
+                "negative_mean_error": negative,
+                "positive_count": parts["positive_count"],
+                "negative_count": parts["negative_count"]}
     return result, role
 
 
@@ -263,7 +291,8 @@ def main() -> None:
     sweep_report, role = sweep(
         model, val_loader, val_ids, args.data_cache_root, alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
-        sampler=sampler, timestep=timestep)
+        sampler=sampler, timestep=timestep,
+        decoder_loss_fp_weight=identity.get("decoder_false_positive_weight"))
     validation = selected_metrics(
         model, val_loader, args.data_cache_root, "val", alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
@@ -308,7 +337,12 @@ def main() -> None:
               "training_target": identity.get("training_target", "pure_epsilon"),
               "threshold_selection": "full_scene_exact_IoU_on_validation_calibration_frames",
               "val_limit": args.val_limit, "test_limit": args.test_limit,
-              "validation_note": "All validation frames may have selected the denoiser checkpoint; heldout only means held out from threshold selection.",
+              "validation_note": (
+                  "Threshold uses calibration frames; heldout frames selected "
+                  "the checkpoint across epochs. Official test was untouched."
+                  if identity.get("checkpoint_selection") else
+                  "All validation frames may have selected the denoiser "
+                  "checkpoint; heldout only means held out from threshold selection."),
               "sweep": sweep_report, "validation": validation, "test": test}
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
@@ -321,6 +355,13 @@ def main() -> None:
     print(f"Checkpoint epoch {saved['epoch']}; {sampler}; "
           f"threshold={sweep_report['threshold']:.3f}",
           flush=True)
+    if "generated_decoder_loss" in sweep_report:
+        print("Generated decoder occupancy loss on validation: "
+              f"calibration="
+              f"{sweep_report['generated_decoder_loss']['calibration']['loss']:.4f}, "
+              f"heldout="
+              f"{sweep_report['generated_decoder_loss']['heldout']['loss']:.4f}",
+              flush=True)
     for name, value in (("validation heldout", validation["overall"]["heldout"]),
                         ("all validation", validation["overall"]["all_validation"]),
                         ("official test", test["overall"]["test"])):
