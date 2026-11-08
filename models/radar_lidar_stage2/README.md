@@ -578,7 +578,33 @@ validation moderate 3D mAP_R40. The detector starts from random weights in a
 new output directory and automatically resumes its own checkpoints if the
 training run is interrupted. The existing Stage-II export is reused.
 
-### Healthy-region addition ablation for the conditioned clean-latent denoiser
+### Conditional reconstruction without clean LiDAR at prediction time
+
+`scripts/run_stage2_conditional_reconstruction.sh` evaluates the saved
+faulty-LiDAR/radar-conditioned epsilon denoiser as a conditional generator.
+The model receives only the measured radar, cached faulty LiDAR, the fixed
+12-radar-voxel/1.6 m coordinate rule, and frame-seeded Gaussian noise.
+It performs 64 DDIM reverse steps by default and decodes the resulting
+latent with frozen LPCR. A voxel already observed by faulty LiDAR is kept;
+decoder predictions can only add unobserved voxels inside the radar gate.
+
+Validation and official test prediction rows contain no clean LiDAR. The
+evaluator loads clean LiDAR only after producing each batch of predictions,
+for threshold calibration and metrics. It selects the addition threshold by
+full-scene exact IoU on validation calibration blocks, includes a no-addition
+option, and reports before/after exact and 0.2 m occupancy metrics on the
+remaining validation blocks and official test. The checkpoint was originally
+trained with epsilon MSE on noisy clean latents conditioned on faulty LiDAR
+and radar, so this evaluates whether that training actually supports
+generation from noise. No clean latent seeds the reverse chain.
+
+The existing addition head was trained on clean-seeded decoder features. It
+is deliberately excluded from this deployment-style evaluation because its
+features shift when the denoiser starts from Gaussian noise. A new head must
+be trained on generated features before its BCE and healthy-region penalty
+can be judged in the deployable pipeline.
+
+### Earlier clean-seeded addition-head ablation
 
 `scripts/run_stage2_reliable_addition_mild.sh` starts a separate experiment
 from the saved one-step, faulty-LiDAR/radar-conditioned denoiser. The denoiser,
