@@ -577,3 +577,28 @@ validation every 10 epochs, and selects the saved epoch with the highest clean
 validation moderate 3D mAP_R40. The detector starts from random weights in a
 new output directory and automatically resumes its own checkpoints if the
 training run is interrupted. The existing Stage-II export is reused.
+
+### Reliable-addition ablation for the conditioned clean-latent denoiser
+
+`scripts/run_stage2_reliable_addition_mild.sh` starts a separate experiment
+from the saved one-step, faulty-LiDAR/radar-conditioned denoiser. The denoiser,
+radar adapter, and LPCR decoder are frozen. Only the existing Stage-II
+`AdditionHead` is trained. It decides whether to add a voxel that the faulty
+LiDAR did not already observe, using decoder features and local faulty-LiDAR
+density. Observed faulty voxels are always retained.
+
+The loss has four balanced components: positive missing-clean cells; negative
+unoccupied candidates; the previous `healthy_region_negatives` for locally
+well-retained regions; and extra negatives outside the synthetic injector
+footprint. Clean LiDAR and injector footprints label training examples but are
+not given to the addition head at inference. Fog has a full-scan footprint, so
+its extra untouched-region term is empty. This remains an oracle-assisted
+diagnostic because the frozen denoiser starts from a noisy **clean-LiDAR**
+latent, not from faulty LiDAR alone.
+
+Validation each epoch reports exact full-ROI IoU at threshold 0.5 against the
+faulty baseline. The post-training evaluator sweeps 0.000–1.000 on validation,
+includes an explicit no-additions option, selects the threshold by full-ROI
+exact IoU on calibration frames, and reports exact and 0.2 m occupancy IoU/F1
+for held-out validation and the official test set. The injector footprint is
+never applied as an inference mask; failure to improve full-ROI IoU is visible.
