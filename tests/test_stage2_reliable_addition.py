@@ -11,21 +11,18 @@ from scripts.evaluate_stage2_reliable_addition import full_roi_curve
 from scripts import train_stage2_reliable_addition as trainer
 
 
-def test_reliable_loss_protects_observed_and_missing_clean_cells():
+def test_empty_loss_protects_observed_and_missing_clean_cells():
     fine = torch.tensor([[0, 8, 80, 10], [0, 8, 80, 11],
                          [0, 8, 80, 12]])
     clean = torch.from_numpy(voxel_centers(fine[:2])).float()
     faulty = clean[:1]
     clean_ids = torch.zeros(len(clean), dtype=torch.long)
     faulty_ids = torch.zeros(len(faulty), dtype=torch.long)
-    # Even with an empty injector footprint, a genuinely missing clean cell
-    # stays positive; only the unobserved empty cell is reliable-negative.
-    masks = addition_masks(clean, clean_ids, faulty, faulty_ids, fine,
-                           [{"kind": "empty"}])
+    # A missing clean cell remains positive; the other unobserved cell is empty.
+    masks = addition_masks(clean, clean_ids, faulty, faulty_ids, fine)
     assert masks["context"].observed.tolist() == [True, False, False]
     assert masks["positive"].tolist() == [False, True, False]
     assert masks["negative"].tolist() == [False, False, True]
-    assert masks["reliable"].tolist() == [False, False, True]
     logits = torch.zeros(3, requires_grad=True)
     losses = addition_losses(logits, fine, masks, 1)
     losses["total"].backward()
@@ -57,7 +54,7 @@ def test_validation_scores_completed_full_roi(monkeypatch):
     faulty = clean[:1]
     masks = addition_masks(
         clean, torch.zeros(2, dtype=torch.long), faulty,
-        torch.zeros(1, dtype=torch.long), fine, [{"kind": "full_scan"}])
+        torch.zeros(1, dtype=torch.long), fine)
     monkeypatch.setattr(trainer, "decoded_addition_batch", lambda *args, **kwargs: {
         "fine": fine, "logits": torch.tensor([0.0, 5.0, -5.0]),
         "masks": masks})
@@ -72,6 +69,6 @@ def test_validation_scores_completed_full_roi(monkeypatch):
     result = trainer.run_epoch(
         Model(), [[row]], None, torch.linspace(0.9, 0.1, 1000),
         device="cpu", epoch=1, seed=3103, eval_timestep=499,
-        weights=(1, 1, 1, 1))
+        weights=(1, 1, 1))
     assert result["baseline"]["iou"] == 0.5
     assert result["completed_at_0p5"]["iou"] == 1.0

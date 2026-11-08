@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train the old addition head with healthy and untouched-region negatives.
+# Train the addition head with clean-occupancy and healthy-region supervision.
 set -euo pipefail
 
 REPO=${REPO:-/media/arrubuntu20/EA0A117F0A114A49/Thesis-1-stage2-geometry-16baaa0}
@@ -10,9 +10,8 @@ VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/vi
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SUPPORT=${SUPPORT:-$DATA/radar_support12vox_1p6m_mild_fog2_20261107}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
-REGIONS=${REGIONS:-$DATA/stage2_mild_fog2_injector_regions_20261106}
 OLD=${OLD:-$DATA/stage2_clean_one_step_faulty_radar_12vox_1p6m_batch16_20261107}
-OUT=${OUT:-$DATA/stage2_reliable_addition_12vox_1p6m_20261108}
+OUT=${OUT:-$DATA/stage2_healthy_addition_12vox_1p6m_20261108}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 if [[ ! -s "$LPCR" ]]; then
   LPCR=$DATA/stage2_fullregion_lpcr_for_geometry_20261106/best.ckpt
@@ -37,14 +36,9 @@ export PYTHONPATH="$REPO" OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
 export TMPDIR="$DATA/stage2_clean_tmp"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-"$PY" -u -m scripts.cache_stage2_fault_regions \
-  --vod-root "$VOD" --data-cache-root "$RAW" \
-  --faulty-root "$MILD" --output-root "$REGIONS" --split both \
-  2>&1 | tee "$OUT/cache_regions.log"
-
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
-  --fault-region-root "$REGIONS" --lpcr-checkpoint "$LPCR"
+  --lpcr-checkpoint "$LPCR"
   --base-checkpoint "$OUT/base.ckpt" --batch-size 16
   --num-workers 2 --device cuda)
 

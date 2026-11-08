@@ -1,7 +1,7 @@
 """Fit the old Stage-II addition head to reject reliable-region additions.
 
 The conditioned one-step denoiser and frozen LPCR are unchanged. Clean LiDAR
-and synthetic injector footprints provide training labels only. This remains
+provides occupancy labels only. This remains
 an oracle-assisted clean-latent diagnostic, not deployable reconstruction.
 """
 
@@ -20,8 +20,6 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as support_identity)
 from models.radar_lidar_stage1.sparse import encode_keys
 from models.radar_lidar_stage2.clean_selected_metrics import full_frame_voxels
-from models.radar_lidar_stage2.fault_region import (
-    FaultRegionCache, cache_identity as region_identity)
 from models.radar_lidar_stage2.reliable_addition import (
     addition_losses, decoded_addition_batch)
 from models.radar_lidar_stage2.sparse_geometry import GRID
@@ -33,21 +31,7 @@ from scripts.train_stage2_clean_denoiser import (
     _CleanRows, _rows)
 
 
-REVISION = "stage2_conditioned_12vox_reliable_addition_head_v1"
-
-
-class RegionRows:
-    def __init__(self, source: _CleanRows, regions: FaultRegionCache):
-        self.source = source
-        self.regions = regions
-
-    def __len__(self) -> int:
-        return len(self.source)
-
-    def __getitem__(self, index: int) -> dict:
-        row = self.source[index]
-        row["region"] = self.regions.get(row["frame_id"])
-        return row
+REVISION = "stage2_conditioned_12vox_healthy_addition_head_v2"
 
 
 def exact_counts(predicted: torch.Tensor, clean: torch.Tensor) -> dict[str, int]:
@@ -71,7 +55,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
               optimizer: torch.optim.Optimizer | None,
               alpha_bars: torch.Tensor, *, device: str, epoch: int,
               seed: int, eval_timestep: int,
-              weights: tuple[float, float, float, float]) -> dict:
+              weights: tuple[float, float, float]) -> dict:
     training = optimizer is not None
     model.eval()
     model.addition_head.train(training)
@@ -79,7 +63,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
     generator.manual_seed(seed + epoch if training else seed)
     loss_sum = 0.0
     frames = 0
-    sites = {name: 0 for name in ("positive", "negative", "healthy", "reliable")}
+    sites = {name: 0 for name in ("positive", "negative", "healthy")}
     baseline = {"predicted": 0, "target": 0, "tp": 0}
     completed = dict(baseline)
     for rows in loader:
@@ -96,7 +80,7 @@ def run_epoch(model: SparseResidualStage2, loader: DataLoader,
             losses = addition_losses(
                 logits, fine, masks, len(rows),
                 positive_weight=weights[0], negative_weight=weights[1],
-                healthy_weight=weights[2], reliable_weight=weights[3])
+                healthy_weight=weights[2])
             loss_sum += float(losses["total"].detach()) * len(rows)
             for key in sites:
                 sites[key] += losses[f"{key}_sites"]
@@ -167,7 +151,6 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
-    parser.add_argument("--fault-region-root", type=Path, required=True)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -180,13 +163,12 @@ def main() -> None:
     parser.add_argument("--positive-weight", type=float, default=1.0)
     parser.add_argument("--negative-weight", type=float, default=1.0)
     parser.add_argument("--healthy-weight", type=float, default=1.0)
-    parser.add_argument("--reliable-weight", type=float, default=1.0)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=3103)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     weights = (args.positive_weight, args.negative_weight,
-               args.healthy_weight, args.reliable_weight)
+               args.healthy_weight)
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or any(weight < 0 for weight in weights) or
@@ -210,7 +192,6 @@ def main() -> None:
             if base_identity[key][split] != sha256(root / split / "manifest.json"):
                 raise ValueError(f"{label} {split} cache differs from base model")
     loaders = {}
-    region_hashes = {}
     for split, limit in (("train", args.train_limit), ("val", args.val_limit)):
         dataset = paired_dataset(
             args.vod_root, split, base_identity["radar_variant"],
@@ -222,17 +203,9 @@ def main() -> None:
             min_radar_voxels=MIN_RADAR_VOXELS)
         cache = RadarSupportCache(args.support_cache_root / split, expected)
         cache.check_complete()
-        region_expected = region_identity(
-            split, frame_ids, args.faulty_root / split / "manifest.json",
-            args.data_cache_root / split / "manifest.json")
-        regions = FaultRegionCache(args.fault_region_root / split,
-                                   region_expected)
-        if regions.regions is None:
-            raise FileNotFoundError(f"Missing {split} injector footprint cache")
-        region_hashes[split] = sha256(regions.regions_path)
-        rows = RegionRows(_CleanRows(
+        rows = _CleanRows(
             dataset, cache, limit, args.faulty_root, split,
-            include_full_clean=(split == "val")), regions)
+            include_full_clean=(split == "val"))
         loaders[split] = DataLoader(
             rows, batch_size=args.batch_size, shuffle=(split == "train"),
             num_workers=args.num_workers, collate_fn=_rows,
@@ -243,7 +216,6 @@ def main() -> None:
                 "base_epoch": int(torch.load(
                     args.base_checkpoint, map_location="cpu",
                     weights_only=False)["epoch"]),
-                "region_data_sha256": region_hashes,
                 "batch_size": args.batch_size, "lr": args.lr,
                 "weights": weights, "seed": args.seed,
                 "train_limit": args.train_limit, "val_limit": args.val_limit,

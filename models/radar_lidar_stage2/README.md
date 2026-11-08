@@ -578,7 +578,7 @@ validation moderate 3D mAP_R40. The detector starts from random weights in a
 new output directory and automatically resumes its own checkpoints if the
 training run is interrupted. The existing Stage-II export is reused.
 
-### Reliable-addition ablation for the conditioned clean-latent denoiser
+### Healthy-region addition ablation for the conditioned clean-latent denoiser
 
 `scripts/run_stage2_reliable_addition_mild.sh` starts a separate experiment
 from the saved one-step, faulty-LiDAR/radar-conditioned denoiser. The denoiser,
@@ -587,18 +587,20 @@ radar adapter, and LPCR decoder are frozen. Only the existing Stage-II
 LiDAR did not already observe, using decoder features and local faulty-LiDAR
 density. Observed faulty voxels are always retained.
 
-The loss has four balanced components: positive missing-clean cells; negative
-unoccupied candidates; the previous `healthy_region_negatives` for locally
-well-retained regions; and extra negatives outside the synthetic injector
-footprint. Clean LiDAR and injector footprints label training examples but are
-not given to the addition head at inference. Fog has a full-scan footprint, so
-its extra untouched-region term is empty. This remains an oracle-assisted
-diagnostic because the frozen denoiser starts from a noisy **clean-LiDAR**
+The loss has three frame-balanced components: positive missing-clean cells;
+negative candidates with no clean-LiDAR return; and the previous
+`healthy_region_negatives` for locally well-retained regions. The generic
+negative is a missing return in the clean point cloud, not proof of physical
+free space. Clean LiDAR labels training examples but is not given to the
+addition head at inference. The radar gate alone can include untouched
+regions; there is no injector-footprint term or inference mask. This remains
+an oracle-assisted diagnostic because the frozen denoiser starts from a noisy
+**clean-LiDAR**
 latent, not from faulty LiDAR alone.
 
 Validation each epoch reports exact full-ROI IoU at threshold 0.5 against the
 faulty baseline. The post-training evaluator sweeps 0.000–1.000 on validation,
 includes an explicit no-additions option, selects the threshold by full-ROI
 exact IoU on calibration frames, and reports exact and 0.2 m occupancy IoU/F1
-for held-out validation and the official test set. The injector footprint is
-never applied as an inference mask; failure to improve full-ROI IoU is visible.
+for held-out validation and the official test set. Failure to improve full-ROI
+IoU is visible.

@@ -1,8 +1,7 @@
 """Addition-only supervision for the conditioned clean-latent diagnostic.
 
 The old Stage-II addition head is trained on unobserved radar-gated cells.
-Clean occupancy and the synthetic injector footprint supply labels only.
-Neither is an input to the addition head at inference.
+Clean occupancy supplies labels only; it is not an input to the addition head.
 """
 
 from __future__ import annotations
@@ -12,54 +11,36 @@ import torch.nn.functional as F
 
 from .addition import addition_context, healthy_region_negatives
 from .clean_denoising import frame_mean
-from .fault_region import footprint_mask
 from .geometry_gate import offset_targets
 from .sparse_residual import SparseResidualStage2, cosine_alpha_bars
 from scripts.train_stage2_clean_denoiser import (
     _batch, _conditioned_inputs, sample_clean_latent)
 
 
-def touched_cells(fine: torch.Tensor, regions: list[dict]) -> torch.Tensor:
-    if fine.ndim != 2 or fine.shape[1] != 4:
-        raise ValueError("Expected batched BZYX candidate cells")
-    if len(fine) and (bool((fine[:, 0] < 0).any()) or
-                      bool((fine[:, 0] >= len(regions)).any())):
-        raise ValueError("Candidate batch IDs exceed injector regions")
-    result = torch.zeros(len(fine), dtype=torch.bool, device=fine.device)
-    for frame, region in enumerate(regions):
-        mask = fine[:, 0] == frame
-        result[mask] = footprint_mask(fine[mask], region)
-    return result
-
-
 def addition_masks(clean: torch.Tensor, clean_ids: torch.Tensor,
                    faulty: torch.Tensor, faulty_ids: torch.Tensor,
-                   fine: torch.Tensor, regions: list[dict]) -> dict:
-    """Reproduce old healthy negatives and label the larger untouched sector."""
+                   fine: torch.Tensor) -> dict:
+    """Label missing clean cells and the previous healthy-region negatives."""
     context = addition_context(faulty, fine, faulty_ids)
     occupied, _, _ = offset_targets(clean, fine, clean_ids)
-    touched = touched_cells(fine, regions)
     candidates = ~context.observed
     positive = candidates & occupied
     negative = candidates & ~occupied
     healthy = healthy_region_negatives(
         clean, fine, occupied, context, clean_ids) & negative
-    reliable = negative & ~touched
     return {"context": context, "occupied": occupied,
             "candidates": candidates, "positive": positive,
-            "negative": negative, "healthy": healthy,
-            "reliable": reliable, "touched": touched}
+            "negative": negative, "healthy": healthy}
 
 
 def addition_losses(logits: torch.Tensor, fine: torch.Tensor, masks: dict,
                     batch_size: int, *, positive_weight: float = 1.0,
                     negative_weight: float = 1.0,
-                    healthy_weight: float = 1.0,
-                    reliable_weight: float = 1.0) -> dict:
-    """Balanced addition BCE, plus extra weight on reliable empty cells."""
+                    healthy_weight: float = 1.0) -> dict:
+    """Frame-balanced addition BCE with extra healthy-region emphasis."""
     if logits.shape != (len(fine),) or batch_size < 1 or any(
             weight < 0 for weight in (positive_weight, negative_weight,
-                                      healthy_weight, reliable_weight)):
+                                      healthy_weight)):
         raise ValueError("Invalid addition scores or loss weights")
     frame_ids = fine[:, 0].long()
 
@@ -72,15 +53,13 @@ def addition_losses(logits: torch.Tensor, fine: torch.Tensor, masks: dict,
     positive = term(masks["positive"], True)
     negative = term(masks["negative"], False)
     healthy = term(masks["healthy"], False)
-    reliable = term(masks["reliable"], False)
     total = (positive_weight * positive + negative_weight * negative
-             + healthy_weight * healthy + reliable_weight * reliable)
+             + healthy_weight * healthy)
     return {"total": total, "positive": positive, "negative": negative,
-            "healthy": healthy, "reliable": reliable,
+            "healthy": healthy,
             "positive_sites": int(masks["positive"].sum()),
             "negative_sites": int(masks["negative"].sum()),
-            "healthy_sites": int(masks["healthy"].sum()),
-            "reliable_sites": int(masks["reliable"].sum())}
+            "healthy_sites": int(masks["healthy"].sum())}
 
 
 def decoded_addition_batch(model: SparseResidualStage2, rows: list[dict],
@@ -112,8 +91,7 @@ def decoded_addition_batch(model: SparseResidualStage2, rows: list[dict],
             recovered.clamp(-1, 1), hierarchy,
             x0.new_ones((len(fine), 1)), return_hidden=True)
         if labels:
-            masks = addition_masks(clean, clean_ids, faulty, faulty_ids, fine,
-                                   [row["region"] for row in rows])
+            masks = addition_masks(clean, clean_ids, faulty, faulty_ids, fine)
         else:
             context = addition_context(faulty, fine, faulty_ids)
             occupied, _, _ = offset_targets(clean, fine, clean_ids)
