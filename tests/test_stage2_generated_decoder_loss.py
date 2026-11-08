@@ -52,8 +52,8 @@ def test_training_rollout_matches_inference_and_tracks_final_steps():
     assert torch.isfinite(model.diffusion.scale.grad)
 
 
-def test_false_positive_weight_acts_on_decoder_probabilities():
-    logits = torch.tensor([0.5, 1.0, -1.0], requires_grad=True)
+def test_false_positive_weight_acts_on_decoder_logits():
+    logits = torch.tensor([-0.5, 1.0, -1.0], requires_grad=True)
     occupied = torch.tensor([True, False, False])
     allowed = torch.tensor([True, True, False])
     mild, parts = asymmetric_occupancy_loss(
@@ -138,7 +138,7 @@ def test_generated_loss_reaches_denoiser_through_frozen_decoder(monkeypatch):
     assert model.lpcr_scale.grad is None
 
 
-def test_real_frozen_lpcr_passes_probability_error_gradient_to_latent():
+def test_real_frozen_lpcr_passes_margin_gradient_to_latent():
     model = SparseResidualStage2(diffusion_target="epsilon").eval()
     model.lpcr.requires_grad_(False)
     fine = torch.tensor([[10, 20, 30], [10, 20, 31]], dtype=torch.int32)

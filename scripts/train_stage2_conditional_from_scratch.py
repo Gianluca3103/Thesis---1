@@ -16,6 +16,7 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 from models.radar_lidar_stage2.clean_thresholds import THRESHOLD_STEPS
 from models.radar_lidar_stage2.fault_only_gate import POLICY
 from models.radar_lidar_stage2.fault_region import FaultRegionCache, cache_identity
+from models.radar_lidar_stage2.decoder_occupancy_loss import LOGIT_MARGIN
 from models.radar_lidar_stage2.sparse_residual import (
     LPCR_REVISION, VERSION, SparseResidualStage2, cosine_alpha_bars)
 from models.radar_lidar_stage2.stage2_io import sha256
@@ -97,7 +98,7 @@ def main() -> None:
                         help="Supervise frozen LPCR after a Gaussian-start rollout")
     parser.add_argument("--rollout-steps", type=int, default=64)
     parser.add_argument("--gradient-steps", type=int, default=4)
-    parser.add_argument("--occupancy-loss-weight", type=float, default=0.1)
+    parser.add_argument("--occupancy-loss-weight", type=float, default=0.05)
     parser.add_argument("--false-positive-weight", type=float, default=2.0)
     parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
@@ -191,11 +192,12 @@ def main() -> None:
             loss_weight=args.occupancy_loss_weight,
             false_positive_weight=args.false_positive_weight)
         identity.update({
-            "training_loss": "epsilon_mse_plus_generated_asymmetric_probability_error",
+            "training_loss": "epsilon_mse_plus_generated_asymmetric_logit_margin",
             "decoder_rollout_steps": args.rollout_steps,
             "decoder_gradient_steps": args.gradient_steps,
             "decoder_loss_weight": args.occupancy_loss_weight,
             "decoder_false_positive_weight": args.false_positive_weight,
+            "decoder_logit_margin": LOGIT_MARGIN,
             "decoder_loss_sites": "unobserved_fault_gated_fine_cells",
             "checkpoint_selection":
                 "calibration_threshold_then_heldout_validation_exact_iou",
