@@ -26,9 +26,10 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant",
                         default="radar_20frames_verified_doppler_radial")
-    parser.add_argument("--split", choices=("train", "val", "both"), default="both")
+    parser.add_argument("--split", choices=("train", "val", "test", "both", "all"), default="both")
     args = parser.parse_args()
-    splits = ("train", "val") if args.split == "both" else (args.split,)
+    splits = (("train", "val", "test") if args.split == "all" else
+              ("train", "val") if args.split == "both" else (args.split,))
     for split in splits:
         dataset = paired_dataset(args.vod_root, split, args.radar_variant,
                                  include_clean=True,

@@ -14,13 +14,16 @@ from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as support_identity)
 from models.radar_lidar_stage2.clean_denoising import frame_mean
+from models.radar_lidar_stage2.fault_only_gate import POLICY
+from models.radar_lidar_stage2.fault_region import FaultRegionCache, cache_identity
 from models.radar_lidar_stage2.conditional_sampling import (
     faulty_to_clean_noise_target)
 from models.radar_lidar_stage2.sparse_residual import (
     SparseResidualStage2, cosine_alpha_bars)
 from models.radar_lidar_stage2.stage2_io import sha256
 from scripts.conditional_stage2 import (
-    CONDITIONED_FAULTY_START_REVISION, deployment_loader)
+    CONDITIONED_FAULTY_START_REVISION, CONDITIONED_FAULT_ONLY_REVISION,
+    deployment_loader)
 from scripts.evaluate_stage2_conditional_reconstruction import sweep
 from scripts.train_stage2_clean_denoiser import (
     MIN_RADAR_VOXELS, RADIUS_M, _CleanRows, _atomic_save,
@@ -84,6 +87,7 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
+    parser.add_argument("--fault-region-root", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=125)
@@ -121,14 +125,24 @@ def main() -> None:
         min_radar_voxels=MIN_RADAR_VOXELS)
     support = RadarSupportCache(args.support_cache_root / "train", expected)
     support.check_complete()
+    train_regions = None
+    if args.fault_region_root is not None:
+        train_regions = FaultRegionCache(
+            args.fault_region_root / "train",
+            cache_identity("train", train_ids,
+                           args.faulty_root / "train" / "manifest.json",
+                           args.data_cache_root / "train" / "manifest.json"))
+        if train_regions.regions is None:
+            raise FileNotFoundError("Train injector footprints are not built")
     train_loader = DataLoader(
         _CleanRows(train_dataset, support, args.train_limit,
-                   args.faulty_root, "train"),
+                   args.faulty_root, "train", fault_regions=train_regions),
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     identity = {
-        "revision": CONDITIONED_FAULTY_START_REVISION,
+        "revision": (CONDITIONED_FAULT_ONLY_REVISION if train_regions is not None
+                     else CONDITIONED_FAULTY_START_REVISION),
         "lpcr_sha256": sha256(args.lpcr_checkpoint),
         "radar_variant": "radar_20frames_verified_doppler_radial",
         "radius_m": RADIUS_M,
@@ -149,10 +163,32 @@ def main() -> None:
         "training_target": "noise_equivalent_faulty_to_clean_latent",
         "validation_model_inputs": "faulty_LiDAR_radar_noisy_faulty_latent",
         "fresh_diffusion_and_radar_adapter": True,
-        "comparison_peer": "stage2_conditional_scratch_12vox_1p6m_20261108"}
+        "comparison_peer": ("conditional_faulty_start_12vox_1p6m"
+                            if train_regions is not None else
+                            "stage2_conditional_scratch_12vox_1p6m_20261108")}
+    if train_regions is not None:
+        val_dataset_for_regions = paired_dataset(
+            args.vod_root, "val", identity["radar_variant"],
+            include_clean=False, data_cache_root=args.data_cache_root)
+        val_region_ids = [frame.frame_id for frame in val_dataset_for_regions.frames]
+        val_regions = FaultRegionCache(
+            args.fault_region_root / "val",
+            cache_identity("val", val_region_ids,
+                           args.faulty_root / "val" / "manifest.json",
+                           args.data_cache_root / "val" / "manifest.json"))
+        if val_regions.regions is None:
+            raise FileNotFoundError("Validation injector footprints are not built")
+        identity.update({
+            "fault_region_policy": POLICY,
+            "fault_region_sha256": {
+                "train": sha256(train_regions.regions_path),
+                "val": sha256(val_regions.regions_path)}})
+    else:
+        val_regions = None
     val_loader, val_ids, _ = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
-        args.faulty_root, "val", identity, args.num_workers, args.val_limit)
+        args.faulty_root, "val", identity, args.num_workers, args.val_limit,
+        fault_region_root=args.fault_region_root)
     val_dataset = paired_dataset(
         args.vod_root, "val", identity["radar_variant"], include_clean=True,
         data_cache_root=args.data_cache_root)
@@ -167,7 +203,7 @@ def main() -> None:
     val_support.check_complete()
     val_loss_loader = DataLoader(
         _CleanRows(val_dataset, val_support, args.val_limit,
-                   args.faulty_root, "val"),
+                   args.faulty_root, "val", fault_regions=val_regions),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)

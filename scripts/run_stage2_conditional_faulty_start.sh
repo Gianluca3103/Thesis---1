@@ -10,6 +10,7 @@ VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/vi
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SUPPORT=${SUPPORT:-$DATA/radar_support12vox_1p6m_mild_fog2_20261107}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
+FAULT_REGIONS=${FAULT_REGIONS:-}
 OUT=${OUT:-$DATA/stage2_conditional_faulty_start_12vox_1p6m_20261108}
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 BATCH_SIZE=${BATCH_SIZE:-16}
@@ -25,6 +26,16 @@ for required in "$PY" "$LPCR" \
   "$MILD/val/manifest.json" "$MILD/test/manifest.json"; do
   [[ -s "$required" ]] || { printf 'Missing required file: %s\n' "$required" >&2; exit 1; }
 done
+region_arg=()
+if [[ -n "$FAULT_REGIONS" ]]; then
+  for split in train val test; do
+    [[ -s "$FAULT_REGIONS/$split/regions.json" ]] || {
+      printf 'Missing injector footprints: %s\n' "$FAULT_REGIONS/$split/regions.json" >&2
+      exit 1
+    }
+  done
+  region_arg=(--fault-region-root "$FAULT_REGIONS")
+fi
 
 mkdir -p "$OUT" "$DATA/stage2_clean_tmp"
 cd "$REPO"
@@ -34,6 +45,7 @@ export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD
 
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
+  "${region_arg[@]}"
   --lpcr-checkpoint "$LPCR" --batch-size "$BATCH_SIZE"
   --num-workers 2 --device cuda)
 
@@ -60,6 +72,7 @@ printf 'Scoring the best validation-IoU checkpoint on official validation and te
 "$PY" -u -m scripts.evaluate_stage2_conditional_reconstruction \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --support-cache-root "$SUPPORT" --faulty-root "$MILD" \
+  "${region_arg[@]}" \
   --lpcr-checkpoint "$LPCR" --checkpoint "$OUT/best_iou.ckpt" \
   --steps 1 --num-workers 2 --device cuda \
   --output-json "$OUT/best_faulty_start_1step_val_test.json" \

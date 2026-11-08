@@ -10,7 +10,12 @@ VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/vi
 RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SUPPORT=${SUPPORT:-$DATA/radar_support12vox_1p6m_mild_fog2_20261107}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
-OUT=${OUT:-$DATA/stage2_conditional_scratch_12vox_1p6m_20261108}
+FAULT_REGIONS=${FAULT_REGIONS:-}
+if [[ -n "$FAULT_REGIONS" ]]; then
+  OUT=${OUT:-$DATA/stage2_conditional_cleanstart_faultonly_12vox_1p6m_20261108}
+else
+  OUT=${OUT:-$DATA/stage2_conditional_scratch_12vox_1p6m_20261108}
+fi
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 BATCH_SIZE=${BATCH_SIZE:-16}
 EPOCHS=${EPOCHS:-125}
@@ -32,8 +37,19 @@ export PYTHONPATH="$REPO" OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
 export TMPDIR="$DATA/stage2_clean_tmp"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+region_arg=()
+if [[ -n "$FAULT_REGIONS" ]]; then
+  printf 'Caching synthetic injector footprints for train, validation, and test.\n'
+  "$PY" -u -m scripts.cache_stage2_fault_regions \
+    --vod-root "$VOD" --data-cache-root "$RAW" \
+    --faulty-root "$MILD" --output-root "$FAULT_REGIONS" --split all \
+    2>&1 | tee "$OUT/cache_fault_regions.log"
+  region_arg=(--fault-region-root "$FAULT_REGIONS")
+fi
+
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
+  "${region_arg[@]}"
   --lpcr-checkpoint "$LPCR" --batch-size "$BATCH_SIZE"
   --num-workers 2 --device cuda)
 
@@ -60,6 +76,7 @@ printf 'Scoring the best validation-IoU checkpoint on official validation and te
 "$PY" -u -m scripts.evaluate_stage2_conditional_reconstruction \
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --support-cache-root "$SUPPORT" --faulty-root "$MILD" \
+  "${region_arg[@]}" \
   --lpcr-checkpoint "$LPCR" --checkpoint "$OUT/best_iou.ckpt" \
   --steps "$VAL_STEPS" --num-workers 2 --device cuda \
   --output-json "$OUT/best_full_noise_${VAL_STEPS}steps_val_test.json" \

@@ -25,6 +25,8 @@ from models.radar_lidar_stage2.clean_denoising import (
     batched_hierarchy, clean_points_in_support, frame_mean,
     occupancy_counts, occupancy_metrics)
 from models.radar_lidar_stage2.fault_data import load_faulty
+from models.radar_lidar_stage2.fault_only_gate import fault_only_support
+from models.radar_lidar_stage2.fault_region import FaultRegionCache
 from models.radar_lidar_stage2.geometry_gate import offset_targets
 from models.radar_lidar_stage2.geometry_gate import geometry_gate_output
 from models.radar_lidar_stage2.sparse_residual import (
@@ -46,13 +48,15 @@ RADAR_VARIANT = "radar_20frames_verified_doppler_radial"
 class _CleanRows:
     def __init__(self, dataset, cache: RadarSupportCache, limit: int | None,
                  faulty_root: Path | None = None, split: str | None = None,
-                 *, include_full_clean: bool = False):
+                 *, include_full_clean: bool = False,
+                 fault_regions: FaultRegionCache | None = None):
         self.dataset = dataset
         self.cache = cache
         self.limit = len(dataset) if limit is None else min(len(dataset), limit)
         self.faulty_root = faulty_root
         self.split = split
         self.include_full_clean = include_full_clean
+        self.fault_regions = fault_regions
 
     def __len__(self) -> int:
         return self.limit
@@ -60,6 +64,8 @@ class _CleanRows:
     def __getitem__(self, index: int) -> dict:
         row = self.dataset[index]
         mask = self.cache.load(row["frame_id"])
+        if self.fault_regions is not None:
+            mask = fault_only_support(mask, self.fault_regions.get(row["frame_id"]))
         result = {"frame_id": row["frame_id"],
                   "fine_zyx": supported_coordinates(mask),
                   "clean_xyz": clean_points_in_support(

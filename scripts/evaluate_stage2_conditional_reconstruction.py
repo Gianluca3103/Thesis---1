@@ -17,6 +17,8 @@ from models.radar_lidar_stage2.clean_thresholds import (
     THRESHOLD_STEPS, score_histograms, sweep_rows)
 from models.radar_lidar_stage2.eligible_occupancy_metrics import (
     occupancy_counts as tolerant_occupancy_counts)
+from models.radar_lidar_stage2.eligible_occupancy_metrics import summarize_counts
+from models.radar_lidar_stage2.fault_only_gate import POLICY
 from models.radar_lidar_stage2.sparse_geometry import GRID, sorted_unique
 from models.radar_lidar_stage2.sparse_residual import cosine_alpha_bars
 from models.radar_lidar_stage2.stage2_io import sha256
@@ -64,6 +66,28 @@ def _frame_candidates(fine: torch.Tensor, logits: torch.Tensor, frame: int,
     cells[:, 0] = 0
     observed = addition_context(faulty_xyz.to(device), cells).observed
     return cells[~observed], logits[selected][~observed]
+
+
+def _empty_active_counts() -> dict[str, int]:
+    return {"frames": 0, "predicted": 0, "eligible_target": 0,
+            "exact_tp": 0, "tolerant_tp_0p2m": 0,
+            "radar_supported_cells": 0, "active_cells": 0}
+
+
+def _active_summary(values: dict[str, int]) -> dict:
+    result = summarize_counts(values)
+    predicted, target = values["predicted"], values["eligible_target"]
+    exact, tolerant = values["exact_tp"], values["tolerant_tp_0p2m"]
+    return {"frames": values["frames"], **result,
+            "mean_radar_supported_cells": (values["radar_supported_cells"] /
+                                           values["frames"] if values["frames"] else 0.0),
+            "mean_active_cells": (values["active_cells"] / values["frames"]
+                                  if values["frames"] else 0.0),
+            "precision": exact / predicted if predicted else 0.0,
+            "recall": exact / target if target else 0.0,
+            "f1": 2 * exact / (predicted + target) if predicted + target else 0.0,
+            "f1_0p2m": 2 * tolerant / (predicted + target)
+            if predicted + target else 0.0}
 
 
 @torch.no_grad()
@@ -146,10 +170,12 @@ def selected_metrics(model, loader, raw_root: Path, split: str, alpha_bars,
                      timestep: int = 499) -> dict:
     groups = ("calibration", "heldout") if role is not None else ("test",)
     overall = {name: {"faulty": empty_accumulator(),
-                      "completed": empty_accumulator()}
+                      "completed": empty_accumulator(),
+                      "active": _empty_active_counts()}
                for name in groups}
     by_fault = {name: {"faulty": empty_accumulator(),
-                       "completed": empty_accumulator()}
+                       "completed": empty_accumulator(),
+                       "active": _empty_active_counts()}
                 for name in sorted(set(fault_names.values()))}
     for rows in tqdm(loader, desc=f"Conditional Stage II {split} metrics",
                      unit="batch"):
@@ -166,21 +192,36 @@ def selected_metrics(model, loader, raw_root: Path, split: str, alpha_bars,
             clean_xyz = reference_clean(raw_root, split, row["frame_id"])
             clean, faulty, completed = full_frame_voxels(
                 clean_xyz, row["faulty_xyz"], additions)
+            # Within the filtered active region, score additions against clean
+            # cells that were not already observed in the faulty LiDAR.
+            candidate_cpu = candidates.cpu()
+            eligible = candidate_cpu[torch.isin(
+                encode_keys(candidate_cpu, GRID.shape_zyx),
+                encode_keys(clean, GRID.shape_zyx))]
+            active_counts = tolerant_occupancy_counts(
+                additions, eligible, tolerance_m=0.2)
             group = role[row["frame_id"]] if role is not None else "test"
             for store in (overall[group], by_fault[fault_names[row["frame_id"]]]):
                 add_frame(store["faulty"], faulty, clean)
                 add_frame(store["completed"], completed, clean)
+                store["active"]["frames"] += 1
+                store["active"]["radar_supported_cells"] += row["radar_supported_cells"]
+                store["active"]["active_cells"] += row["active_cells"]
+                for key, value in active_counts.items():
+                    store["active"][key] += value
     if role is not None:
         overall["all_validation"] = {
             phase: {key: (overall["calibration"][phase][key] +
                           overall["heldout"][phase][key])
                     for key in overall["calibration"][phase]}
-            for phase in ("faulty", "completed")}
+            for phase in ("faulty", "completed", "active")}
     return {"overall": {name: completion_summary(
                 value["faulty"], value["completed"])
+                | {"active_additions": _active_summary(value["active"])}
                 for name, value in overall.items()},
             "by_fault": {name: completion_summary(
                 value["faulty"], value["completed"])
+                | {"active_additions": _active_summary(value["active"])}
                 for name, value in by_fault.items()}}
 
 
@@ -190,6 +231,7 @@ def main() -> None:
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
+    parser.add_argument("--fault-region-root", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
@@ -216,7 +258,8 @@ def main() -> None:
     alpha_bars = cosine_alpha_bars(device=args.device)
     val_loader, val_ids, val_manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
-        args.faulty_root, "val", identity, args.num_workers, args.val_limit)
+        args.faulty_root, "val", identity, args.num_workers, args.val_limit,
+        fault_region_root=args.fault_region_root)
     sweep_report, role = sweep(
         model, val_loader, val_ids, args.data_cache_root, alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
@@ -236,7 +279,8 @@ def main() -> None:
             raise RuntimeError(f"{group} sweep and selected metrics differ")
     test_loader, test_ids, test_manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
-        args.faulty_root, "test", identity, args.num_workers, args.test_limit)
+        args.faulty_root, "test", identity, args.num_workers, args.test_limit,
+        fault_region_root=args.fault_region_root)
     if set(val_ids) & set(test_ids):
         raise ValueError("Official test and validation frames overlap")
     test = selected_metrics(
@@ -253,6 +297,9 @@ def main() -> None:
               "prediction_inputs": ["faulty_LiDAR", "measured_radar",
                                     "radar_geometry_gate", "Gaussian_noise"],
               "clean_LiDAR_role": "metric_reference_only",
+              "oracle_injector_fault_gate": args.fault_region_root is not None,
+              "fault_gate_policy": POLICY if
+                  args.fault_region_root is not None else None,
               "checkpoint": str(args.checkpoint),
               "checkpoint_sha256": sha256(args.checkpoint),
               "checkpoint_epoch": int(saved["epoch"]),
@@ -291,6 +338,24 @@ def main() -> None:
               f"F1@0.2m {before['f1_0p2m']:.2%} -> "
               f"{after['f1_0p2m']:.2%} "
               f"({delta['f1_0p2m'] * 100:+.2f} pp)", flush=True)
+        active = value["active_additions"]
+        print(f"  Active-gate additions: "
+              f"P={active['precision']:.2%}, R={active['recall']:.2%}, "
+              f"IoU={active['eligible_iou']:.2%}, "
+              f"IoU@0.2m={active['eligible_iou_0p2m']:.2%}, "
+              f"mean active/radar cells={active['mean_active_cells']:,.0f}/"
+              f"{active['mean_radar_supported_cells']:,.0f}, "
+              f"predicted={active['predicted']:,}, "
+              f"eligible targets={active['eligible_target']:,}", flush=True)
+    for fault, value in test["by_fault"].items():
+        active = value["active_additions"]
+        print(f"test {fault}: exact IoU "
+              f"{value['faulty']['iou']:.2%} -> "
+              f"{value['completed']['iou']:.2%}; "
+              f"active cells/frame {active['mean_active_cells']:,.0f}/"
+              f"{active['mean_radar_supported_cells']:,.0f} radar-supported; "
+              f"addition P={active['precision']:.2%}, "
+              f"R={active['recall']:.2%}", flush=True)
     print(f"Report: {args.output_json}", flush=True)
 
 

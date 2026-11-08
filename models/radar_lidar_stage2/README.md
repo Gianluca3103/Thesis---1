@@ -616,6 +616,16 @@ chain every epoch; `EPOCHS` and `VAL_STEPS` can be overridden explicitly.
 The prior BCE addition head is excluded from this run because it was trained
 with clean-seeded decoder features; it needs its own generated-feature trial.
 
+Set `FAULT_REGIONS` to a distinct injector-footprint cache root when running
+`scripts/run_stage2_conditional_from_scratch.sh` to train the same clean-start
+objective inside the synthetic fault-area gate. The launcher builds train,
+validation, and test footprints before training and uses a separate output
+folder. For partial-loss faults, reliable azimuth sectors are excluded before
+constructing the sparse hierarchy; fog remains full-scan. The clean LiDAR
+latent supplies the training noise target, while validation/test generation
+starts from Gaussian noise with faulty LiDAR and radar conditioning. The
+injector footprint is an oracle diagnostic input for these synthetic faults.
+
 For a valid evaluation of the older conditioned denoiser without retraining,
 `scripts/run_stage2_conditional_reconstruction.sh` evaluates the saved
 faulty-LiDAR/radar-conditioned epsilon denoiser as a conditional generator.
@@ -668,3 +678,22 @@ includes an explicit no-additions option, selects the threshold by full-ROI
 exact IoU on calibration frames, and reports exact and 0.2 m occupancy IoU/F1
 for held-out validation and the official test set. Failure to improve full-ROI
 IoU is visible.
+
+### Oracle fault-area gate diagnostic
+
+For partial-loss faults, the active cells are the intersection of the
+12-radar-voxel/1.6 m support and the injector's removed azimuth sector. A
+conservative inward voxel margin excludes cells that could touch the reliable
+sector. Fog was applied to the full scan, so its gate is unchanged. The
+faulty LiDAR's observed voxels remain in the completed output and are never
+emitted as additions. Training and inference use the same filtered support.
+The denoiser sees clean LiDAR only as a training target, while the footprint
+cache builder uses the synthetic injector's clean input and seed to recover
+the known fault sector.
+
+The injector footprint is an **oracle synthetic-fault sidecar**, not an input
+available for unknown real faults. These results diagnose the reconstruction
+model's quality when the fault location is supplied. The evaluator reports
+both full-scene faulty-versus-completed IoU/F1 and addition-only scores inside
+the active gate, with exact and 0.2 m occupancy matching. It also reports
+mean active cells to verify how much of the radar gate was excluded.
