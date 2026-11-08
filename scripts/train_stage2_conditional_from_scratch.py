@@ -115,6 +115,8 @@ def main() -> None:
     parser.add_argument("--fault-region-root", type=Path)
     parser.add_argument("--generated-occupancy-loss", action="store_true",
                         help="Supervise frozen LPCR after a Gaussian-start rollout")
+    parser.add_argument("--fixed-validation-only", action="store_true",
+                        help="Use periodic fixed-0.5 validation without epoch sweeps")
     parser.add_argument("--rollout-steps", type=int, default=64)
     parser.add_argument("--gradient-steps", type=int, default=4)
     parser.add_argument("--occupancy-loss-weight", type=float, default=0.05)
@@ -140,6 +142,8 @@ def main() -> None:
         parser.error("Generated occupancy trial requires --fault-region-root")
     if args.initialize_from is not None and not args.generated_occupancy_loss:
         parser.error("--initialize-from is for the generated occupancy trial")
+    if args.fixed_validation_only and args.generated_occupancy_loss:
+        parser.error("Generated occupancy already uses fixed validation")
     if (args.device != "cuda" or not torch.cuda.is_available() or
             args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or
             args.lr <= 0 or not 2 <= args.validation_steps <= 1000 or
@@ -226,6 +230,11 @@ def main() -> None:
             "checkpoint_selection": "fixed_0p5_full_validation_exact_iou",
             "initialize_from_sha256": (sha256(args.initialize_from)
                                        if args.initialize_from else None)})
+    elif args.fixed_validation_only:
+        identity.update({"training_loss": "epsilon_mse_only",
+                         "reconstruction_val_every": args.reconstruction_val_every,
+                         "checkpoint_selection":
+                             "fixed_0p5_full_validation_exact_iou"})
     val_clean_dataset = paired_dataset(
         args.vod_root, "val", identity["radar_variant"],
         include_clean=True, data_cache_root=args.data_cache_root)
@@ -318,7 +327,7 @@ def main() -> None:
             raise RuntimeError("Validation noise loss did not cover all selected frames")
         validation = None
         full = None
-        if decoder_config is None:
+        if decoder_config is None and not args.fixed_validation_only:
             validation, _ = sweep(
                 model, val_loader, val_ids, args.data_cache_root, alpha_bars,
                 device=args.device, seed=args.seed, steps=args.validation_steps,
@@ -329,7 +338,8 @@ def main() -> None:
             full = fixed_threshold_validation(
                 model, val_loader, args.data_cache_root, alpha_bars,
                 device=args.device, seed=args.seed, steps=args.validation_steps,
-                decoder_loss_fp_weight=args.false_positive_weight)
+                decoder_loss_fp_weight=(args.false_positive_weight
+                                        if decoder_config is not None else None))
             if full["frames"] != len(val_ids):
                 raise RuntimeError("Fixed-threshold validation skipped frames")
         selection_iou = full["iou"] if full is not None else None
@@ -345,9 +355,10 @@ def main() -> None:
                   "val_full_roi_at_0p5": full,
                   "val_frames": len(val_ids),
                   "best_val_selection_iou": best_iou}
-        if decoder_config is None:
+        if validation is not None:
             record["val_calibration_selected"] = validation["calibration"]
             record["val_threshold_heldout"] = validation["heldout"]
+        if decoder_config is None:
             record["best_val_full_iou_at_0p5"] = best_iou
         else:
             record.update({
@@ -380,7 +391,7 @@ def main() -> None:
         if decoder_config is not None and full is not None:
             metric_log += (f"val_generated_decoder_loss="
                            f"{full['generated_decoder_loss']['loss']:.4f} ")
-        if decoder_config is None:
+        if decoder_config is None and validation is not None:
             metric_log += (f"heldout_calibrated_exact_IoU="
                            f"{validation['heldout']['iou']:.2%} "
                            f"calibrated_probability_threshold="

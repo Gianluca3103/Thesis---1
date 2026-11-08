@@ -16,6 +16,7 @@ if [[ ${BCE:-0} != 0 ]]; then
   exit 1
 fi
 DECODER_LOSS=${DECODER_LOSS:-0}
+FIXED_VAL_ONLY=${FIXED_VAL_ONLY:-0}
 INIT=${INIT:-}
 ROLLOUT_STEPS=${ROLLOUT_STEPS:-64}
 GRADIENT_STEPS=${GRADIENT_STEPS:-4}
@@ -23,6 +24,12 @@ OCCUPANCY_LOSS_WEIGHT=${OCCUPANCY_LOSS_WEIGHT:-0.05}
 FALSE_POSITIVE_WEIGHT=${FALSE_POSITIVE_WEIGHT:-2.0}
 if [[ "$DECODER_LOSS" != 0 && "$DECODER_LOSS" != 1 ]]; then
   printf 'DECODER_LOSS must be 0 or 1\n' >&2; exit 1
+fi
+if [[ "$FIXED_VAL_ONLY" != 0 && "$FIXED_VAL_ONLY" != 1 ]]; then
+  printf 'FIXED_VAL_ONLY must be 0 or 1\n' >&2; exit 1
+fi
+if [[ "$DECODER_LOSS" == 1 && "$FIXED_VAL_ONLY" == 1 ]]; then
+  printf 'DECODER_LOSS already uses fixed validation\n' >&2; exit 1
 fi
 if [[ "$DECODER_LOSS" == 1 && -z "$FAULT_REGIONS" ]]; then
   printf 'DECODER_LOSS=1 requires FAULT_REGIONS\n' >&2; exit 1
@@ -33,6 +40,8 @@ fi
 if [[ -n "$FAULT_REGIONS" ]]; then
   if [[ "$DECODER_LOSS" == 1 ]]; then
     OUT=${OUT:-$DATA/stage2_conditional_cleanstart_faultonly_decoder_loss_12vox_1p6m_20261108}
+  elif [[ "$FIXED_VAL_ONLY" == 1 ]]; then
+    OUT=${OUT:-$DATA/stage2_conditional_cleanstart_faultonly_mse_fixed_12vox_1p6m_20261108}
   else
     OUT=${OUT:-$DATA/stage2_conditional_cleanstart_faultonly_12vox_1p6m_20261108}
   fi
@@ -42,6 +51,10 @@ fi
 LPCR=${LPCR:-$DATA/radar_stage2_ray0_20261028/stage2_sparse_lpcr_fullregion_v9/best.ckpt}
 if [[ "$DECODER_LOSS" == 1 ]]; then
   BATCH_SIZE=${BATCH_SIZE:-8}
+  EPOCHS=${EPOCHS:-25}
+  RECON_VAL_EVERY=${RECON_VAL_EVERY:-5}
+elif [[ "$FIXED_VAL_ONLY" == 1 ]]; then
+  BATCH_SIZE=${BATCH_SIZE:-16}
   EPOCHS=${EPOCHS:-25}
   RECON_VAL_EVERY=${RECON_VAL_EVERY:-5}
 else
@@ -78,6 +91,11 @@ export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD
 region_arg=()
 decoder_arg=()
 smoke_decoder_arg=()
+fixed_val_arg=()
+if [[ "$FIXED_VAL_ONLY" == 1 ]]; then
+  fixed_val_arg=(--fixed-validation-only
+    --reconstruction-val-every "$RECON_VAL_EVERY")
+fi
 if [[ "$DECODER_LOSS" == 1 ]]; then
   decoder_arg=(--generated-occupancy-loss
     --rollout-steps "$ROLLOUT_STEPS"
@@ -101,7 +119,7 @@ fi
 
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
-  "${region_arg[@]}" "${decoder_arg[@]}"
+  "${region_arg[@]}" "${decoder_arg[@]}" "${fixed_val_arg[@]}"
   --lpcr-checkpoint "$LPCR" --batch-size "$BATCH_SIZE"
   --num-workers "$WORKERS" --device cuda)
 
@@ -122,8 +140,12 @@ if [[ -s "$OUT/last.ckpt" ]]; then
     resume+=(--allow-batch-size-change)
   fi
 fi
-printf 'Training %s epochs; noise loss each epoch; fixed-0.5 reconstruction validation every %s epochs with %s steps.\n' \
-  "$EPOCHS" "$RECON_VAL_EVERY" "$VAL_STEPS"
+if [[ "$DECODER_LOSS" == 1 || "$FIXED_VAL_ONLY" == 1 ]]; then
+  printf 'Training %s epochs; noise loss each epoch; fixed-0.5 reconstruction validation every %s epochs with %s steps.\n' \
+    "$EPOCHS" "$RECON_VAL_EVERY" "$VAL_STEPS"
+else
+  printf 'Training %s epochs; historical full validation sweep each epoch.\n' "$EPOCHS"
+fi
 "$PY" -u -m scripts.train_stage2_conditional_from_scratch \
   "${common[@]}" --output-root "$OUT" --epochs "$EPOCHS" \
   --validation-steps "$VAL_STEPS" "${resume[@]}" \
