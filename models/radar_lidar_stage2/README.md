@@ -697,3 +697,13 @@ model's quality when the fault location is supplied. The evaluator reports
 both full-scene faulty-versus-completed IoU/F1 and addition-only scores inside
 the active gate, with exact and 0.2 m occupancy matching. It also reports
 mean active cells to verify how much of the radar gate was excluded.
+
+To inspect the complete active masks in 3D on the professor desktop, run
+`bash scripts/run_stage2_fault_only_gate_viewer.sh` from the checked-out
+repository. It caches the injector footprints if needed, renders two balanced
+validation frames per fault, starts a local HTTP server, and opens Firefox.
+The page defaults to the fault-only gate; toggle the original radar gate to
+compare them. The voxel masks are complete, while LiDAR and radar overlays
+are sampled for display. `SPLIT=test`, `PER_FAULT=4`, and `PORT=8769` can be
+set through the environment when needed. Fog uses the full-scan footprint,
+so both gates coincide in fog examples.
