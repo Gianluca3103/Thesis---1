@@ -103,12 +103,16 @@ def _plot(path: Path, record: dict) -> None:
                              linewidths=0)
     before = record["overall"]["faulty"]
     after = record["overall"]["completed"]
+    source_note = (
+        "Oracle-assisted diagnostic: denoising starts from clean-LiDAR latent"
+        if record.get("oracle_clean_latent", True) else
+        "Prediction starts from Gaussian noise; inputs are faulty LiDAR and radar")
     fig.suptitle(
         f"{record['split']} {record['frame_id']} · {record['fault']} · "
         f"epoch {record['epoch']} · threshold {record['threshold']:.3f}\n"
         f"Full-ROI IoU {before['iou']:.1%} → {after['iou']:.1%}; "
         f"green: correct addition, orange: false addition, red: still missing\n"
-        "Oracle-assisted diagnostic: denoising starts from clean-LiDAR latent",
+        f"{source_note}",
         color="white", fontsize=11)
     fig.savefig(path, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -151,7 +155,7 @@ label{white-space:nowrap}canvas{width:100%;height:72vh;min-height:440px;backgrou
 <button id="zout">Zoom out</button><button id="reset">Reset</button></div>
 <div id="layers" class="layers"></div><canvas id="view"></canvas>
 <p>Drag to rotate · Shift-drag to pan · wheel to zoom. Points are occupancy voxel centers. Display is sampled; PLY and NPZ contain every voxel.</p>
-<p><b>Interpretation:</b> This model begins from a noised clean-LiDAR latent. These are oracle-assisted diagnostic outputs, not deployable reconstruction from faulty LiDAR and radar alone.</p>
+<p><b>Interpretation:</b> __INTERPRETATION__</p>
 <p id="downloads"></p><script id="data" type="application/json">__DATA__</script>
 <script>(()=>{const d=JSON.parse(document.getElementById('data').textContent);
 document.getElementById('title').textContent=`${d.split} ${d.frame} · ${d.fault} · epoch ${d.epoch} · threshold ${d.threshold.toFixed(3)}`;
@@ -170,7 +174,14 @@ canvas.addEventListener('pointermove',e=>{if(!last)return;const dx=e.clientX-las
 for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,()=>last=null);
 canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001));},{passive:false});
 document.getElementById('zin').onclick=()=>zoom(1.6);document.getElementById('zout').onclick=()=>zoom(1/1.6);document.getElementById('reset').onclick=()=>{Object.assign(view,{yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0});draw();};window.addEventListener('resize',draw);preset([1,2,3]);})();</script></html>'''
-    path.write_text(markup.replace("__DATA__", payload), encoding="utf-8")
+    interpretation = ("This model begins from a noised clean-LiDAR latent. "
+                      "These are oracle-assisted diagnostic outputs."
+                      if record.get("oracle_clean_latent", True) else
+                      "Prediction begins from Gaussian noise with faulty "
+                      "LiDAR and radar conditioning. Clean LiDAR is loaded "
+                      "only afterward to score and color the result.")
+    path.write_text(markup.replace("__DATA__", payload).replace(
+        "__INTERPRETATION__", interpretation), encoding="utf-8")
 
 
 def _save_record(root: Path, record: dict, seed: int) -> dict:

@@ -7,7 +7,7 @@ import torch
 from models.radar_lidar_stage2.clean_selected_metrics import (
     add_frame, completion_summary, empty_accumulator, voxel_centers)
 from scripts.visualize_stage2_conditioned_completion import (
-    _save_record, balanced_frame_ids)
+    _save_record, _viewer, balanced_frame_ids)
 
 
 def test_balanced_frame_ids_selects_each_fault_reproducibly():
@@ -58,3 +58,8 @@ def test_conditioned_sample_writes_completed_scan_and_light_viewer(tmp_path):
     assert "New false additions" in page
     assert "Faulty input" in page
     assert "oracle-assisted diagnostic" in page.lower()
+    record["oracle_clean_latent"] = False
+    _viewer(tmp_path / "deployable.html", record, 3103)
+    deployable = (tmp_path / "deployable.html").read_text(encoding="utf-8")
+    assert "Prediction begins from Gaussian noise" in deployable
+    assert "oracle-assisted diagnostic outputs" not in deployable.lower()
