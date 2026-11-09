@@ -24,14 +24,17 @@ from models.radar_lidar_stage1.correspondence import Neighborhood
 from models.radar_lidar_stage1.sparse import (SparseSites, decode_keys,
                                                encode_keys, voxelize)
 from models.radar_lidar_stage2.candidate_domain import CandidateDomain
+from models.radar_lidar_stage2.sparse_geometry import GRID as STAGE2_GRID
 from models.radar_lidar_stage2.voxel_target import make_targets
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.meta_cache import (MetaOccupancyCache,
-                                                        cache_manifest)
+                                                        _sha256, cache_manifest)
 from models.radar_lidar_crossmodal_v1.meta_occupancy import (
     MetaOccupancyConfig, candidate_support, supported_clean_points,
 )
 from models.radar_lidar_crossmodal_v1.pipeline_data import collate_stage1, paired_dataset
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
+    RadarSupportCache, identity as gate_identity)
 
 
 COARSE_SHAPE = GRID.scale_shape(8)
@@ -103,24 +106,73 @@ def _cpu_neighbors(radar: SparseSites, lidar: SparseSites,
 
 
 @torch.no_grad()
-def build_entry_fast(batch: dict, config: MetaOccupancyConfig) -> dict:
+def _gate_on_global_cells(coords: torch.Tensor, mask: np.ndarray) -> torch.Tensor:
+    """Map the Stage-II gate into the aligned global radar decoder grid."""
+    if mask.shape != STAGE2_GRID.shape_zyx or mask.dtype != np.bool_:
+        raise ValueError("Expected the 12-radar-voxel Stage-II support mask")
+    offset_xyz = [((local - global_min) / size) for local, global_min, size in
+                  zip(STAGE2_GRID.minimum_xyz, GRID.minimum_xyz, GRID.size_xyz)]
+    if any(abs(value - round(value)) > 1e-6 for value in offset_xyz):
+        raise ValueError("Radar decoder and Stage-II gate grids do not align")
+    shift = coords.new_tensor(tuple(int(round(value)) for value in offset_xyz[::-1]))
+    local = coords[:, 1:].long() - shift
+    limits = local.new_tensor(STAGE2_GRID.shape_zyx)
+    inside = ((local >= 0) & (local < limits)).all(-1)
+    selected = torch.zeros(len(coords), dtype=torch.bool)
+    if bool(inside.any()):
+        zyx = local[inside].numpy()
+        selected[inside] = torch.from_numpy(mask[zyx[:, 0], zyx[:, 1],
+                                                 zyx[:, 2]].copy())
+    return selected
+
+
+def _clean_points_in_gate(batch: dict, mask: np.ndarray) -> int:
+    xyz = batch["clean_lidar"][batch["clean_lidar_valid"]][:, :3]
+    lower = xyz.new_tensor(STAGE2_GRID.minimum_xyz)
+    upper = xyz.new_tensor(STAGE2_GRID.maximum_xyz)
+    inside = ((xyz >= lower) & (xyz < upper)).all(-1)
+    local = torch.floor((xyz[inside] - lower) /
+                        xyz.new_tensor(STAGE2_GRID.voxel_xyz)).long().numpy()
+    return int(mask[local[:, 2], local[:, 1], local[:, 0]].sum())
+
+
+@torch.no_grad()
+def build_entry_fast(batch: dict, config: MetaOccupancyConfig,
+                     gate_mask: np.ndarray | None = None) -> dict:
     radar = bottleneck_geometry(batch["radar"], batch["radar_valid"])
-    lidar = bottleneck_geometry(batch["clean_lidar"], batch["clean_lidar_valid"])
+    # The direct radar decoder never consumes LiDAR encoder sites or
+    # radar-to-LiDAR teacher neighbors. Keep those cache fields empty in its
+    # gate-specific cache; clean points still supply occupancy supervision.
+    lidar = (bottleneck_geometry(batch["clean_lidar"], batch["clean_lidar_valid"])
+             if gate_mask is None else None)
     candidate = candidate_geometry(radar)
     domain = CandidateDomain(candidate, torch.zeros(len(candidate)), GRID, {})
     targets = make_targets(domain, batch["clean_lidar"], batch["clean_lidar_valid"])
-    support = candidate_support(candidate, batch["radar"], batch["radar_valid"],
-                                config.radius_m)
+    support = (_gate_on_global_cells(candidate, gate_mask)
+               if gate_mask is not None else
+               candidate_support(candidate, batch["radar"],
+                                 batch["radar_valid"], config.radius_m))
     observed, _, _, _ = voxelize(batch["clean_lidar"], batch["clean_lidar_valid"], GRID)
-    observed = observed[candidate_support(observed, batch["radar"],
-                                          batch["radar_valid"], config.radius_m)]
-    neighbors = _cpu_neighbors(radar, lidar, config.radius_m, config.max_candidates)
-    clean_supported = supported_clean_points(
-        batch["clean_lidar"], batch["clean_lidar_valid"],
-        batch["radar"], batch["radar_valid"], config.radius_m)
+    observed = observed[(_gate_on_global_cells(observed, gate_mask)
+                         if gate_mask is not None else
+                         candidate_support(observed, batch["radar"],
+                                           batch["radar_valid"], config.radius_m))]
+    neighbors = (_cpu_neighbors(radar, lidar, config.radius_m,
+                               config.max_candidates)
+                 if lidar is not None else Neighborhood(
+                     torch.full((len(radar.coords), config.max_candidates),
+                                -1, dtype=torch.long),
+                     torch.full((len(radar.coords), config.max_candidates),
+                                float("inf"), dtype=torch.float32)))
+    clean_supported = (_clean_points_in_gate(batch, gate_mask)
+                       if gate_mask is not None else
+                       supported_clean_points(
+                           batch["clean_lidar"], batch["clean_lidar_valid"],
+                           batch["radar"], batch["radar_valid"], config.radius_m))
     return {
         "radar_coords": radar.coords.to(torch.int32),
-        "lidar_coords": lidar.coords.to(torch.int32),
+        "lidar_coords": (lidar.coords.to(torch.int32) if lidar is not None else
+                         torch.empty((0, 4), dtype=torch.int32)),
         "neighbor_indices": neighbors.indices.to(torch.int32),
         "neighbor_distances": neighbors.distances_m,
         "candidate_coords": candidate.to(torch.int32),
@@ -133,20 +185,25 @@ def build_entry_fast(batch: dict, config: MetaOccupancyConfig) -> dict:
     }
 
 
-def _build_collate(rows: list[dict], config: MetaOccupancyConfig):
+def _build_collate(rows: list[dict], config: MetaOccupancyConfig,
+                   gate_cache: RadarSupportCache | None = None):
     os.environ["STAGE2_KDTREE_WORKERS"] = "1"
     batch = collate_stage1(rows)
-    return batch["frame_id"][0], build_entry_fast(batch, config)
+    frame_id = batch["frame_id"][0]
+    mask = gate_cache.load(frame_id) if gate_cache is not None else None
+    return frame_id, build_entry_fast(batch, config, mask)
 
 
-def _verify_existing(dataset, cache, count: int, config: MetaOccupancyConfig):
+def _verify_existing(dataset, cache, count: int, config: MetaOccupancyConfig,
+                     gate_cache: RadarSupportCache | None = None):
     for index in tqdm(range(count), desc="Verify fast geometry", unit="frame"):
         frame_id = dataset.frames[index].frame_id
         if not cache.path(frame_id).is_file():
             raise FileNotFoundError(f"Existing reference cache frame missing: {frame_id}")
         old = cache[index]
         os.environ["STAGE2_KDTREE_WORKERS"] = "1"
-        fresh = build_entry_fast(collate_stage1([dataset[index]]), config)
+        mask = gate_cache.load(frame_id) if gate_cache is not None else None
+        fresh = build_entry_fast(collate_stage1([dataset[index]]), config, mask)
         for name, value in fresh.items():
             original = old[name]
             if isinstance(value, torch.Tensor):
@@ -163,11 +220,13 @@ def main():
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--radar-encoder", type=Path, required=True)
-    parser.add_argument("--lidar-encoder", type=Path, required=True)
+    parser.add_argument("--lidar-encoder", type=Path)
+    parser.add_argument("--gate-support-root", type=Path,
+                        help="Use cached >=12 radar voxels within 1.6 m in the Stage-II ROI")
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_meta_occupancy.json"))
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
-    parser.add_argument("--split", choices=("train", "val"), required=True)
+    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--verify-existing", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -175,18 +234,39 @@ def main():
     if (args.limit is not None and args.limit < 1 or args.verify_existing < 0
             or args.num_workers < 1):
         parser.error("Limit and worker count must be positive; verification count nonnegative")
+    if args.gate_support_root is None and args.lidar_encoder is None:
+        parser.error("An ungated geometry cache requires --lidar-encoder")
     config = MetaOccupancyConfig(**json.loads(args.config.read_text(encoding="utf-8")))
     dataset = paired_dataset(args.vod_root, args.split, args.radar_variant,
                              data_cache_root=args.data_cache_root)
     ids = [frame.frame_id for frame in dataset.frames]
+    gate_cache = None
+    gate_sha = None
+    if args.gate_support_root is not None:
+        gate_path = args.gate_support_root / args.split
+        gate_cache = RadarSupportCache(
+            gate_path,
+            gate_identity(args.split, ids, args.radar_variant,
+                          data_cache_root=args.data_cache_root,
+                          radius_m=1.6, min_radar_voxels=12))
+        if args.limit is None:
+            gate_cache.check_complete()
+        else:
+            missing_support = [frame_id for frame_id in ids[:args.limit]
+                               if not gate_cache.path(frame_id).is_file()]
+            if missing_support:
+                raise FileNotFoundError(f"Missing selected gate support: {missing_support[0]}")
+        gate_sha = _sha256(gate_path / "manifest.json")
     manifest = cache_manifest(
         split=args.split, frame_ids=ids, vod_root=args.vod_root,
         radar_variant=args.radar_variant, radar_encoder=args.radar_encoder,
         lidar_encoder=args.lidar_encoder, radius_m=config.radius_m,
-        max_candidates=config.max_candidates)
+        max_candidates=config.max_candidates,
+        gate_support_manifest_sha256=gate_sha)
     cache = MetaOccupancyCache(args.cache_root / args.split, manifest, create=True)
     if args.verify_existing:
-        _verify_existing(dataset, cache, min(args.verify_existing, len(dataset)), config)
+        _verify_existing(dataset, cache, min(args.verify_existing, len(dataset)),
+                         config, gate_cache)
     selected = ids[:args.limit] if args.limit is not None else ids
     missing = [index for index, frame_id in enumerate(selected)
                if not cache.path(frame_id).is_file()]
@@ -195,7 +275,8 @@ def main():
         return
     loader = DataLoader(Subset(dataset, missing), batch_size=1,
                         num_workers=args.num_workers,
-                        collate_fn=partial(_build_collate, config=config),
+                        collate_fn=partial(_build_collate, config=config,
+                                           gate_cache=gate_cache),
                         pin_memory=False, prefetch_factor=2)
     written = 0
     for count, (frame_id, entry) in enumerate(

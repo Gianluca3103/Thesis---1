@@ -64,7 +64,7 @@ def _load_checkpoint(path: Path, device: str):
     # not need to keep in memory once the model has been loaded.
     fields = ("epoch", "radar_variant", "radar_checkpoint", "radar_sha256",
               "lidar_sha256", "radius_m", "meta_config", "selected_threshold",
-              "threshold")
+              "threshold", "support_policy", "gate_support_manifest_sha256")
     metadata = {field: saved[field] for field in fields if field in saved}
     return model, metadata, model_type
 
@@ -97,6 +97,13 @@ def _check_manifest(path: Path, saved: dict, dataset, split: str,
         raise ValueError("Geometry cache LiDAR encoder differs from checkpoint")
     if "meta_config" in saved and manifest.get("max_candidates") != saved["meta_config"]["max_candidates"]:
         raise ValueError("Geometry cache neighborhood differs from checkpoint")
+    if model_type == "radar_autoencoder":
+        if manifest.get("support_policy") != saved.get("support_policy"):
+            raise ValueError("Radar-only geometry gate differs from checkpoint")
+        if (split in ("train", "val") and saved.get("support_policy") is not None
+                and manifest.get("gate_support_manifest_sha256") !=
+                saved["gate_support_manifest_sha256"][split]):
+            raise ValueError("Radar-only gate support manifest differs from training")
     return manifest
 
 
@@ -154,7 +161,7 @@ def main() -> None:
     parser.add_argument("--meta-cache-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--split", choices=("train", "val"), default="val")
+    parser.add_argument("--split", choices=("train", "val", "test"), default="val")
     parser.add_argument("--thresholds", nargs="+", type=float, default=DEFAULT_THRESHOLDS)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -174,9 +181,15 @@ def main() -> None:
     manifest = _check_manifest(cache_root / "manifest.json", saved, points,
                                args.split, args.vod_root, model_type)
     cache = MetaOccupancyCache(cache_root, manifest)
-    cache.check_complete()
     joined = MetaOccupancyDataset(points, cache)
     selected = Subset(joined, range(min(args.limit, len(joined)))) if args.limit else joined
+    if args.limit is None:
+        cache.check_complete()
+    else:
+        missing = [points.frames[index].frame_id for index in range(len(selected))
+                   if not cache.path(points.frames[index].frame_id).is_file()]
+        if missing:
+            raise FileNotFoundError(f"Geometry cache lacks a selected frame: {missing[0]}")
     loader = DataLoader(selected, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, collate_fn=collate_meta_cache,
                         pin_memory=args.device.startswith("cuda"))
@@ -192,6 +205,8 @@ def main() -> None:
         "split": args.split, "frames": len(selected),
         "radar_variant": saved["radar_variant"],
         "radius_m": manifest["radius_m"], "best_thresholds": best, "rows": rows,
+        "support_policy": manifest.get("support_policy"),
+        "gate_support_manifest_sha256": manifest.get("gate_support_manifest_sha256"),
     }
     args.output_root.mkdir(parents=True, exist_ok=True)
     csv_path = args.output_root / "threshold_sweep.csv"

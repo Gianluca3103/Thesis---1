@@ -100,22 +100,31 @@ def _source_hash() -> str:
 
 
 def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
-                   radar_variant: str, radar_encoder: Path, lidar_encoder: Path,
-                   radius_m: float, max_candidates: int) -> dict:
-    if split not in ("train", "val") or radius_m <= 0 or max_candidates < 1:
+                   radar_variant: str, radar_encoder: Path,
+                   lidar_encoder: Path | None, radius_m: float,
+                   max_candidates: int,
+                   gate_support_manifest_sha256: str | None = None) -> dict:
+    if split not in ("train", "val", "test") or radius_m <= 0 or max_candidates < 1:
         raise ValueError("Invalid geometry cache split or neighborhood")
-    return {
+    manifest = {
         "version": VERSION, "split": split, "frame_ids": frame_ids,
         "codec": "delta-voxel-ids+bitmask+lzma9",
         "vod_root": str(vod_root.resolve()), "radar_variant": radar_variant,
         "radar_initial_sha256": _sha256(radar_encoder),
-        "lidar_initial_sha256": _sha256(lidar_encoder),
+        "lidar_initial_sha256": (_sha256(lidar_encoder)
+                                         if lidar_encoder is not None else None),
         "radius_m": radius_m, "max_candidates": max_candidates,
         "source_hash": _source_hash(),
         "grid_minimum_xyz": list(GRID.minimum_xyz),
         "grid_size_xyz": list(GRID.size_xyz),
         "grid_shape_zyx": list(GRID.shape_zyx),
     }
+    if gate_support_manifest_sha256 is not None:
+        manifest.update({
+            "support_policy": "radar12vox_1p6m_stage2_roi_v1",
+            "gate_support_manifest_sha256": gate_support_manifest_sha256,
+        })
+    return manifest
 
 
 class MetaOccupancyCache:

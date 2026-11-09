@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from models.radar_lidar_crossmodal_v1.pipeline_data import paired_dataset
@@ -29,9 +29,13 @@ def main() -> None:
     parser.add_argument("--split", choices=("train", "val", "test", "both"), default="both")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--build-limit", type=int,
+                        help="Cache only the first N frames, retaining a full-split manifest for a smoke test")
     args = parser.parse_args()
     if (args.num_workers < 0 or args.min_distinct_radar_voxels < 1 or
-            args.limit is not None and args.limit < 1):
+            args.limit is not None and args.limit < 1 or
+            args.build_limit is not None and args.build_limit < 1 or
+            args.limit is not None and args.build_limit is not None):
         parser.error("Workers and optional limit must be nonnegative/positive")
     for split in (("train", "val") if args.split == "both" else (args.split,)):
         dataset = paired_dataset(args.vod_root, split, args.radar_variant,
@@ -45,7 +49,9 @@ def main() -> None:
                                            radius_m=args.radius_m,
                                            min_radar_voxels=args.min_distinct_radar_voxels),
                                   create=True)
-        loader = DataLoader(dataset, batch_size=1, shuffle=False,
+        selected = (Subset(dataset, range(min(args.build_limit, len(dataset))))
+                    if args.build_limit is not None else dataset)
+        loader = DataLoader(selected, batch_size=1, shuffle=False,
                             collate_fn=_one,
                             num_workers=args.num_workers)
         reused = written = supported = 0
@@ -60,9 +66,10 @@ def main() -> None:
                 cache.write(frame_id, mask)
                 written += 1
             supported += int(mask.sum())
-        cache.check_complete()
-        print(f"{split}: {len(ids)} frames, {written} written, {reused} reused, "
-              f"mean supported cells/frame={supported / max(len(ids), 1):,.0f}",
+        if args.build_limit is None:
+            cache.check_complete()
+        print(f"{split}: {len(selected)}/{len(ids)} frames, {written} written, {reused} reused, "
+              f"mean supported cells/frame={supported / max(len(selected), 1):,.0f}",
               flush=True)
 
 

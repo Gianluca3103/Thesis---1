@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--radar-encoder", type=Path, required=True)
     parser.add_argument("--data-cache-root", type=Path, required=True)
     parser.add_argument("--meta-cache-root", type=Path, required=True)
+    parser.add_argument("--gate-support-root", type=Path,
+                        help="Require cached >=12 radar voxels within 1.6 m")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_meta_occupancy.json"))
@@ -171,11 +173,26 @@ def main():
                     "source_hash": _source_hash()}
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"Existing {split} meta geometry cache differs: {manifest_path}")
+        if args.gate_support_root is not None:
+            support_manifest = args.gate_support_root / split / "manifest.json"
+            if (manifest.get("support_policy") != "radar12vox_1p6m_stage2_roi_v1"
+                    or manifest.get("gate_support_manifest_sha256") !=
+                    _sha256(support_manifest)):
+                raise ValueError(f"{split} cache is not bound to the 12-voxel gate")
+        elif manifest.get("support_policy") is not None:
+            raise ValueError("Gated geometry requires --gate-support-root")
         cache = MetaOccupancyCache(root, manifest)
-        cache.check_complete()
         joined = MetaOccupancyDataset(points, cache)
-        return (Subset(joined, range(min(limit, len(joined))))
-                if limit is not None else joined), _sha256(manifest_path)
+        selected = (Subset(joined, range(min(limit, len(joined))))
+                    if limit is not None else joined)
+        if limit is None:
+            cache.check_complete()
+        else:
+            missing = [points.frames[index].frame_id for index in range(len(selected))
+                       if not cache.path(points.frames[index].frame_id).is_file()]
+            if missing:
+                raise FileNotFoundError(f"{split} geometry lacks a selected frame: {missing[0]}")
+        return selected, _sha256(manifest_path)
     train, train_manifest = open_split("train", args.train_limit)
     val, val_manifest = open_split("val", args.val_limit)
     if not len(train) or not len(val):
@@ -203,11 +220,17 @@ def main():
                 "train_manifest_sha256": train_manifest,
                 "val_manifest_sha256": val_manifest,
                 "student_lr": args.student_lr, "batch_size": args.batch_size}
+    if args.gate_support_root is not None:
+        identity["support_policy"] = "radar12vox_1p6m_stage2_roi_v1"
+        identity["gate_support_manifest_sha256"] = {
+            split: _sha256(args.gate_support_root / split / "manifest.json")
+            for split in ("train", "val")}
     args.output_root.mkdir(parents=True, exist_ok=True)
     history = args.output_root / "metrics.jsonl"
     if history.exists() and args.resume is None:
         parser.error("Existing metrics require --resume or a new output root")
     start, best = 1, float("-inf")
+    best_val_bce = float("inf")
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if saved.get("version") != VERSION or any(saved.get(key) != value
@@ -216,6 +239,7 @@ def main():
         student.load_state_dict(saved["student"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_iou_full_support"])
+        best_val_bce = float(saved.get("best_val_bce", float("inf")))
     for epoch in range(start, args.epochs + 1):
         training = _epoch(student, loaders["train"], optimizer, config, args.device,
                           name=f"Radar AE train {epoch:03d}")
@@ -228,15 +252,21 @@ def main():
         improved = full and score is not None and score > best
         if improved:
             best = score
+        val_bce = validation["map_bce"]
+        bce_improved = full and val_bce is not None and val_bce < best_val_bce
+        if bce_improved:
+            best_val_bce = val_bce
         record = {"epoch": epoch, "train": training, "val": validation,
                   "validation_scope": "full" if full else "quick",
                   "scan_metrics": evaluate_scan,
                   "best_iou_full_support": best,
+                  "best_val_bce": best_val_bce,
                   "ablation": "radar_encoder_decoder_lidar_occupancy_supervision"}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         base = {"version": VERSION, **identity, "epoch": epoch,
                 "best_iou_full_support": best,
+                "best_val_bce": best_val_bce,
                 "student": student.state_dict(), "optimizer": optimizer.state_dict(),
                 "record": record}
         only = {key: value for key, value in base.items() if key != "optimizer"}
@@ -246,6 +276,9 @@ def main():
         if improved:
             _atomic_save(args.output_root / "best_iou.ckpt", base)
             _atomic_save(args.output_root / "best_student.ckpt", only)
+        if bce_improved:
+            _atomic_save(args.output_root / "best_bce.ckpt", base)
+            _atomic_save(args.output_root / "best_bce_student.ckpt", only)
         print(f"Epoch {epoch:03d}: train BCE={training['map_bce']} "
               f"val Known/Full IoU={validation['iou_known_supported']}/"
               f"{validation['iou_full_support']} scan={evaluate_scan}", flush=True)
