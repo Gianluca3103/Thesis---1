@@ -46,12 +46,13 @@ CHECKPOINT_METRIC=${CHECKPOINT_METRIC:-full_support}
 PHASE=${1:-all}
 
 cd "$REPO"
-mkdir -p "$OUT/tmp"
+RADAR_AE_TMPDIR=${RADAR_AE_TMPDIR:-$OUT/tmp}
+mkdir -p "$RADAR_AE_TMPDIR"
 export PYTHONPATH="/usr/lib/python3/dist-packages:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 export CROSSMODAL_GPU_NEIGHBORS=0
-export TMPDIR="$OUT/tmp"
+export TMPDIR="$RADAR_AE_TMPDIR"
 CONFIG=configs/radar_autoencoder_gate12_1p6m.json
 ENCODER="$OUT/radar_pretrain/best_encoder.pth"
 SUPPORT="$OUT/support12vox_1p6m"
