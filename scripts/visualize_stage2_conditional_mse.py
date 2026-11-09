@@ -39,7 +39,8 @@ def main() -> None:
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--split", choices=("val", "test"), default="test")
+    parser.add_argument("--split", choices=("train", "val", "test"),
+                        default="test")
     parser.add_argument("--per-fault", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--steps", type=int, default=64)
