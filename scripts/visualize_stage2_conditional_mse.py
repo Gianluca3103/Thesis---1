@@ -1,4 +1,4 @@
-"""Render balanced 3D examples from a deployable, MSE-only Stage II checkpoint.
+"""Render balanced 3D examples from a deployable conditional Stage II checkpoint.
 
 Prediction uses Gaussian noise, faulty LiDAR, and radar. Clean LiDAR is loaded
 only after prediction to color additions and report reconstruction metrics.
@@ -54,10 +54,15 @@ def main() -> None:
 
     model, identity, saved = load_model(
         args.lpcr_checkpoint, args.checkpoint, args.device)
-    if (identity.get("training_loss") != "epsilon_mse_only" or
+    training_loss = identity.get("training_loss")
+    if (training_loss not in ("epsilon_mse_only",
+                              "epsilon_mse_plus_generated_standard_bce") or
             identity.get("fault_region_policy") is None or
             identity.get("sampler", "gaussian_ddim") != "gaussian_ddim"):
-        parser.error("Expected a fault-gated, MSE-only Gaussian DDIM checkpoint")
+        parser.error("Expected a fault-gated conditional Gaussian DDIM checkpoint")
+    training_label = ("MSE-only" if training_loss == "epsilon_mse_only" else
+                      f"MSE + generated BCE (weight "
+                      f"{identity['decoder_bce_weight']:g})")
     full_loader, frame_ids, manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, args.split, identity, args.num_workers,
@@ -138,6 +143,8 @@ def main() -> None:
     (args.output_root / "summary.json").write_text(json.dumps({
         "checkpoint": str(args.checkpoint), "epoch": int(saved["epoch"]),
         "split": args.split, "threshold": args.threshold,
+        "training_loss": training_loss,
+        "decoder_bce_weight": identity.get("decoder_bce_weight"),
         "sampling_steps": args.steps, "oracle_clean_latent": False,
         "prediction_inputs": ["Gaussian_noise", "faulty_LiDAR", "radar"],
         "samples": summaries}, indent=2) + "\n", encoding="utf-8")
@@ -149,11 +156,11 @@ def main() -> None:
     first = html.escape(summaries[0]["html"], quote=True)
     (args.output_root / "index.html").write_text(
         "<!doctype html><html lang='en'><meta charset='utf-8'>"
-        "<title>MSE-only Stage II completion samples</title>"
+        f"<title>{html.escape(training_label)} Stage II completion samples</title>"
         "<style>body{margin:1rem;background:#101820;color:#edf4fa;"
         "font:16px system-ui}a{color:#88ceff}iframe{width:100%;"
         "height:85vh;border:1px solid #526474}</style>"
-        "<h1>MSE-only Stage II · faulty LiDAR + radar inference</h1>"
+        f"<h1>{html.escape(training_label)} Stage II · faulty LiDAR + radar inference</h1>"
         "<p>Each sample shows faulty, added, completed, and clean occupancy. "
         "Clean LiDAR is used only for display and metrics.</p>"
         f"<ul>{links}</ul><iframe name='viewer' src='{first}' "

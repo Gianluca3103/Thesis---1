@@ -5,13 +5,21 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from scripts import visualize_stage2_conditional_mse as viewer
 
 
-def test_balanced_mse_samples_use_only_faulty_inputs_for_prediction(
-        monkeypatch, tmp_path):
+@pytest.mark.parametrize("training_loss,bce_weight,label", [
+    ("epsilon_mse_only", None, "MSE-only"),
+    ("epsilon_mse_plus_generated_standard_bce", 0.1,
+     "MSE + generated BCE (weight 0.1)"),
+    ("epsilon_mse_plus_generated_standard_bce", 1.0,
+     "MSE + generated BCE (weight 1)"),
+])
+def test_balanced_samples_use_only_faulty_inputs_for_prediction(
+        monkeypatch, tmp_path, training_loss, bce_weight, label):
     faults = ("fog_sim_2", "partial_loss_30", "partial_loss_40",
               "partial_loss_50")
     rows = [{"frame_id": f"{index:05d}",
@@ -20,7 +28,8 @@ def test_balanced_mse_samples_use_only_faulty_inputs_for_prediction(
             for index in range(4)]
     ids = [row["frame_id"] for row in rows]
     manifest = {"frame_faults": dict(zip(ids, faults))}
-    identity = {"training_loss": "epsilon_mse_only",
+    identity = {"training_loss": training_loss,
+                "decoder_bce_weight": bce_weight,
                 "fault_region_policy": "synthetic_fault_gate",
                 "sampler": "gaussian_ddim", "batch_size": 2,
                 "seed": 3103}
@@ -76,6 +85,9 @@ def test_balanced_mse_samples_use_only_faulty_inputs_for_prediction(
     viewer.main()
     report = json.loads((tmp_path / "views" / "summary.json").read_text())
     assert report["oracle_clean_latent"] is False
+    assert report["training_loss"] == training_loss
+    assert report["decoder_bce_weight"] == bce_weight
+    assert label in (tmp_path / "views" / "index.html").read_text()
     assert len(report["samples"]) == 4
     assert {record["fault"] for record in state["records"]} == set(faults)
     assert all(record["overall"]["added_cells"] == 1
