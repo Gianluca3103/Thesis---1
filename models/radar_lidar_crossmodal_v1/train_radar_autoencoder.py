@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -26,12 +27,13 @@ from .radar_autoencoder import RadarOccupancyAutoencoder
 from .student import StudentConfig
 from .train_meta_occupancy import EpochMetrics
 from .radar_voxel_gate import SUPPORT_POLICY as FULL_RADAR_SUPPORT_POLICY
+from .radar_voxel_gate import filter_radar_valid
 
 
 VERSION = "radar_direct_occupancy_autoencoder_v1"
 
 
-def collate_radar_autoencoder(rows: list[dict]) -> dict:
+def collate_radar_autoencoder(rows: list[dict], *, radar_input_filter: bool = False) -> dict:
     """Read only radar input and cached LiDAR labels; omit teacher neighbors."""
     if not rows or any("geometry" not in row for row in rows):
         raise ValueError("Radar autoencoder requires cached geometry rows")
@@ -42,6 +44,8 @@ def collate_radar_autoencoder(rows: list[dict]) -> dict:
         count = len(row["radar"])
         radar[i, :count] = row["radar"]
         radar_valid[i, :count] = True
+    if radar_input_filter:
+        radar_valid = filter_radar_valid(radar, radar_valid)
 
     def coordinates(name):
         return torch.cat([
@@ -78,7 +82,8 @@ def _epoch(model, loader, optimizer, config, device, *, name, scan=False):
     with context():
         for raw in tqdm(loader, desc=name, unit="batch", dynamic_ncols=True):
             batch = _move(raw, device)
-            output = model(batch["radar"], batch["radar_valid"])
+            output = model(batch["radar"], batch["radar_valid"],
+                           radar_already_filtered=model.radar_input_filter)
             if not torch.equal(output.confidence_logits.coords,
                                batch["candidate_coords"]):
                 raise ValueError("Radar decoder sites differ from cached LiDAR labels")
@@ -130,7 +135,8 @@ def load_radar_autoencoder(path: Path, device: str = "cuda"):
     if saved.get("version") not in (VERSION, VERSION + "_student"):
         raise ValueError("Expected direct radar occupancy autoencoder checkpoint")
     model = RadarOccupancyAutoencoder(
-        config=StudentConfig(**saved["student_config"]))
+        config=StudentConfig(**saved["student_config"]),
+        radar_input_filter=saved.get("radar_input_filter", False))
     model.load_state_dict(saved["student"], strict=True)
     return model.to(device).eval(), saved
 
@@ -145,6 +151,8 @@ def main():
                         help="Require cached >=12 radar voxels within 1.6 m")
     parser.add_argument("--full-radar-gate", action="store_true",
                         help="Train only in the full encoder-grid >=12/1.6 m gate")
+    parser.add_argument("--radar-input-filter", action="store_true",
+                        help="Remove unsupported radar voxels before the encoder")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_meta_occupancy.json"))
@@ -166,6 +174,8 @@ def main():
     args = parser.parse_args()
     if args.full_radar_gate and args.gate_support_root is not None:
         parser.error("Full-grid and Stage-II ROI radar gates are exclusive")
+    if args.radar_input_filter and not args.full_radar_gate:
+        parser.error("Radar input filtering requires --full-radar-gate")
     if args.checkpoint_metric == "exact" and args.scan_metrics_every != 1:
         parser.error("Exact-IoU checkpoint selection needs scan metrics every epoch")
     if (args.device != "cuda" or not torch.cuda.is_available()
@@ -195,6 +205,8 @@ def main():
                     "source_hash": _source_hash()}
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"Existing {split} meta geometry cache differs: {manifest_path}")
+        if manifest.get("radar_input_filter", False) != args.radar_input_filter:
+            raise ValueError(f"{split} radar input filter differs from geometry cache")
         fixed_hash = manifest.get("fixed_frame_manifest_sha256")
         if ((args.full_radar_gate and fixed_hash is None) or
                 fixed_hash is not None and fixed_hash !=
@@ -230,16 +242,23 @@ def main():
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers,
-                            collate_fn=collate_radar_autoencoder, pin_memory=True),
+                            collate_fn=partial(collate_radar_autoencoder,
+                                               radar_input_filter=args.radar_input_filter),
+                            pin_memory=True),
         "val": DataLoader(val, batch_size=args.batch_size, shuffle=False,
                           num_workers=args.num_workers,
-                          collate_fn=collate_radar_autoencoder, pin_memory=True),
+                          collate_fn=partial(collate_radar_autoencoder,
+                                             radar_input_filter=args.radar_input_filter),
+                          pin_memory=True),
         "quick": DataLoader(Subset(val, range(min(args.quick_val_frames, len(val)))),
                             batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers,
-                            collate_fn=collate_radar_autoencoder, pin_memory=True),
+                            collate_fn=partial(collate_radar_autoencoder,
+                                               radar_input_filter=args.radar_input_filter),
+                            pin_memory=True),
     }
-    student = RadarOccupancyAutoencoder(str(args.radar_encoder)).to(args.device)
+    student = RadarOccupancyAutoencoder(
+        str(args.radar_encoder), radar_input_filter=args.radar_input_filter).to(args.device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.student_lr)
     identity = {"meta_config": asdict(config),
                 "student_config": asdict(student.config),
@@ -259,6 +278,8 @@ def main():
             for split in ("train", "val")}
     if args.full_radar_gate:
         identity["support_policy"] = FULL_RADAR_SUPPORT_POLICY
+    if args.radar_input_filter:
+        identity["radar_input_filter"] = True
     if args.checkpoint_metric == "exact":
         identity["checkpoint_metric"] = "exact"
     args.output_root.mkdir(parents=True, exist_ok=True)

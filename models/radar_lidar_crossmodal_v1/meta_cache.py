@@ -107,11 +107,14 @@ def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
                    max_candidates: int,
                    gate_support_manifest_sha256: str | None = None,
                    full_radar_gate: bool = False,
+                   radar_input_filter: bool = False,
                    fixed_frame_manifest_sha256: str | None = None) -> dict:
     if split not in ("train", "val", "test") or radius_m <= 0 or max_candidates < 1:
         raise ValueError("Invalid geometry cache split or neighborhood")
     if full_radar_gate and gate_support_manifest_sha256 is not None:
         raise ValueError("Full-grid radar gate and Stage-II ROI gate are exclusive")
+    if radar_input_filter and not full_radar_gate:
+        raise ValueError("The radar input filter requires the full-grid radar gate")
     manifest = {
         "version": VERSION, "split": split, "frame_ids": frame_ids,
         "codec": "delta-voxel-ids+bitmask+lzma9",
@@ -133,6 +136,8 @@ def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
     if full_radar_gate:
         from .radar_voxel_gate import SUPPORT_POLICY
         manifest["support_policy"] = SUPPORT_POLICY
+    if radar_input_filter:
+        manifest["radar_input_filter"] = True
     if fixed_frame_manifest_sha256 is not None:
         manifest["fixed_frame_manifest_sha256"] = fixed_frame_manifest_sha256
     return manifest

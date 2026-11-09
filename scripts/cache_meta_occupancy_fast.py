@@ -35,7 +35,8 @@ from models.radar_lidar_crossmodal_v1.meta_occupancy import (
 from models.radar_lidar_crossmodal_v1.pipeline_data import collate_stage1, paired_dataset
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as gate_identity)
-from models.radar_lidar_crossmodal_v1.radar_voxel_gate import DistinctRadarVoxelGate
+from models.radar_lidar_crossmodal_v1.radar_voxel_gate import (
+    DistinctRadarVoxelGate, filter_radar_valid)
 
 
 COARSE_SHAPE = GRID.scale_shape(8)
@@ -140,12 +141,17 @@ def _clean_points_in_gate(batch: dict, mask: np.ndarray) -> int:
 @torch.no_grad()
 def build_entry_fast(batch: dict, config: MetaOccupancyConfig,
                      gate_mask: np.ndarray | None = None,
-                     full_radar_gate: bool = False) -> dict:
+                     full_radar_gate: bool = False,
+                     radar_input_filter: bool = False) -> dict:
     if gate_mask is not None and full_radar_gate:
         raise ValueError("Choose one radar gate")
+    if radar_input_filter and not full_radar_gate:
+        raise ValueError("Radar input filtering requires the full-grid gate")
     global_gate = (DistinctRadarVoxelGate(batch["radar"], batch["radar_valid"])
                    if full_radar_gate else None)
-    radar = bottleneck_geometry(batch["radar"], batch["radar_valid"])
+    model_radar_valid = (filter_radar_valid(batch["radar"], batch["radar_valid"])
+                         if radar_input_filter else batch["radar_valid"])
+    radar = bottleneck_geometry(batch["radar"], model_radar_valid)
     # The direct radar decoder never consumes LiDAR encoder sites or
     # radar-to-LiDAR teacher neighbors. Keep those cache fields empty in its
     # gate-specific cache; clean points still supply occupancy supervision.
@@ -199,17 +205,20 @@ def build_entry_fast(batch: dict, config: MetaOccupancyConfig,
 
 def _build_collate(rows: list[dict], config: MetaOccupancyConfig,
                    gate_cache: RadarSupportCache | None = None,
-                   full_radar_gate: bool = False):
+                   full_radar_gate: bool = False,
+                   radar_input_filter: bool = False):
     os.environ["STAGE2_KDTREE_WORKERS"] = "1"
     batch = collate_stage1(rows)
     frame_id = batch["frame_id"][0]
     mask = gate_cache.load(frame_id) if gate_cache is not None else None
-    return frame_id, build_entry_fast(batch, config, mask, full_radar_gate)
+    return frame_id, build_entry_fast(batch, config, mask, full_radar_gate,
+                                      radar_input_filter)
 
 
 def _verify_existing(dataset, cache, count: int, config: MetaOccupancyConfig,
                      gate_cache: RadarSupportCache | None = None,
-                     full_radar_gate: bool = False):
+                     full_radar_gate: bool = False,
+                     radar_input_filter: bool = False):
     for index in tqdm(range(count), desc="Verify fast geometry", unit="frame"):
         frame_id = dataset.frames[index].frame_id
         if not cache.path(frame_id).is_file():
@@ -218,7 +227,7 @@ def _verify_existing(dataset, cache, count: int, config: MetaOccupancyConfig,
         os.environ["STAGE2_KDTREE_WORKERS"] = "1"
         mask = gate_cache.load(frame_id) if gate_cache is not None else None
         fresh = build_entry_fast(collate_stage1([dataset[index]]), config, mask,
-                                 full_radar_gate)
+                                 full_radar_gate, radar_input_filter)
         for name, value in fresh.items():
             original = old[name]
             if isinstance(value, torch.Tensor):
@@ -240,6 +249,8 @@ def main():
                         help="Use cached >=12 radar voxels within 1.6 m in the Stage-II ROI")
     parser.add_argument("--full-radar-gate", action="store_true",
                         help="Use >=12 distinct radar voxels within 1.6 m on the full encoder grid")
+    parser.add_argument("--radar-input-filter", action="store_true",
+                        help="Remove unsupported radar voxels before the encoder geometry")
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_meta_occupancy.json"))
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
@@ -253,6 +264,8 @@ def main():
         parser.error("Limit and worker count must be positive; verification count nonnegative")
     if args.gate_support_root is not None and args.full_radar_gate:
         parser.error("Stage-II ROI and full-grid gates are exclusive")
+    if args.radar_input_filter and not args.full_radar_gate:
+        parser.error("Radar input filtering requires --full-radar-gate")
     if not args.full_radar_gate and args.gate_support_root is None and args.lidar_encoder is None:
         parser.error("An ungated geometry cache requires --lidar-encoder")
     config = MetaOccupancyConfig(**json.loads(args.config.read_text(encoding="utf-8")))
@@ -285,12 +298,14 @@ def main():
         max_candidates=config.max_candidates,
         gate_support_manifest_sha256=gate_sha,
         full_radar_gate=args.full_radar_gate,
+        radar_input_filter=args.radar_input_filter,
         fixed_frame_manifest_sha256=_sha256(
             args.data_cache_root / args.split / "manifest.json"))
     cache = MetaOccupancyCache(args.cache_root / args.split, manifest, create=True)
     if args.verify_existing:
         _verify_existing(dataset, cache, min(args.verify_existing, len(dataset)),
-                         config, gate_cache, args.full_radar_gate)
+                         config, gate_cache, args.full_radar_gate,
+                         args.radar_input_filter)
     selected = ids[:args.limit] if args.limit is not None else ids
     missing = [index for index, frame_id in enumerate(selected)
                if not cache.path(frame_id).is_file()]
@@ -301,7 +316,8 @@ def main():
                         num_workers=args.num_workers,
                         collate_fn=partial(_build_collate, config=config,
                                            gate_cache=gate_cache,
-                                           full_radar_gate=args.full_radar_gate),
+                                           full_radar_gate=args.full_radar_gate,
+                                           radar_input_filter=args.radar_input_filter),
                         pin_memory=False, prefetch_factor=2)
     written = 0
     for count, (frame_id, entry) in enumerate(

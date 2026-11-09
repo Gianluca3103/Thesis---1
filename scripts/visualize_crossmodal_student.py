@@ -37,6 +37,7 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 )
 from models.radar_lidar_crossmodal_v1.radar_voxel_gate import (
     DistinctRadarVoxelGate, SUPPORT_POLICY as FULL_RADAR_SUPPORT_POLICY,
+    filter_radar_valid,
 )
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 from scripts.cache_meta_occupancy_fast import _gate_on_global_cells
@@ -64,12 +65,13 @@ def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None
 def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
                 *, checkpoint_uses_fov: bool,
+                radar_name: str = "Radar",
                 support_radius_m: float | None = None,
                 support_basis: str = "radar point",
                 clean_reference_name: str = "Clean LiDAR in forward radar sector",
                 clean_reference_note: str | None = None) -> None:
     clouds = [
-        {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
+        {"name": radar_name, "xyz": np.round(radar, 3).tolist()},
         {"name": clean_reference_name, "xyz": np.round(lidar, 3).tolist()},
         {"name": "Raw student confidence", "xyz": np.round(centers, 3).tolist(),
          "score": np.round(confidence, 4).tolist()},
@@ -249,7 +251,12 @@ def main() -> None:
         origin = np.asarray(grid["origin_xyz_m"], dtype=np.float32)
         size = np.asarray(grid["voxel_xyz_m"], dtype=np.float32)
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
-        radar = row["radar"][:, :3].numpy()
+        input_filtered = auto and saved.get("radar_input_filter", False)
+        if input_filtered:
+            keep = filter_radar_valid(batch["radar"], batch["radar_valid"])[0]
+            radar = row["radar"][keep[:len(row["radar"])], :3].numpy()
+        else:
+            radar = row["radar"][:, :3].numpy()
         if gated_auto:
             clean_coords, _, _, _ = voxelize(batch["clean_lidar"],
                                              batch["clean_lidar_valid"], GRID)
@@ -269,6 +276,8 @@ def main() -> None:
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
                     centers, confidence,
                     checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
+                    radar_name=("Radar after ≥12-voxel filter" if input_filtered
+                                else "Radar"),
                     support_radius_m=saved["radius_m"] if supported_only else None,
                     support_basis=("cluster of at least 12 distinct radar voxels"
                                    if gated_auto else "radar voxel" if fine else "radar point"),

@@ -64,7 +64,8 @@ def _load_checkpoint(path: Path, device: str):
     # not need to keep in memory once the model has been loaded.
     fields = ("epoch", "radar_variant", "radar_checkpoint", "radar_sha256",
               "lidar_sha256", "radius_m", "meta_config", "selected_threshold",
-              "threshold", "support_policy", "gate_support_manifest_sha256")
+              "threshold", "support_policy", "gate_support_manifest_sha256",
+              "radar_input_filter")
     metadata = {field: saved[field] for field in fields if field in saved}
     return model, metadata, model_type
 
@@ -100,6 +101,8 @@ def _check_manifest(path: Path, saved: dict, dataset, split: str,
     if model_type == "radar_autoencoder":
         if manifest.get("support_policy") != saved.get("support_policy"):
             raise ValueError("Radar-only geometry gate differs from checkpoint")
+        if manifest.get("radar_input_filter", False) != saved.get("radar_input_filter", False):
+            raise ValueError("Radar-only input filter differs from geometry cache")
         if (split in ("train", "val") and
                 "gate_support_manifest_sha256" in saved
                 and manifest.get("gate_support_manifest_sha256") !=

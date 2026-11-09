@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ from .history import log_record, open_writer, overfitting_warning
 from .plots import update_plots
 from .pipeline_data import collate_stage1, paired_dataset
 from .pretrain_loss import observed_child_distribution, observed_distribution_loss
+from .radar_voxel_gate import filter_radar_valid
 from .train_teacher import _move
 
 
@@ -47,6 +49,14 @@ def _write_progress(path, **values):
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(values), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _collate_pretrain(rows, *, radar_input_filter=False):
+    batch = collate_stage1(rows)
+    if radar_input_filter:
+        batch["radar_valid"] = filter_radar_valid(batch["radar"],
+                                                    batch["radar_valid"])
+    return batch
 
 
 def _epoch(model, loader, modality, device, mask_rate, salt, optimizer=None, epoch=0,
@@ -94,6 +104,8 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--data-cache-root", type=Path)
+    parser.add_argument("--radar-input-filter", action="store_true",
+                        help="Keep only radar voxels with >=12 neighbors within 1.6 m")
     parser.add_argument("--online-augmentation-config", type=Path,
                         default=Path("configs/stage1_online_geometric_augmentation.json"))
     parser.add_argument("--augmentation-seed", type=int, default=0)
@@ -117,6 +129,8 @@ def main():
         args.progress_file.parent.mkdir(parents=True, exist_ok=True)
     if args.device != "cuda" or not torch.cuda.is_available():
         parser.error("Full Stage-I sparse encoder training needs CUDA")
+    if args.radar_input_filter and args.modality != "radar":
+        parser.error("The radar input filter applies only to radar pretraining")
     if not 0 < args.mask_rate < 1:
         parser.error("Mask rate must lie strictly between zero and one")
     augmentation = GeometricAugmentationConfig.from_dict(
@@ -129,14 +143,15 @@ def main():
     val = paired_dataset(args.vod_root, "val", args.radar_variant,
                          limit=args.val_limit, data_cache_root=args.data_cache_root,
                          include_clean=args.modality == "lidar")
+    collate = partial(_collate_pretrain, radar_input_filter=args.radar_input_filter)
     loaders = {
         "train": DataLoader(train, batch_size=args.batch_size, shuffle=True,
-                            num_workers=args.num_workers, collate_fn=collate_stage1, pin_memory=True),
+                            num_workers=args.num_workers, collate_fn=collate, pin_memory=True),
         "quick": DataLoader(Subset(val, list(range(min(args.quick_val_frames, len(val))))),
                             batch_size=args.batch_size, num_workers=args.num_workers,
-                            collate_fn=collate_stage1, pin_memory=True),
+                            collate_fn=collate, pin_memory=True),
         "full": DataLoader(val, batch_size=args.batch_size, num_workers=args.num_workers,
-                           collate_fn=collate_stage1, pin_memory=True),
+                           collate_fn=collate, pin_memory=True),
     }
     args.output_root.mkdir(parents=True, exist_ok=True)
     if (args.output_root / "metrics.jsonl").exists() and not args.resume:
@@ -153,6 +168,7 @@ def main():
                 or saved.get("modality") != args.modality
                 or saved.get("mask_rate") != args.mask_rate
                 or saved.get("augmentation") != augmentation.to_dict()
+                or saved.get("radar_input_filter", False) != args.radar_input_filter
                 or (args.modality == "lidar" and saved.get("lidar_fov") != RADAR_FOV_SPEC)):
             raise ValueError("Encoder pretraining resume configuration differs")
         model.load_state_dict(saved["model"])
@@ -191,6 +207,7 @@ def main():
         checkpoint = {"version": "previous_stage1_native_sparse_geometry_pretrain_v1",
                       "modality": args.modality, "mask_rate": args.mask_rate,
                       "augmentation": augmentation.to_dict(),
+                      "radar_input_filter": args.radar_input_filter,
                       "lidar_fov": RADAR_FOV_SPEC if args.modality == "lidar" else None,
                       "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                       "scheduler": scheduler.state_dict(), "epoch": epoch,

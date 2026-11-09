@@ -6,11 +6,27 @@ REPO=${REPO:-/mnt/c/Users/gianl/Desktop/Thesis/radar-lidar-crossmodal}
 VOD=${VOD:-/mnt/c/Users/gianl/Desktop/Thesis/View-Of-Delft dataset/view_of_delft_PUBLIC}
 PRETRAIN_DATA=${PRETRAIN_DATA:-/home/gianl/stage2_conditional_local_from_scratch_20261108/fixed_frames}
 GATE_SCOPE=${GATE_SCOPE:-full_grid}
+RADAR_INPUT_FILTER=${RADAR_INPUT_FILTER:-0}
 if [[ "$GATE_SCOPE" != full_grid && "$GATE_SCOPE" != stage2_roi ]]; then
   echo "GATE_SCOPE must be full_grid or stage2_roi" >&2
   exit 2
 fi
-OUT=${OUT:-/home/gianl/radar_encoder_decoder_${GATE_SCOPE}_gate12_20261109}
+if [[ "$RADAR_INPUT_FILTER" != 0 && "$RADAR_INPUT_FILTER" != 1 ]]; then
+  echo "RADAR_INPUT_FILTER must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$RADAR_INPUT_FILTER" == 1 && "$GATE_SCOPE" != full_grid ]]; then
+  echo "Radar input filtering requires GATE_SCOPE=full_grid" >&2
+  exit 2
+fi
+if [[ "$RADAR_INPUT_FILTER" == 1 ]]; then
+  DEFAULT_OUT=/home/gianl/radar_encoder_decoder_full_grid_prefilter_gate12_20261109
+  radar_filter_args=(--radar-input-filter)
+else
+  DEFAULT_OUT=/home/gianl/radar_encoder_decoder_${GATE_SCOPE}_gate12_20261109
+  radar_filter_args=()
+fi
+OUT=${OUT:-$DEFAULT_OUT}
 if [[ "$GATE_SCOPE" == full_grid ]]; then
   DATA=${DATA:-$OUT/full_clean_fixed_frames}
 else
@@ -51,6 +67,7 @@ pretrain() {
     --vod-root "$VOD" --data-cache-root "$PRETRAIN_DATA" \
     --radar-variant "$VARIANT" --modality radar \
     --online-augmentation-config configs/crossmodal_no_geometric_augmentation.json \
+    "${radar_filter_args[@]}" \
     --output-root "$OUT/radar_pretrain" --epochs "$PRETRAIN_EPOCHS" \
     --batch-size "$PRETRAIN_BATCH" --num-workers "$WORKERS" \
     --no-tensorboard "${resume[@]}"
@@ -82,7 +99,7 @@ cache() {
     "$PY" -u -m scripts.cache_meta_occupancy_fast \
       --vod-root "$VOD" --data-cache-root "$DATA" \
       --cache-root "$GEOMETRY" --radar-encoder "$ENCODER" \
-      "${gate_args[@]}" --config "$CONFIG" \
+      "${gate_args[@]}" "${radar_filter_args[@]}" --config "$CONFIG" \
       --radar-variant "$VARIANT" --split "$split" \
       --num-workers "$CACHE_WORKERS"
   done
@@ -102,7 +119,7 @@ train() {
   "$PY" -u -m models.radar_lidar_crossmodal_v1.train_radar_autoencoder \
     --vod-root "$VOD" --data-cache-root "$DATA" \
     --radar-encoder "$ENCODER" --meta-cache-root "$GEOMETRY" \
-    "${gate_args[@]}" --output-root "$MODEL" \
+    "${gate_args[@]}" "${radar_filter_args[@]}" --output-root "$MODEL" \
     --config "$CONFIG" --radar-variant "$VARIANT" \
     --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH" \
     --num-workers "$WORKERS" --full-val-every "$FULL_VAL_EVERY" \

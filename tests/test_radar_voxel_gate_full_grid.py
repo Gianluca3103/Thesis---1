@@ -5,7 +5,8 @@ import torch
 from models.radar_lidar_stage2.candidate_domain import voxel_centers_xyz
 from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.radar_pruner import radar_support_mask
-from models.radar_lidar_crossmodal_v1.radar_voxel_gate import DistinctRadarVoxelGate
+from models.radar_lidar_crossmodal_v1.radar_voxel_gate import (
+    DistinctRadarVoxelGate, filter_radar_valid)
 from scripts.cache_meta_occupancy_fast import _gate_on_global_cells
 
 
@@ -69,3 +70,31 @@ def test_full_grid_gate_agrees_with_existing_stage2_rule_inside_roi():
     stage2_mask = radar_support_mask(radar[0], 1.6, 12)
     assert torch.equal(gate.contains_cells(coords),
                        _gate_on_global_cells(coords, stage2_mask))
+
+
+def test_input_filter_keeps_all_returns_in_supported_voxels_only():
+    _, radar = _radar_points()
+    duplicate = radar[:, :1].clone()
+    isolated = radar[:, :1].clone()
+    isolated[..., 0] += 4.0
+    outside_grid = radar[:, :1].clone()
+    outside_grid[..., 2] = GRID.maximum_xyz[2] + 0.125
+    points = torch.cat((radar, duplicate, isolated, outside_grid), dim=1)
+    valid = torch.ones(points.shape[:2], dtype=torch.bool)
+    kept = filter_radar_valid(points, valid)
+    assert kept.tolist() == [[True] * 13 + [False, False]]
+
+
+def test_input_filter_uses_the_existing_full_grid_gate_definition():
+    generator = torch.Generator().manual_seed(3103)
+    radar = torch.zeros((1, 128, 7))
+    radar[0, :, :3] = (torch.rand((128, 3), generator=generator) - 0.5) * 4
+    valid = torch.ones((1, 128), dtype=torch.bool)
+    gate = DistinctRadarVoxelGate(radar, valid)
+    minimum = radar.new_tensor(GRID.minimum_xyz)
+    size = radar.new_tensor(GRID.size_xyz)
+    xyz_indices = torch.floor((radar[0, :, :3] - minimum) / size).long()
+    coordinates = torch.cat((torch.zeros((128, 1), dtype=torch.long),
+                             xyz_indices[:, [2, 1, 0]]), dim=1)
+    assert torch.equal(filter_radar_valid(radar, valid)[0],
+                       gate.contains_cells(coordinates))

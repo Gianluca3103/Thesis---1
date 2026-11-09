@@ -78,3 +78,37 @@ class DistinctRadarVoxelGate:
                                   xyz.new_tensor(GRID.size_xyz)).long()
         coords = torch.cat((batch_index[:, None], indices_xyz[:, [2, 1, 0]]), dim=1)
         return int(self.contains_cells(coords).sum())
+
+
+def filter_radar_valid(radar: torch.Tensor,
+                       radar_valid: torch.Tensor) -> torch.Tensor:
+    """Keep returns only from radar voxels supported by the original frame.
+
+    All returns in a qualifying voxel survive. The gate is evaluated once
+    against the unfiltered returns, so filtering does not recursively shrink
+    clusters at their boundaries.
+    """
+    if radar.ndim != 3 or radar.shape[-1] != 7 or radar_valid.shape != radar.shape[:2]:
+        raise ValueError("Expected batched seven-column radar points and validity")
+    xyz = radar.detach().cpu().numpy()[..., :3]
+    valid = radar_valid.detach().cpu().numpy()
+    minimum = np.asarray(GRID.minimum_xyz, dtype=np.float64)
+    maximum = np.asarray(GRID.maximum_xyz, dtype=np.float64)
+    size = np.asarray(GRID.size_xyz, dtype=np.float64)
+    result = np.zeros(valid.shape, dtype=np.bool_)
+    for batch in range(len(xyz)):
+        inside = valid[batch] & ((xyz[batch] >= minimum) &
+                                 (xyz[batch] < maximum)).all(axis=1)
+        point_ids = np.flatnonzero(inside)
+        if len(point_ids) < MIN_RADAR_VOXELS:
+            continue
+        indices = np.floor((xyz[batch, point_ids] - minimum) / size).astype(np.int32)
+        voxel_indices, inverse = np.unique(indices, axis=0, return_inverse=True)
+        if len(voxel_indices) < MIN_RADAR_VOXELS:
+            continue
+        centers = minimum + (voxel_indices.astype(np.float64) + 0.5) * size
+        distance, _ = cKDTree(centers).query(
+            centers, k=MIN_RADAR_VOXELS,
+            distance_upper_bound=RADIUS_M + 1e-9, workers=1)
+        result[batch, point_ids] = (distance[:, -1] <= RADIUS_M + 1e-9)[inverse]
+    return torch.from_numpy(result).to(radar.device)

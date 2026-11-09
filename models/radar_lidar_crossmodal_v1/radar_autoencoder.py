@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from .previous_encoder import PreviousStage1Sparse
+from .radar_voxel_gate import filter_radar_valid
 from .student import RawSparseConfidenceDecoder, StudentConfig, StudentOutput
 
 
@@ -18,14 +19,19 @@ class RadarOccupancyAutoencoder(nn.Module):
     """Trainable pretrained radar backbone directly decoded to occupancy."""
 
     def __init__(self, radar_checkpoint: str | None = None,
-                 config: StudentConfig | None = None):
+                 config: StudentConfig | None = None,
+                 *, radar_input_filter: bool = False):
         super().__init__()
         self.config = config or StudentConfig(positive_weight=1, dice_weight=0,
                                              lambda_teacher_evidence=0)
         self.radar_encoder = PreviousStage1Sparse(radar_checkpoint, modality="radar")
         self.confidence_decoder = RawSparseConfidenceDecoder(self.config)
+        self.radar_input_filter = radar_input_filter
 
     def forward(self, radar_points: torch.Tensor,
-                radar_valid: torch.Tensor) -> StudentOutput:
+                radar_valid: torch.Tensor,
+                *, radar_already_filtered: bool = False) -> StudentOutput:
+        if self.radar_input_filter and not radar_already_filtered:
+            radar_valid = filter_radar_valid(radar_points, radar_valid)
         encoded = self.radar_encoder(radar_points, radar_valid)
         return StudentOutput(encoded, self.confidence_decoder(encoded))
