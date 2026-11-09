@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import time
 
 import torch
 from tqdm import tqdm
@@ -225,12 +227,26 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
     errors = {"positive_error_sum": 0.0, "negative_error_sum": 0.0,
               "positive_count": 0, "negative_count": 0}
     bce_total = bce_frames = bce_positive = bce_negative = 0
-    for rows in tqdm(loader, desc="Conditional fixed-0.5 validation",
-                     unit="batch"):
+    trace = os.environ.get("STAGE2_VALIDATION_TRACE") == "1"
+    for batch_number, rows in enumerate(tqdm(
+            loader, desc="Conditional fixed-0.5 validation", unit="batch"), 1):
+        batch_start = time.monotonic()
+
+        def mark(phase: str, frame_id: str = "-") -> None:
+            if trace:
+                print(f"Validation trace batch={batch_number} "
+                      f"frame={frame_id} phase={phase} "
+                      f"elapsed_s={time.monotonic() - batch_start:.1f}",
+                      flush=True)
+
+        mark("loaded")
         output = predict_batch(model, rows, alpha_bars, device=device,
                                seed=seed, steps=steps)
+        mark("predicted")
         batch_bce_sum = batch_bce_sites = 0
         for frame, row in enumerate(rows):
+            frame_id = row["frame_id"]
+            mark("frame_start", frame_id)
             candidates, logits = _frame_candidates(
                 output["fine"], output["logits"], frame,
                 row["faulty_xyz"], device)
@@ -238,8 +254,10 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
             totals["added"] += len(additions)
             totals["candidate_cells"] += len(candidates)
             clean_xyz = reference_clean(raw_root, "val", row["frame_id"])
+            mark("reference_loaded", frame_id)
             clean, faulty, completed = full_frame_voxels(
                 clean_xyz, row["faulty_xyz"], additions)
+            mark("frame_voxelized", frame_id)
             # Candidates exclude observed faulty cells. Their baseline
             # prediction is therefore empty, including on full-scan fog frames.
             candidate_cpu = candidates.cpu()
@@ -248,14 +266,17 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
                 encode_keys(clean, GRID.shape_zyx))]
             addition_matches = tolerant_occupancy_counts(
                 additions, eligible_missing, tolerance_m=0.2)
+            mark("addition_matched", frame_id)
             for key, value in addition_matches.items():
                 missing_additions[key] += value
             current = counts(completed, clean)
             baseline = counts(faulty, clean)
             tolerant = tolerant_occupancy_counts(
                 completed, clean, tolerance_m=0.2)
+            mark("completed_matched", frame_id)
             baseline_tolerant = tolerant_occupancy_counts(
                 faulty, clean, tolerance_m=0.2)
+            mark("baseline_matched", frame_id)
             if (tolerant["predicted"] != current["predicted"] or
                     tolerant["eligible_target"] != current["target"] or
                     tolerant["exact_tp"] != current["tp"] or
@@ -273,6 +294,7 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
                     gated_faulty, gated_clean, tolerance_m=0.2),
                 "completed": tolerant_occupancy_counts(
                     gated_completed, gated_clean, tolerance_m=0.2)}
+            mark("gate_matched", frame_id)
             for phase, matches in gated_metrics.items():
                 for key, value in matches.items():
                     fault_area[phase][key] += value
@@ -302,9 +324,11 @@ def fixed_threshold_validation(model, loader, raw_root: Path, alpha_bars,
                     value = parts[key]
                     errors[key] += (float(value) if isinstance(value, torch.Tensor)
                                     else value)
+            mark("frame_done", frame_id)
         if generated_bce:
             bce_total += (batch_bce_sum / max(batch_bce_sites, 1)) * len(rows)
             bce_frames += len(rows)
+        mark("batch_done")
     union = totals["predicted"] + totals["target"] - totals["tp"]
     tolerant_union = (totals["predicted"] + totals["target"] -
                       totals["tolerant_tp_0p2m"])
