@@ -11,3 +11,5 @@ The script builds separate geometry caches and checkpoints, validates exact IoU 
 The professor launcher sets `RADAR_AE_TMPDIR` to a short path on the data drive before its cache compatibility check. It passes that path to Python multiprocessing sockets, avoiding a full `/tmp` and the Unix socket path-length limit. Training output remains under `OUT`. Override `RADAR_AE_TMPDIR` with another short, writable directory if needed.
 
 Radar pretraining on the professor environment disables optional matplotlib plots because the installed matplotlib/Pillow combination cannot import `_imaging`. Metrics and checkpoints still save every epoch. If a prior run wrote a metrics row but crashed before its first checkpoint, the launcher archives that incomplete metrics file and starts epoch 1 again.
+
+The professor launcher also adds the existing `stage2-openblas-runtime/lib` directory to `LD_LIBRARY_PATH` before constructing the MinkowskiEngine occupancy decoder.

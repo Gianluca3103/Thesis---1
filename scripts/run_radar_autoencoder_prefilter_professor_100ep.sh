@@ -17,6 +17,12 @@ export TMPDIR="$RADAR_AE_TMPDIR"
 
 test -x "$PY" || { echo "Missing Python: $PY" >&2; exit 1; }
 test -d "$VOD" || { echo "Missing VoD data: $VOD" >&2; exit 1; }
+OPENBLAS_LIB="$BASE/stage2-openblas-runtime/lib"
+test -e "$OPENBLAS_LIB/libopenblas.so.0" || {
+  echo "Missing MinkowskiEngine OpenBLAS runtime: $OPENBLAS_LIB/libopenblas.so.0" >&2
+  exit 1
+}
+export LD_LIBRARY_PATH="$OPENBLAS_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cd "$REPO"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
