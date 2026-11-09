@@ -109,6 +109,7 @@ print(name, report["best_thresholds"]["iou_exact"])
     checkpoint="$MODEL/best_student.ckpt"
   fi
   echo "Validation-selected checkpoint: $name; exact-IoU threshold: $threshold"
+  ln -sfn "$checkpoint" "$OUT/evaluation/selected_student.ckpt"
   "$PY" -u -m scripts.sweep_meta_occupancy_thresholds \
     --vod-root "$VOD" --data-cache-root "$DATA" \
     --meta-cache-root "$GEOMETRY" --checkpoint "$checkpoint" \

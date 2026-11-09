@@ -16,6 +16,8 @@ import numpy as np
 import torch
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
+from models.radar_lidar_stage1.sparse import voxelize
+from models.radar_lidar_stage2.candidate_domain import voxel_centers_xyz
 from models.radar_lidar_stage1.radar_fov import (
     RADAR_FOV_SPEC, RADAR_HALF_FOV_DEG, RADAR_MAX_RANGE_M,
 )
@@ -28,7 +30,13 @@ from models.radar_lidar_crossmodal_v1.train_meta_occupancy import (
 from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import (
     VERSION as RADAR_AUTO_VERSION, load_radar_autoencoder,
 )
+from models.radar_lidar_crossmodal_v1.meta_cache import _sha256
+from models.radar_lidar_crossmodal_v1.encoder import GRID
+from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
+    RadarSupportCache, identity as gate_identity,
+)
 from models.radar_lidar_crossmodal_v1.train_student import load_student
+from scripts.cache_meta_occupancy_fast import _gate_on_global_cells
 
 
 def _write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None) -> None:
@@ -54,10 +62,12 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                 lidar: np.ndarray, centers: np.ndarray, confidence: np.ndarray,
                 *, checkpoint_uses_fov: bool,
                 support_radius_m: float | None = None,
-                support_basis: str = "radar point") -> None:
+                support_basis: str = "radar point",
+                clean_reference_name: str = "Clean LiDAR in forward radar sector",
+                clean_reference_note: str | None = None) -> None:
     clouds = [
         {"name": "Radar", "xyz": np.round(radar, 3).tolist()},
-        {"name": "Clean LiDAR in forward radar sector", "xyz": np.round(lidar, 3).tolist()},
+        {"name": clean_reference_name, "xyz": np.round(lidar, 3).tolist()},
         {"name": "Raw student confidence", "xyz": np.round(centers, 3).tolist(),
          "score": np.round(confidence, 4).tolist()},
     ]
@@ -70,6 +80,7 @@ def _write_html(path: Path, frame_id: str, epoch: int, radar: np.ndarray,
                          "checkpoint_uses_fov": checkpoint_uses_fov,
                          "support_radius_m": support_radius_m,
                          "support_basis": support_basis,
+                         "clean_reference_note": clean_reference_note,
                          "minimum": minimum, "maximum": maximum},
                         separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
@@ -100,7 +111,7 @@ h2{font-size:14px;margin:0 0 5px}canvas{width:100%;height:70vh;min-height:420px;
 const data=JSON.parse(document.getElementById('data').textContent), panes=document.getElementById('panels');
 document.getElementById('title').textContent=`Frame ${data.frame} · student epoch ${data.epoch}`;
 document.getElementById('map-note').textContent=`Raw radar-only confidence at fine voxel centers${data.support_radius_m===null?'':` within ${data.support_radius_m.toFixed(1)} m of a ${data.support_basis}`}. No interpolation or point limit. Clean LiDAR is shown only for comparison; it is not an inference input.`;
-document.getElementById('range-note').textContent=`Clean LiDAR reference: ${data.clouds[1].xyz.length.toLocaleString()} points in the calibrated forward sector (±${data.radar_half_fov_deg.toFixed(0)}° azimuth, up to ${data.radar_max_range_m.toFixed(0)} m). This is a fixed crop, not measured free space or per-frame radar visibility.${data.checkpoint_uses_fov?'':' This checkpoint predates the training crop; the green reference is cropped for display only.'}`;
+document.getElementById('range-note').textContent=data.clean_reference_note||`Clean LiDAR reference: ${data.clouds[1].xyz.length.toLocaleString()} points in the calibrated forward sector (±${data.radar_half_fov_deg.toFixed(0)}° azimuth, up to ${data.radar_max_range_m.toFixed(0)} m). This is a fixed crop, not measured free space or per-frame radar visibility.${data.checkpoint_uses_fov?'':' This checkpoint predates the training crop; the green reference is cropped for display only.'}`;
 const canvases=[], headings=[];
 for(const cloud of data.clouds){const section=document.createElement('section'),h=document.createElement('h2'),canvas=document.createElement('canvas');
   h.textContent=`${cloud.name}: ${cloud.xyz.length.toLocaleString()} points`;section.append(h,canvas);panes.append(section);canvases.push(canvas);headings.push(h);}
@@ -145,6 +156,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--data-cache-root", type=Path,
+                        help="Fixed frames used for a gated radar-autoencoder checkpoint")
+    parser.add_argument("--gate-support-root", type=Path,
+                        help="Exact >=12 distinct radar voxel / 1.6 m support cache")
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
     parser.add_argument("--frame-id", nargs="+")
     parser.add_argument("--limit", type=int, default=5,
@@ -167,26 +182,53 @@ def main() -> None:
     loader = (load_meta_student if meta else load_radar_autoencoder if auto
               else load_fine_association if fine else load_student)
     student, saved = loader(args.checkpoint, args.device)
+    gated_auto = auto and saved.get("support_policy") == "radar12vox_1p6m_stage2_roi_v1"
+    if gated_auto and (args.data_cache_root is None or args.gate_support_root is None):
+        parser.error("Gated radar autoencoder needs --data-cache-root and --gate-support-root")
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
-                               frame_ids=args.frame_id, include_clean=True,
+                               include_clean=True,
                                lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
                                lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
-    if args.frame_id is None:
+    full_ids = [frame.frame_id for frame in dataset.frames]
+    gate_cache = None
+    if gated_auto:
+        root = args.gate_support_root / args.split
+        gate_cache = RadarSupportCache(
+            root, gate_identity(args.split, full_ids, saved["radar_variant"],
+                                data_cache_root=args.data_cache_root,
+                                radius_m=1.6, min_radar_voxels=12))
+        bound = saved.get("gate_support_manifest_sha256", {})
+        if args.split in bound and _sha256(root / "manifest.json") != bound[args.split]:
+            raise ValueError("Viewer gate differs from the trained radar autoencoder")
+    if args.frame_id is not None:
+        by_id = {frame.frame_id: frame for frame in dataset.frames}
+        missing = sorted(set(args.frame_id) - by_id.keys())
+        if missing:
+            raise ValueError(f"Frames absent from {args.split}: {missing}")
+        dataset.frames = [by_id[frame_id] for frame_id in args.frame_id]
+    else:
         dataset.frames = (random.Random(args.random_seed).sample(
             dataset.frames, min(args.limit, len(dataset.frames)))
             if args.random_seed is not None else dataset.frames[:args.limit])
     args.output_root.mkdir(parents=True, exist_ok=True)
-    found = {frame.frame_id for frame in dataset.frames}
-    if args.frame_id and (missing := set(args.frame_id) - found):
-        raise ValueError(f"Frames absent from {args.split}: {sorted(missing)}")
     written = []
     for row in dataset:
         batch = collate_stage1([row])
         radar_input = batch["radar"].to(args.device)
         radar_valid = batch["radar_valid"].to(args.device)
         supported_only = (meta or auto or fine) and not args.all_candidates
-        if supported_only:
+        gate_mask = gate_cache.load(row["frame_id"]) if gated_auto else None
+        if gated_auto and supported_only:
+            output = student(radar_input, radar_valid).exported()
+            coords_full = output["confidence_coords"].detach().cpu()
+            select = _gate_on_global_cells(coords_full, gate_mask)
+            output["confidence_coords"] = output["confidence_coords"][
+                select.to(output["confidence_coords"].device)]
+            output["confidence_probabilities"] = output[
+                "confidence_probabilities"][select.to(
+                    output["confidence_probabilities"].device)]
+        elif supported_only:
             output = radar_only_probability_map(
                 student, radar_input, radar_valid, saved["radius_m"])
         else:
@@ -198,24 +240,40 @@ def main() -> None:
         size = np.asarray(grid["voxel_xyz_m"], dtype=np.float32)
         centers = origin + (coords[:, [3, 2, 1]].astype(np.float32) + 0.5) * size
         radar = row["radar"][:, :3].numpy()
-        lidar = row["clean_lidar"][:, :3].numpy()
+        if gated_auto:
+            clean_coords, _, _, _ = voxelize(batch["clean_lidar"],
+                                             batch["clean_lidar_valid"], GRID)
+            eligible = clean_coords[_gate_on_global_cells(clean_coords, gate_mask)]
+            lidar = voxel_centers_xyz(eligible, GRID).cpu().numpy()
+        else:
+            lidar = row["clean_lidar"][:, :3].numpy()
         suffix = "_all_candidates" if args.all_candidates else ""
         stem = args.output_root / f"{row['frame_id']}_student_epoch_{saved['epoch']:03d}{suffix}"
         _write_ply(stem.with_name(stem.name + "_radar.ply"), radar)
-        _write_ply(stem.with_name(stem.name + "_clean_lidar.ply"), lidar)
+        _write_ply(stem.with_name(stem.name + (
+            "_eligible_clean_voxels.ply" if gated_auto else "_clean_lidar.ply")), lidar)
         _write_ply(stem.with_name(stem.name + "_confidence.ply"), centers, confidence)
         html = stem.with_suffix(".html")
         _write_html(html, row["frame_id"], saved["epoch"], radar, lidar,
                     centers, confidence,
                     checkpoint_uses_fov=saved.get("lidar_fov") == RADAR_FOV_SPEC,
                     support_radius_m=saved["radius_m"] if supported_only else None,
-                    support_basis="radar voxel" if fine else "radar point")
-        support_note = (f", radar-voxel support {saved['radius_m']:.1f} m" if fine
+                    support_basis=("cluster of at least 12 distinct radar voxels"
+                                   if gated_auto else "radar voxel" if fine else "radar point"),
+                    clean_reference_name=("Gate-eligible clean LiDAR voxels" if gated_auto
+                                          else "Clean LiDAR in forward radar sector"),
+                    clean_reference_note=(
+                        f"Green: {len(lidar):,} clean occupied voxel centers inside the exact "
+                        "12-radar-voxel/1.6 m gate. The blue confidence panel uses the same gate."
+                        if gated_auto else None))
+        support_note = (", >=12 distinct radar voxels within 1.6 m" if gated_auto
+                        else f", radar-voxel support {saved['radius_m']:.1f} m" if fine
                         else f", radar support {saved['radius_m']:.1f} m"
                         if supported_only else ", all decoder candidates" if meta or auto else "")
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
-              f"{len(radar)} radar points, {len(lidar)} clean LiDAR points "
-              f"within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
+              f"{len(radar)} radar points, {len(lidar)} "
+              f"{'gate-eligible clean voxels' if gated_auto else 'clean LiDAR points'}"
+              f" within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
               f"{support_note} | {html}",
               flush=True)
         written.append((row["frame_id"], html.name))
