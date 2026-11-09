@@ -120,6 +120,7 @@ def main():
     parser.add_argument("--full-val-every", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--progress-file", type=Path)
     parser.add_argument("--quiet-progress", action="store_true")
@@ -200,7 +201,6 @@ def main():
         with (args.output_root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         log_record(writer, record)
-        update_plots(args.output_root, "pretrain")
         warning = overfitting_warning(args.output_root / "metrics.jsonl")
         if warning:
             print(f"Overfitting warning: {warning}", flush=True)
@@ -229,6 +229,8 @@ def main():
                         val_loss=validation["loss_total"],
                         validation_scope="full" if full else "quick",
                         warning=warning)
+        if args.plots:
+            update_plots(args.output_root, "pretrain")
     if writer is not None:
         writer.close()
 

@@ -40,6 +40,7 @@ PRETRAIN_BATCH=${PRETRAIN_BATCH:-8}
 TRAIN_BATCH=${TRAIN_BATCH:-2}
 WORKERS=${WORKERS:-2}
 CACHE_WORKERS=${CACHE_WORKERS:-4}
+PRETRAIN_PLOTS=${PRETRAIN_PLOTS:-1}
 FULL_VAL_EVERY=${FULL_VAL_EVERY:-5}
 SCAN_METRICS_EVERY=${SCAN_METRICS_EVERY:-5}
 CHECKPOINT_METRIC=${CHECKPOINT_METRIC:-full_support}
@@ -61,8 +62,16 @@ MODEL="$OUT/radar_autoencoder"
 
 pretrain() {
   local resume=()
+  local plot_args=()
+  if [[ "$PRETRAIN_PLOTS" == 0 ]]; then
+    plot_args=(--no-plots)
+  fi
   if [[ -s "$OUT/radar_pretrain/last.ckpt" ]]; then
     resume=(--resume "$OUT/radar_pretrain/last.ckpt")
+  elif [[ -e "$OUT/radar_pretrain/metrics.jsonl" ]]; then
+    local backup="$OUT/radar_pretrain/metrics_without_checkpoint_$(date +%Y%m%d_%H%M%S)_$$.jsonl"
+    mv -- "$OUT/radar_pretrain/metrics.jsonl" "$backup"
+    echo "Archived incomplete pretraining metrics: $backup"
   fi
   "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
     --vod-root "$VOD" --data-cache-root "$PRETRAIN_DATA" \
@@ -71,7 +80,7 @@ pretrain() {
     "${radar_filter_args[@]}" \
     --output-root "$OUT/radar_pretrain" --epochs "$PRETRAIN_EPOCHS" \
     --batch-size "$PRETRAIN_BATCH" --num-workers "$WORKERS" \
-    --no-tensorboard "${resume[@]}"
+    --no-tensorboard "${plot_args[@]}" "${resume[@]}"
   test -s "$ENCODER"
 }
 

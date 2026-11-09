@@ -9,3 +9,5 @@ The reconstruction target and metric gate stay defined by the **original unfilte
 The script builds separate geometry caches and checkpoints, validates exact IoU and IoU@0.2 m over all 1,296 validation frames every occupancy epoch, then sweeps thresholds once and applies the validation-selected threshold to the official test. The final geometry coverage report can be produced with `scripts.report_radar_gate_decoder_coverage` against the trial's `geometry_gate12` directory.
 
 The professor launcher sets `RADAR_AE_TMPDIR` to a short `/tmp` path for Python multiprocessing sockets. Training output remains under `OUT`. Override `RADAR_AE_TMPDIR` with another short, writable directory if needed.
+
+Radar pretraining on the professor environment disables optional matplotlib plots because the installed matplotlib/Pillow combination cannot import `_imaging`. Metrics and checkpoints still save every epoch. If a prior run wrote a metrics row but crashed before its first checkpoint, the launcher archives that incomplete metrics file and starts epoch 1 again.
