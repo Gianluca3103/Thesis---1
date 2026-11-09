@@ -18,6 +18,25 @@ from scripts import train_stage2_clean_denoiser as train_module
 from scripts.train_stage2_clean_denoiser import _CleanRows
 
 
+def test_validation_replay_drift_is_reported_without_losing_counts():
+    sweep = {
+        "calibration": {"tp": 10, "predicted": 20, "target": 30},
+        "heldout": {"tp": 40, "predicted": 60, "target": 80},
+    }
+    validation = {"overall": {
+        "calibration": {"completed": {
+            "exact_tp": 10, "predicted": 20, "eligible_target": 30}},
+        "heldout": {"completed": {
+            "exact_tp": 39, "predicted": 62, "eligible_target": 80}},
+    }}
+    assert evaluator.replay_count_differences(sweep, validation) == {
+        "heldout": {"exact_tp": -1, "predicted": 2,
+                    "eligible_target": 0}}
+    validation["overall"]["heldout"]["completed"].update(
+        exact_tp=40, predicted=60)
+    assert evaluator.replay_count_differences(sweep, validation) == {}
+
+
 def _mask() -> np.ndarray:
     mask = np.zeros(SHAPE, dtype=np.bool_)
     mask[0, 80, 50] = True  # azimuth near zero, well inside the fault
