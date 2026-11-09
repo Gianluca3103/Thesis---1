@@ -1,6 +1,6 @@
 # Radar input-prefilter trial
 
-Run `bash scripts/run_radar_autoencoder_prefilter_professor_100ep.sh` from a pinned professor-machine checkout. This is a separate 25-epoch radar pretraining plus 100-epoch radar occupancy encoder–decoder experiment. Its output root is `/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/radar_encoder_decoder_fullgrid12_1p6m_prefilter_100ep_20261109`.
+Run `bash scripts/run_radar_autoencoder_prefilter_professor_100ep.sh pretrain` from a pinned professor-machine checkout to build or reuse compatible fixed-frame caches and train only the filtered radar encoder for 25 epochs. Afterward, run the same script with `cache`, `train`, and `evaluate` phases in that order, or omit the phase to run all steps. This is a separate 100-epoch radar occupancy encoder–decoder experiment. Its output root is `/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/radar_encoder_decoder_fullgrid12_1p6m_prefilter_100ep_20261109`.
 
 For each frame, voxelize raw radar within the existing encoder grid (`x,y` ±51.2 m and `z` ±2 m). A radar voxel survives if its center has at least 12 **distinct radar voxel centers**, including itself, within 1.6 m. Every original return in a surviving voxel is kept; returns from other voxels are removed before radar encoder pretraining and before the occupancy encoder–decoder. The filter is computed once against the original frame, so it does not recursively erode a cluster.
 

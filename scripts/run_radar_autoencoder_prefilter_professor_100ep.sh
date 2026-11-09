@@ -51,4 +51,4 @@ export GATE_SCOPE=full_grid PRETRAIN_EPOCHS=25 TRAIN_EPOCHS=100
 export RADAR_INPUT_FILTER=1
 export PRETRAIN_BATCH=16 TRAIN_BATCH=8 WORKERS=4 CACHE_WORKERS=8
 export FULL_VAL_EVERY=1 SCAN_METRICS_EVERY=1 CHECKPOINT_METRIC=exact
-exec bash "$REPO/scripts/run_radar_autoencoder_gate12_local.sh" all
+exec bash "$REPO/scripts/run_radar_autoencoder_gate12_local.sh" "${1:-all}"
