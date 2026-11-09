@@ -11,13 +11,16 @@ PY=${PY:-$BASE/Sensor-Fusion/.venv_model_v2/bin/python}
 PRETRAIN_DATA=${PRETRAIN_DATA:-$DATA_ROOT/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 OUT=${OUT:-$DATA_ROOT/radar_encoder_decoder_fullgrid12_1p6m_prefilter_100ep_20261109}
 VARIANT=${VARIANT:-radar_20frames_verified_doppler_radial}
+RADAR_AE_TMPDIR=${RADAR_AE_TMPDIR:-$(dirname "$DATA_ROOT")/rtmp_${UID}}
+mkdir -p "$RADAR_AE_TMPDIR"
+export TMPDIR="$RADAR_AE_TMPDIR"
 
 test -x "$PY" || { echo "Missing Python: $PY" >&2; exit 1; }
 test -d "$VOD" || { echo "Missing VoD data: $VOD" >&2; exit 1; }
 cd "$REPO"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
-if ! "$PY" - "$PRETRAIN_DATA" "$VOD" "$VARIANT" <<'PY'
+if ! "$PY" -c '
 import json
 import sys
 from pathlib import Path
@@ -35,8 +38,7 @@ for split in ("train", "val"):
             or manifest.get("lidar_radar_fov_deg") != 70.0
             or manifest.get("lidar_radar_max_range_m") != 80.0):
         raise SystemExit(1)
-PY
-then
+' "$PRETRAIN_DATA" "$VOD" "$VARIANT"; then
   PRETRAIN_DATA="$OUT/pretrain_fixed_frames"
   echo "Building compatible cropped radar pretraining cache: $PRETRAIN_DATA"
   for split in train val; do
@@ -49,7 +51,7 @@ fi
 export REPO BASE VOD PY PRETRAIN_DATA OUT VARIANT
 export GATE_SCOPE=full_grid PRETRAIN_EPOCHS=25 TRAIN_EPOCHS=100
 export RADAR_INPUT_FILTER=1
-export RADAR_AE_TMPDIR=${RADAR_AE_TMPDIR:-/tmp/radar_ae_prefilter_${UID}}
+export RADAR_AE_TMPDIR
 export PRETRAIN_PLOTS=0
 export PRETRAIN_BATCH=16 TRAIN_BATCH=8 WORKERS=4 CACHE_WORKERS=8
 export FULL_VAL_EVERY=1 SCAN_METRICS_EVERY=1 CHECKPOINT_METRIC=exact
