@@ -1,1 +1,2 @@
 scripts/run_radar_autoencoder_gate12_local.sh text eol=lf
+scripts/run_radar_autoencoder_gate12_professor_100ep.sh text eol=lf

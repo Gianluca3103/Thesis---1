@@ -24,6 +24,9 @@ PRETRAIN_BATCH=${PRETRAIN_BATCH:-8}
 TRAIN_BATCH=${TRAIN_BATCH:-2}
 WORKERS=${WORKERS:-2}
 CACHE_WORKERS=${CACHE_WORKERS:-4}
+FULL_VAL_EVERY=${FULL_VAL_EVERY:-5}
+SCAN_METRICS_EVERY=${SCAN_METRICS_EVERY:-5}
+CHECKPOINT_METRIC=${CHECKPOINT_METRIC:-full_support}
 PHASE=${1:-all}
 
 cd "$REPO"
@@ -102,8 +105,9 @@ train() {
     "${gate_args[@]}" --output-root "$MODEL" \
     --config "$CONFIG" --radar-variant "$VARIANT" \
     --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH" \
-    --num-workers "$WORKERS" --full-val-every 5 \
-    --scan-metrics-every 5 "${resume[@]}"
+    --num-workers "$WORKERS" --full-val-every "$FULL_VAL_EVERY" \
+    --scan-metrics-every "$SCAN_METRICS_EVERY" \
+    --checkpoint-metric "$CHECKPOINT_METRIC" "${resume[@]}"
 }
 
 evaluate() {

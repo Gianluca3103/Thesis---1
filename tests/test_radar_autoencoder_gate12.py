@@ -10,6 +10,7 @@ import torch
 from models.radar_lidar_stage2.sparse_geometry import GRID as STAGE2_GRID
 from models.radar_lidar_crossmodal_v1.meta_cache import cache_manifest
 from models.radar_lidar_crossmodal_v1.radar_voxel_gate import SUPPORT_POLICY
+from models.radar_lidar_crossmodal_v1.train_radar_autoencoder import _checkpoint_score
 from scripts.cache_meta_occupancy_fast import (
     _clean_points_in_gate, _gate_on_global_cells,
 )
@@ -73,3 +74,9 @@ def test_full_grid_manifest_has_distinct_policy(tmp_path: Path):
     dataset = SimpleNamespace(frames=[SimpleNamespace(frame_id="00001")])
     assert _check_manifest(path, saved, dataset, "val", tmp_path,
                            "radar_autoencoder") == manifest
+
+
+def test_best_checkpoint_uses_reconstruction_iou_when_requested():
+    validation = {"iou_full_support": 0.8, "iou_exact": 0.2}
+    assert _checkpoint_score(validation, "exact") == 0.2
+    assert _checkpoint_score(validation, "full_support") == 0.8

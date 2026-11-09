@@ -114,6 +114,16 @@ def _atomic_save(path: Path, payload: dict):
         temporary.unlink(missing_ok=True)
 
 
+def _checkpoint_score(validation: dict, metric: str) -> float | None:
+    if metric == "exact":
+        if "iou_exact" not in validation:
+            raise ValueError("Exact-IoU checkpoint selection requires scan validation")
+        return validation["iou_exact"]
+    if metric == "full_support":
+        return validation["iou_full_support"]
+    raise ValueError(f"Unknown checkpoint metric: {metric}")
+
+
 def load_radar_autoencoder(path: Path, device: str = "cuda"):
     """Inference uses only the trained radar model checkpoint."""
     saved = torch.load(path, map_location="cpu", weights_only=False)
@@ -146,6 +156,9 @@ def main():
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--scan-metrics-every", type=int, default=5)
+    parser.add_argument("--checkpoint-metric", choices=("full_support", "exact"),
+                        default="full_support",
+                        help="Select the best-IoU checkpoint using this validation metric")
     parser.add_argument("--quick-val-frames", type=int, default=32)
     parser.add_argument("--full-val-every", type=int, default=5)
     parser.add_argument("--resume", type=Path)
@@ -153,6 +166,8 @@ def main():
     args = parser.parse_args()
     if args.full_radar_gate and args.gate_support_root is not None:
         parser.error("Full-grid and Stage-II ROI radar gates are exclusive")
+    if args.checkpoint_metric == "exact" and args.scan_metrics_every != 1:
+        parser.error("Exact-IoU checkpoint selection needs scan metrics every epoch")
     if (args.device != "cuda" or not torch.cuda.is_available()
             or args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.student_lr <= 0 or args.scan_metrics_every < 1
@@ -244,10 +259,14 @@ def main():
             for split in ("train", "val")}
     if args.full_radar_gate:
         identity["support_policy"] = FULL_RADAR_SUPPORT_POLICY
+    if args.checkpoint_metric == "exact":
+        identity["checkpoint_metric"] = "exact"
     args.output_root.mkdir(parents=True, exist_ok=True)
     history = args.output_root / "metrics.jsonl"
     if history.exists() and args.resume is None:
         parser.error("Existing metrics require --resume or a new output root")
+    best_key = ("best_iou_exact" if args.checkpoint_metric == "exact"
+                else "best_iou_full_support")
     start, best = 1, float("-inf")
     best_val_bce = float("inf")
     if args.resume:
@@ -257,7 +276,7 @@ def main():
             raise ValueError("Resume checkpoint differs from this radar-only experiment")
         student.load_state_dict(saved["student"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
-        start, best = int(saved["epoch"]) + 1, float(saved["best_iou_full_support"])
+        start, best = int(saved["epoch"]) + 1, float(saved[best_key])
         best_val_bce = float(saved.get("best_val_bce", float("inf")))
     for epoch in range(start, args.epochs + 1):
         training = _epoch(student, loaders["train"], optimizer, config, args.device,
@@ -267,7 +286,7 @@ def main():
         validation = _epoch(student, loaders["val" if full else "quick"], None,
                             config, args.device, name=f"Radar AE val {epoch:03d}",
                             scan=evaluate_scan)
-        score = validation["iou_full_support"]
+        score = _checkpoint_score(validation, args.checkpoint_metric)
         improved = full and score is not None and score > best
         if improved:
             best = score
@@ -278,13 +297,13 @@ def main():
         record = {"epoch": epoch, "train": training, "val": validation,
                   "validation_scope": "full" if full else "quick",
                   "scan_metrics": evaluate_scan,
-                  "best_iou_full_support": best,
+                  best_key: best,
                   "best_val_bce": best_val_bce,
                   "ablation": "radar_encoder_decoder_lidar_occupancy_supervision"}
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         base = {"version": VERSION, **identity, "epoch": epoch,
-                "best_iou_full_support": best,
+                best_key: best,
                 "best_val_bce": best_val_bce,
                 "student": student.state_dict(), "optimizer": optimizer.state_dict(),
                 "record": record}
@@ -298,9 +317,23 @@ def main():
         if bce_improved:
             _atomic_save(args.output_root / "best_bce.ckpt", base)
             _atomic_save(args.output_root / "best_bce_student.ckpt", only)
-        print(f"Epoch {epoch:03d}: train BCE={training['map_bce']} "
-              f"val Known/Full IoU={validation['iou_known_supported']}/"
-              f"{validation['iou_full_support']} scan={evaluate_scan}", flush=True)
+        if evaluate_scan:
+            print(f"Epoch {epoch:03d}: train_BCE={training['map_bce']:.4f} "
+                  f"val_BCE={validation['map_bce']:.4f} "
+                  f"eligible_exact_IoU@{config.threshold:g}="
+                  f"{validation['iou_exact']:.2%} "
+                  f"eligible_IoU@0.2m@{config.threshold:g}="
+                  f"{validation['iou_at_0_2m']:.2%} "
+                  f"val_frames={validation['frames']} "
+                  f"best_eligible_{args.checkpoint_metric}_IoU="
+                  f"{best:.2%}", flush=True)
+        else:
+            print(f"Epoch {epoch:03d}: train_BCE={training['map_bce']:.4f} "
+                  f"val_BCE={validation['map_bce']:.4f} "
+                  f"known/full_IoU@{config.threshold:g}="
+                  f"{validation['iou_known_supported']:.2%}/"
+                  f"{validation['iou_full_support']:.2%} "
+                  f"val_frames={validation['frames']}", flush=True)
 
 
 if __name__ == "__main__":
