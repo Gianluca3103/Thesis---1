@@ -91,7 +91,9 @@ def _source_hash() -> str:
         "models/radar_lidar_crossmodal_v1/teacher.py",
         "models/radar_lidar_crossmodal_v1/meta_occupancy.py",
         "models/radar_lidar_crossmodal_v1/meta_cache.py",
+        "models/radar_lidar_crossmodal_v1/radar_voxel_gate.py",
         "scripts/cache_meta_occupancy.py",
+        "scripts/cache_meta_occupancy_fast.py",
     )
     digest = hashlib.sha256()
     for name in files:
@@ -103,9 +105,13 @@ def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
                    radar_variant: str, radar_encoder: Path,
                    lidar_encoder: Path | None, radius_m: float,
                    max_candidates: int,
-                   gate_support_manifest_sha256: str | None = None) -> dict:
+                   gate_support_manifest_sha256: str | None = None,
+                   full_radar_gate: bool = False,
+                   fixed_frame_manifest_sha256: str | None = None) -> dict:
     if split not in ("train", "val", "test") or radius_m <= 0 or max_candidates < 1:
         raise ValueError("Invalid geometry cache split or neighborhood")
+    if full_radar_gate and gate_support_manifest_sha256 is not None:
+        raise ValueError("Full-grid radar gate and Stage-II ROI gate are exclusive")
     manifest = {
         "version": VERSION, "split": split, "frame_ids": frame_ids,
         "codec": "delta-voxel-ids+bitmask+lzma9",
@@ -124,6 +130,11 @@ def cache_manifest(*, split: str, frame_ids: list[str], vod_root: Path,
             "support_policy": "radar12vox_1p6m_stage2_roi_v1",
             "gate_support_manifest_sha256": gate_support_manifest_sha256,
         })
+    if full_radar_gate:
+        from .radar_voxel_gate import SUPPORT_POLICY
+        manifest["support_policy"] = SUPPORT_POLICY
+    if fixed_frame_manifest_sha256 is not None:
+        manifest["fixed_frame_manifest_sha256"] = fixed_frame_manifest_sha256
     return manifest
 
 

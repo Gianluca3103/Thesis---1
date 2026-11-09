@@ -37,22 +37,23 @@ def paired_dataset(vod_root: str | Path, split: str, radar_variant: str, *,
                    augmentation: GeometricAugmentationConfig | None = None,
                    seed: int = 0, limit: int | None = None,
                    include_clean: bool = True, data_cache_root: Path | None = None,
-                   id_only: bool = False):
+                   id_only: bool = False, full_lidar: bool = False,
+                   check_complete: bool = True):
     if id_only and augmentation is not None and augmentation.enabled:
         raise ValueError("ID-only dataset cannot apply geometric augmentation")
     dataset = VoDStage1Dataset(vod_root, split, radar_variant=radar_variant,
                                include_clean=include_clean,
                                augmentation_config=augmentation,
                                augmentation_grid=GRID, augmentation_seed=seed,
-                               lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
-                               lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
+                               lidar_radar_fov_deg=(None if full_lidar else RADAR_HALF_FOV_DEG),
+                               lidar_radar_max_range_m=(None if full_lidar else RADAR_MAX_RANGE_M))
     if data_cache_root is not None and not id_only:
         from .fixed_frame_cache import FixedFrameCache
         dataset = FixedFrameCache(Path(data_cache_root) / split, dataset,
                                   include_clean=include_clean)
     if limit is not None:
         dataset.frames = dataset.frames[:limit]
-    if data_cache_root is not None and not id_only:
+    if data_cache_root is not None and not id_only and check_complete:
         dataset.check_complete()
     if id_only:
         dataset = FrameIdDataset(dataset)

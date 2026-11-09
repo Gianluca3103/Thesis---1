@@ -19,6 +19,8 @@ def main() -> None:
     parser.add_argument("--vod-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
+    parser.add_argument("--full-lidar", action="store_true",
+                        help="Preserve uncropped clean LiDAR for full-grid evaluation")
     parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -26,8 +28,8 @@ def main() -> None:
     args = parser.parse_args()
     dataset = VoDStage1Dataset(
         args.vod_root, args.split, radar_variant=args.radar_variant,
-        lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
-        lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
+        lidar_radar_fov_deg=(None if args.full_lidar else RADAR_HALF_FOV_DEG),
+        lidar_radar_max_range_m=(None if args.full_lidar else RADAR_MAX_RANGE_M))
     cache = FixedFrameCache(args.cache_root / args.split, dataset, create=True)
     frames = dataset.frames[:args.limit] if args.limit is not None else dataset.frames
     missing = [i for i, frame in enumerate(frames)

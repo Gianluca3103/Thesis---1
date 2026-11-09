@@ -25,6 +25,7 @@ from .pipeline_data import paired_dataset
 from .radar_autoencoder import RadarOccupancyAutoencoder
 from .student import StudentConfig
 from .train_meta_occupancy import EpochMetrics
+from .radar_voxel_gate import SUPPORT_POLICY as FULL_RADAR_SUPPORT_POLICY
 
 
 VERSION = "radar_direct_occupancy_autoencoder_v1"
@@ -132,6 +133,8 @@ def main():
     parser.add_argument("--meta-cache-root", type=Path, required=True)
     parser.add_argument("--gate-support-root", type=Path,
                         help="Require cached >=12 radar voxels within 1.6 m")
+    parser.add_argument("--full-radar-gate", action="store_true",
+                        help="Train only in the full encoder-grid >=12/1.6 m gate")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path,
                         default=Path("configs/crossmodal_meta_occupancy.json"))
@@ -148,6 +151,8 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.full_radar_gate and args.gate_support_root is not None:
+        parser.error("Full-grid and Stage-II ROI radar gates are exclusive")
     if (args.device != "cuda" or not torch.cuda.is_available()
             or args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.student_lr <= 0 or args.scan_metrics_every < 1
@@ -159,7 +164,9 @@ def main():
     def open_split(split: str, limit: int | None):
         points = paired_dataset(args.vod_root, split, args.radar_variant,
                                 include_clean=False,
-                                data_cache_root=args.data_cache_root)
+                                data_cache_root=args.data_cache_root,
+                                full_lidar=args.full_radar_gate,
+                                check_complete=limit is None)
         root = args.meta_cache_root / split
         manifest_path = root / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -173,7 +180,15 @@ def main():
                     "source_hash": _source_hash()}
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"Existing {split} meta geometry cache differs: {manifest_path}")
-        if args.gate_support_root is not None:
+        fixed_hash = manifest.get("fixed_frame_manifest_sha256")
+        if ((args.full_radar_gate and fixed_hash is None) or
+                fixed_hash is not None and fixed_hash !=
+                _sha256(args.data_cache_root / split / "manifest.json")):
+            raise ValueError(f"{split} geometry uses a different clean LiDAR cache")
+        if args.full_radar_gate:
+            if manifest.get("support_policy") != FULL_RADAR_SUPPORT_POLICY:
+                raise ValueError(f"{split} cache is not the full-grid 12-voxel gate")
+        elif args.gate_support_root is not None:
             support_manifest = args.gate_support_root / split / "manifest.json"
             if (manifest.get("support_policy") != "radar12vox_1p6m_stage2_roi_v1"
                     or manifest.get("gate_support_manifest_sha256") !=
@@ -215,7 +230,9 @@ def main():
                 "student_config": asdict(student.config),
                 "radar_sha256": _sha256(args.radar_encoder),
                 "radar_variant": args.radar_variant,
-                "lidar_fov": RADAR_FOV_SPEC,
+                "lidar_fov": None if args.full_radar_gate else RADAR_FOV_SPEC,
+                "clean_lidar_scope": ("uncropped" if args.full_radar_gate
+                                      else "forward_radar_sector"),
                 "radius_m": config.radius_m, "threshold": config.threshold,
                 "train_manifest_sha256": train_manifest,
                 "val_manifest_sha256": val_manifest,
@@ -225,6 +242,8 @@ def main():
         identity["gate_support_manifest_sha256"] = {
             split: _sha256(args.gate_support_root / split / "manifest.json")
             for split in ("train", "val")}
+    if args.full_radar_gate:
+        identity["support_policy"] = FULL_RADAR_SUPPORT_POLICY
     args.output_root.mkdir(parents=True, exist_ok=True)
     history = args.output_root / "metrics.jsonl"
     if history.exists() and args.resume is None:

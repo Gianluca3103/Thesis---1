@@ -4,8 +4,18 @@ set -euo pipefail
 # Run in the laptop's WSL terminal. All outputs stay on the WSL filesystem.
 REPO=${REPO:-/mnt/c/Users/gianl/Desktop/Thesis/radar-lidar-crossmodal}
 VOD=${VOD:-/mnt/c/Users/gianl/Desktop/Thesis/View-Of-Delft dataset/view_of_delft_PUBLIC}
-DATA=${DATA:-/home/gianl/stage2_conditional_local_from_scratch_20261108/fixed_frames}
-OUT=${OUT:-/home/gianl/radar_encoder_decoder_local_20261109/full}
+PRETRAIN_DATA=${PRETRAIN_DATA:-/home/gianl/stage2_conditional_local_from_scratch_20261108/fixed_frames}
+GATE_SCOPE=${GATE_SCOPE:-full_grid}
+if [[ "$GATE_SCOPE" != full_grid && "$GATE_SCOPE" != stage2_roi ]]; then
+  echo "GATE_SCOPE must be full_grid or stage2_roi" >&2
+  exit 2
+fi
+OUT=${OUT:-/home/gianl/radar_encoder_decoder_${GATE_SCOPE}_gate12_20261109}
+if [[ "$GATE_SCOPE" == full_grid ]]; then
+  DATA=${DATA:-$OUT/full_clean_fixed_frames}
+else
+  DATA=${DATA:-$PRETRAIN_DATA}
+fi
 PY=${PY:-/home/gianl/venvs/stage2-local/bin/python}
 VARIANT=${VARIANT:-radar_20frames_verified_doppler_radial}
 PRETRAIN_EPOCHS=${PRETRAIN_EPOCHS:-25}
@@ -35,8 +45,9 @@ pretrain() {
     resume=(--resume "$OUT/radar_pretrain/last.ckpt")
   fi
   "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
-    --vod-root "$VOD" --data-cache-root "$DATA" \
+    --vod-root "$VOD" --data-cache-root "$PRETRAIN_DATA" \
     --radar-variant "$VARIANT" --modality radar \
+    --online-augmentation-config configs/crossmodal_no_geometric_augmentation.json \
     --output-root "$OUT/radar_pretrain" --epochs "$PRETRAIN_EPOCHS" \
     --batch-size "$PRETRAIN_BATCH" --num-workers "$WORKERS" \
     --no-tensorboard "${resume[@]}"
@@ -45,16 +56,30 @@ pretrain() {
 
 cache() {
   test -s "$ENCODER" || { echo "Missing $ENCODER; run pretrain first" >&2; exit 1; }
+  local gate_args
+  if [[ "$GATE_SCOPE" == full_grid ]]; then
+    gate_args=(--full-radar-gate)
+  else
+    gate_args=(--gate-support-root "$SUPPORT")
+  fi
   for split in train val test; do
-    "$PY" -u -m scripts.cache_radar_pruner_stage1 \
-      --vod-root "$VOD" --data-cache-root "$DATA" \
-      --output-root "$SUPPORT" --radar-variant "$VARIANT" \
-      --radius-m 1.6 --min-distinct-radar-voxels 12 \
-      --split "$split" --num-workers "$CACHE_WORKERS"
+    if [[ "$GATE_SCOPE" == full_grid ]]; then
+      "$PY" -u -m scripts.cache_crossmodal_fixed_frames \
+        --vod-root "$VOD" --cache-root "$DATA" \
+        --radar-variant "$VARIANT" --full-lidar --split "$split" \
+        --num-workers "$CACHE_WORKERS"
+    fi
+    if [[ "$GATE_SCOPE" == stage2_roi ]]; then
+      "$PY" -u -m scripts.cache_radar_pruner_stage1 \
+        --vod-root "$VOD" --data-cache-root "$DATA" \
+        --output-root "$SUPPORT" --radar-variant "$VARIANT" \
+        --radius-m 1.6 --min-distinct-radar-voxels 12 \
+        --split "$split" --num-workers "$CACHE_WORKERS"
+    fi
     "$PY" -u -m scripts.cache_meta_occupancy_fast \
       --vod-root "$VOD" --data-cache-root "$DATA" \
       --cache-root "$GEOMETRY" --radar-encoder "$ENCODER" \
-      --gate-support-root "$SUPPORT" --config "$CONFIG" \
+      "${gate_args[@]}" --config "$CONFIG" \
       --radar-variant "$VARIANT" --split "$split" \
       --num-workers "$CACHE_WORKERS"
   done
@@ -62,13 +87,19 @@ cache() {
 
 train() {
   local resume=()
+  local gate_args
+  if [[ "$GATE_SCOPE" == full_grid ]]; then
+    gate_args=(--full-radar-gate)
+  else
+    gate_args=(--gate-support-root "$SUPPORT")
+  fi
   if [[ -s "$MODEL/last.ckpt" ]]; then
     resume=(--resume "$MODEL/last.ckpt")
   fi
   "$PY" -u -m models.radar_lidar_crossmodal_v1.train_radar_autoencoder \
     --vod-root "$VOD" --data-cache-root "$DATA" \
     --radar-encoder "$ENCODER" --meta-cache-root "$GEOMETRY" \
-    --gate-support-root "$SUPPORT" --output-root "$MODEL" \
+    "${gate_args[@]}" --output-root "$MODEL" \
     --config "$CONFIG" --radar-variant "$VARIANT" \
     --epochs "$TRAIN_EPOCHS" --batch-size "$TRAIN_BATCH" \
     --num-workers "$WORKERS" --full-val-every 5 \

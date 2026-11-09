@@ -35,6 +35,9 @@ from models.radar_lidar_crossmodal_v1.encoder import GRID
 from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
     RadarSupportCache, identity as gate_identity,
 )
+from models.radar_lidar_crossmodal_v1.radar_voxel_gate import (
+    DistinctRadarVoxelGate, SUPPORT_POLICY as FULL_RADAR_SUPPORT_POLICY,
+)
 from models.radar_lidar_crossmodal_v1.train_student import load_student
 from scripts.cache_meta_occupancy_fast import _gate_on_global_cells
 
@@ -182,17 +185,21 @@ def main() -> None:
     loader = (load_meta_student if meta else load_radar_autoencoder if auto
               else load_fine_association if fine else load_student)
     student, saved = loader(args.checkpoint, args.device)
-    gated_auto = auto and saved.get("support_policy") == "radar12vox_1p6m_stage2_roi_v1"
-    if gated_auto and (args.data_cache_root is None or args.gate_support_root is None):
-        parser.error("Gated radar autoencoder needs --data-cache-root and --gate-support-root")
+    roi_gated_auto = auto and saved.get("support_policy") == "radar12vox_1p6m_stage2_roi_v1"
+    full_gated_auto = auto and saved.get("support_policy") == FULL_RADAR_SUPPORT_POLICY
+    gated_auto = roi_gated_auto or full_gated_auto
+    if roi_gated_auto and (args.data_cache_root is None or args.gate_support_root is None):
+        parser.error("Stage-II ROI gated autoencoder needs --data-cache-root and --gate-support-root")
     dataset = VoDStage1Dataset(args.vod_root, args.split,
                                radar_variant=saved["radar_variant"],
                                include_clean=True,
-                               lidar_radar_fov_deg=RADAR_HALF_FOV_DEG,
-                               lidar_radar_max_range_m=RADAR_MAX_RANGE_M)
+                               lidar_radar_fov_deg=(None if full_gated_auto
+                                                    else RADAR_HALF_FOV_DEG),
+                               lidar_radar_max_range_m=(None if full_gated_auto
+                                                        else RADAR_MAX_RANGE_M))
     full_ids = [frame.frame_id for frame in dataset.frames]
     gate_cache = None
-    if gated_auto:
+    if roi_gated_auto:
         root = args.gate_support_root / args.split
         gate_cache = RadarSupportCache(
             root, gate_identity(args.split, full_ids, saved["radar_variant"],
@@ -218,11 +225,14 @@ def main() -> None:
         radar_input = batch["radar"].to(args.device)
         radar_valid = batch["radar_valid"].to(args.device)
         supported_only = (meta or auto or fine) and not args.all_candidates
-        gate_mask = gate_cache.load(row["frame_id"]) if gated_auto else None
+        gate_mask = gate_cache.load(row["frame_id"]) if roi_gated_auto else None
+        full_gate = (DistinctRadarVoxelGate(batch["radar"], batch["radar_valid"])
+                     if full_gated_auto else None)
         if gated_auto and supported_only:
             output = student(radar_input, radar_valid).exported()
             coords_full = output["confidence_coords"].detach().cpu()
-            select = _gate_on_global_cells(coords_full, gate_mask)
+            select = (full_gate.contains_cells(coords_full) if full_gated_auto else
+                      _gate_on_global_cells(coords_full, gate_mask))
             output["confidence_coords"] = output["confidence_coords"][
                 select.to(output["confidence_coords"].device)]
             output["confidence_probabilities"] = output[
@@ -243,7 +253,9 @@ def main() -> None:
         if gated_auto:
             clean_coords, _, _, _ = voxelize(batch["clean_lidar"],
                                              batch["clean_lidar_valid"], GRID)
-            eligible = clean_coords[_gate_on_global_cells(clean_coords, gate_mask)]
+            eligible = clean_coords[(full_gate.contains_cells(clean_coords)
+                                     if full_gated_auto else
+                                     _gate_on_global_cells(clean_coords, gate_mask))]
             lidar = voxel_centers_xyz(eligible, GRID).cpu().numpy()
         else:
             lidar = row["clean_lidar"][:, :3].numpy()
@@ -264,17 +276,21 @@ def main() -> None:
                                           else "Clean LiDAR in forward radar sector"),
                     clean_reference_note=(
                         f"Green: {len(lidar):,} clean occupied voxel centers inside the exact "
-                        "12-radar-voxel/1.6 m gate. The blue confidence panel uses the same gate."
+                        "12-radar-voxel/1.6 m gate on the radar model grid. "
+                        "The blue confidence panel uses the same gate."
                         if gated_auto else None))
-        support_note = (", >=12 distinct radar voxels within 1.6 m" if gated_auto
+        support_note = (", >=12 distinct radar voxels within 1.6 m (full encoder grid)"
+                        if full_gated_auto else
+                        ", >=12 distinct radar voxels within 1.6 m (Stage-II ROI)" if roi_gated_auto
                         else f", radar-voxel support {saved['radius_m']:.1f} m" if fine
                         else f", radar support {saved['radius_m']:.1f} m"
                         if supported_only else ", all decoder candidates" if meta or auto else "")
         print(f"{row['frame_id']}: {len(centers)} raw confidence cells, "
               f"{len(radar)} radar points, {len(lidar)} "
               f"{'gate-eligible clean voxels' if gated_auto else 'clean LiDAR points'}"
-              f" within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m"
-              f"{support_note} | {html}",
+              + (" within the full radar encoder grid" if full_gated_auto else
+                 f" within forward ±{RADAR_HALF_FOV_DEG:.0f}° and {RADAR_MAX_RANGE_M:.0f} m")
+              + f"{support_note} | {html}",
               flush=True)
         written.append((row["frame_id"], html.name))
     if written:
@@ -284,11 +300,11 @@ def main() -> None:
             for frame_id, name in written)
         first = html_lib.escape(written[0][1])
         index = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
-                 "<title>Stage I confidence samples</title>"
+                 "<title>Radar autoencoder confidence samples</title>"
                  "<style>body{margin:1rem;background:#101820;color:#edf4fa;"
                  "font:16px system-ui}a{color:#88ceff}"
                  "iframe{width:100%;height:85vh;border:1px solid #526474}"
-                 "</style><h1>Stage I confidence samples</h1>"
+                 "</style><h1>Radar autoencoder confidence samples</h1>"
                  f"<ul>{links}</ul><iframe name=\"sample\" src=\"{first}\" "
                  "title=\"Confidence sample\"></iframe></html>")
         index_path = args.output_root / "index.html"

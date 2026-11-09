@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from models.radar_lidar_crossmodal_v1.meta_cache import MetaOccupancyCache
+from models.radar_lidar_crossmodal_v1.radar_voxel_gate import SUPPORT_POLICY
 
 
 def main() -> None:
@@ -19,8 +20,9 @@ def main() -> None:
         parser.error("--limit must be positive")
     root = args.meta_cache_root / args.split
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("support_policy") != "radar12vox_1p6m_stage2_roi_v1":
-        raise ValueError("Expected geometry for the >=12 radar voxels / 1.6 m gate")
+    if manifest.get("support_policy") not in (SUPPORT_POLICY,
+                                               "radar12vox_1p6m_stage2_roi_v1"):
+        raise ValueError("Expected geometry for a >=12 radar voxels / 1.6 m gate")
     cache = MetaOccupancyCache(root, manifest)
     selected = range(min(args.limit, len(cache))) if args.limit else range(len(cache))
     totals = {"eligible_clean_voxels": 0, "decoder_representable_clean_voxels": 0,
@@ -36,7 +38,8 @@ def main() -> None:
         totals["decoder_representable_clean_points"] += row[
             "represented_clean_points_supported"]
     count = len(selected)
-    result = {"split": args.split, "frames": count, **totals,
+    result = {"split": args.split, "frames": count,
+              "support_policy": manifest["support_policy"], **totals,
               "voxel_coverage_ceiling": (
                   totals["decoder_representable_clean_voxels"] /
                   totals["eligible_clean_voxels"] if totals["eligible_clean_voxels"] else None),

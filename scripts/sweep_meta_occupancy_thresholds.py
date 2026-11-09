@@ -100,7 +100,8 @@ def _check_manifest(path: Path, saved: dict, dataset, split: str,
     if model_type == "radar_autoencoder":
         if manifest.get("support_policy") != saved.get("support_policy"):
             raise ValueError("Radar-only geometry gate differs from checkpoint")
-        if (split in ("train", "val") and saved.get("support_policy") is not None
+        if (split in ("train", "val") and
+                "gate_support_manifest_sha256" in saved
                 and manifest.get("gate_support_manifest_sha256") !=
                 saved["gate_support_manifest_sha256"][split]):
             raise ValueError("Radar-only gate support manifest differs from training")
@@ -176,10 +177,17 @@ def main() -> None:
     thresholds = tuple(sorted(args.thresholds))
     model, saved, model_type = _load_checkpoint(args.checkpoint, args.device)
     points = paired_dataset(args.vod_root, args.split, saved["radar_variant"],
-                            data_cache_root=args.data_cache_root)
+                            data_cache_root=args.data_cache_root,
+                            full_lidar=saved.get("support_policy") ==
+                            "radar12vox_1p6m_full_encoder_grid_v1",
+                            check_complete=args.limit is None)
     cache_root = args.meta_cache_root / args.split
     manifest = _check_manifest(cache_root / "manifest.json", saved, points,
                                args.split, args.vod_root, model_type)
+    fixed_hash = manifest.get("fixed_frame_manifest_sha256")
+    if (fixed_hash is not None and fixed_hash !=
+            _sha256(args.data_cache_root / args.split / "manifest.json")):
+        raise ValueError("Evaluation uses a different clean LiDAR cache")
     cache = MetaOccupancyCache(cache_root, manifest)
     joined = MetaOccupancyDataset(points, cache)
     selected = Subset(joined, range(min(args.limit, len(joined)))) if args.limit else joined

@@ -1,15 +1,19 @@
 """The radar-only ablation must use exactly the Stage-II 12/1.6 m gate."""
 
 from pathlib import Path
+from types import SimpleNamespace
+import json
 
 import numpy as np
 import torch
 
 from models.radar_lidar_stage2.sparse_geometry import GRID as STAGE2_GRID
 from models.radar_lidar_crossmodal_v1.meta_cache import cache_manifest
+from models.radar_lidar_crossmodal_v1.radar_voxel_gate import SUPPORT_POLICY
 from scripts.cache_meta_occupancy_fast import (
     _clean_points_in_gate, _gate_on_global_cells,
 )
+from scripts.sweep_meta_occupancy_thresholds import _check_manifest
 
 
 def test_stage2_gate_maps_to_global_decoder_grid():
@@ -48,3 +52,24 @@ def test_gated_manifest_records_support_and_no_lidar_weights(tmp_path: Path):
     assert manifest["lidar_initial_sha256"] is None
     assert manifest["support_policy"] == "radar12vox_1p6m_stage2_roi_v1"
     assert manifest["gate_support_manifest_sha256"] == "support-hash"
+
+
+def test_full_grid_manifest_has_distinct_policy(tmp_path: Path):
+    radar = tmp_path / "radar.pth"
+    radar.write_bytes(b"radar")
+    manifest = cache_manifest(
+        split="val", frame_ids=["00001"], vod_root=tmp_path,
+        radar_variant="radar_20frames_verified_doppler_radial",
+        radar_encoder=radar, lidar_encoder=None, radius_m=1.6,
+        max_candidates=24, full_radar_gate=True)
+    assert manifest["support_policy"] == SUPPORT_POLICY
+    assert "gate_support_manifest_sha256" not in manifest
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    saved = {"radar_sha256": manifest["radar_initial_sha256"],
+             "radar_variant": manifest["radar_variant"],
+             "radius_m": 1.6, "meta_config": {"max_candidates": 24},
+             "support_policy": SUPPORT_POLICY}
+    dataset = SimpleNamespace(frames=[SimpleNamespace(frame_id="00001")])
+    assert _check_manifest(path, saved, dataset, "val", tmp_path,
+                           "radar_autoencoder") == manifest
