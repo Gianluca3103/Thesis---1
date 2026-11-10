@@ -17,6 +17,9 @@ The necessary radar adaptations are recorded in `upstream_radar_patch.diff`:
 - Unused THC declarations and deprecated tensor accessor names are removed
   only to compile the authors' CUDA kernels against the professor's newer
   PyTorch. These edits do not change kernel math.
+- An unused `open3d` import is removed from `models/utils.py`. That module's
+  `index_points` function needs only PyTorch and einops; Open3D appears only
+  in the import and is not used by training or evaluation.
 - The existing ≥12 distinct radar voxels within 1.6 m filtered cache supplies
   the *whole retained frame* as both input and target. No LiDAR is loaded.
   D-PCC's SemanticKITTI code instead operates on 12 m cubes; full frames are

@@ -20,7 +20,7 @@ def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
     source = Path(__file__).parents[2] / "dpcc-upstream" / "models"
     if not source.exists():
         return  # CI may not have the optional external source checkout.
-    for name in ("layer.py", "autoencoder.py"):
+    for name in ("layer.py", "autoencoder.py", "utils.py"):
         dest = tmp_path / "models" / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes((source / name).read_bytes())
@@ -41,6 +41,7 @@ def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
         tmp_path / "models/autoencoder.py").read_text()
     assert "#include <THC/THC.h>" not in (
         tmp_path / "models/pointops/src" / COMPAT_CPP[0]).read_text()
+    assert "import open3d" not in (tmp_path / "models/utils.py").read_text()
 
 
 def test_paper_config_except_radar_width():

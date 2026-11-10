@@ -38,25 +38,33 @@ def adapt(root: Path) -> dict:
         "models/layer.py": (
             "            self.out_fdim = 3\n",
             "            self.out_fdim = getattr(args, 'radar_attribute_dim', 3)\n",
+            "radar attribute width",
         ),
         "models/autoencoder.py": (
             "        return decompressed_xyzs, loss, loss_items, bpp\n",
             "        return decompressed_xyzs, pred_normals, loss, loss_items, bpp\n",
+            "expose decoded attributes for evaluation",
+        ),
+        "models/utils.py": (
+            "import open3d as o3d\n",
+            "",
+            "remove unused visualization-only Open3D import",
         ),
     }
     result = {"upstream_url": UPSTREAM_URL, "upstream_revision": actual,
               "changes": {}, "build_compatibility": []}
-    for relative, (old, new) in edits.items():
+    for relative, (old, new, description) in edits.items():
         path = root / relative
         source = path.read_text(encoding="utf-8")
         if source.count(old) == 1:
             path.write_text(source.replace(old, new), encoding="utf-8")
+        elif relative == "models/utils.py" and "import open3d as o3d" not in source:
+            pass
         elif source.count(new) != 1:
             raise RuntimeError(f"Unexpected upstream source: {path}")
         result["changes"][relative] = {
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "description": "radar attribute width" if relative.endswith("layer.py")
-                           else "expose decoded attributes for evaluation",
+            "description": description,
         }
     # PyTorch 2.5 removed the THC header and THCState declaration. These are
     # unused in upstream pointops; remove only those declarations, not kernels.
