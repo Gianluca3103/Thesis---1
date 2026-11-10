@@ -1,0 +1,81 @@
+"""Validate radar-only adaptations and metric parity with the earlier AE."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import torch
+
+from models.radar_lidar_crossmodal_v1.encoder import GRID
+from models.radar_lidar_crossmodal_v1.radar_self_autoencoder import reconstruction_counts as old_counts
+from models.radar_lidar_stage1.sparse import voxelize
+from scripts.official_dpcc_radar_data import RadarScale, reconstruction_counts, summarize_counts
+from scripts.patch_official_dpcc_radar import COMPAT_CPP, UPSTREAM_REV, adapt
+from scripts.train_radar_dpcc_official import ModelConfig
+
+
+def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
+    source = Path(__file__).parents[2] / "dpcc-upstream" / "models"
+    if not source.exists():
+        return  # CI may not have the optional external source checkout.
+    for name in ("layer.py", "autoencoder.py"):
+        dest = tmp_path / "models" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes((source / name).read_bytes())
+    for name in COMPAT_CPP:
+        dest = tmp_path / "models/pointops/src" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes((source / "pointops/src" / name).read_bytes())
+    dest = tmp_path / "models/Chamfer3D/chamfer3D.cu"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes((source / "Chamfer3D/chamfer3D.cu").read_bytes())
+    with patch("scripts.patch_official_dpcc_radar.subprocess.check_output",
+               return_value=UPSTREAM_REV):
+        first = adapt(tmp_path)
+        second = adapt(tmp_path)
+    assert first == second
+    assert "getattr(args, 'radar_attribute_dim', 3)" in (tmp_path / "models/layer.py").read_text()
+    assert "return decompressed_xyzs, pred_normals, loss" in (
+        tmp_path / "models/autoencoder.py").read_text()
+    assert "#include <THC/THC.h>" not in (
+        tmp_path / "models/pointops/src" / COMPAT_CPP[0]).read_text()
+
+
+def test_paper_config_except_radar_width():
+    c = ModelConfig()
+    assert c.in_fdim == 7 and c.radar_attribute_dim == 4
+    assert c.k == 16 and c.layer_num == 3 and c.dim == 8
+    assert c.downsample_rate == (1 / 3,) * 3
+    assert c.max_upsample_num == (8, 8, 8)
+    assert c.bpp_lambda == 1e-3 and c.chamfer_coe == 0.1
+    assert c.lr == 1e-3 and c.aux_lr == 1e-3
+
+
+def test_normalization_inverts_training_values():
+    scale = RadarScale([-30, -15, -10, 0], [50, 20, 10, 19])
+    points = torch.tensor([[1.2, -4.1, 0.8, 12, -2, 1, 8],
+                           [-20.0, 30.0, -1.4, -30, 20, -10, 19]], dtype=torch.float32)
+    restored = scale.decode(scale.encode(points))
+    assert torch.allclose(restored, points, atol=1e-5)
+
+
+def test_same_counts_as_previous_radar_evaluator():
+    target = np.array([[0.12, 0.04, 0.05, 10, 1, 1.1, 0],
+                       [0.42, 0.04, 0.05, 12, 2, 2.1, 1],
+                       [1.12, 0.04, 0.05, 14, 3, 3.1, 2]], dtype=np.float32)
+    predicted = np.array([[0.13, 0.05, 0.05, 9, 1.5, 1.1, 0],
+                          [0.45, 0.05, 0.05, 13, 2.5, 2.1, 1],
+                          [1.82, 0.05, 0.05, 14, 3, 3.1, 2]], dtype=np.float32)
+    pt = torch.from_numpy(predicted)
+    gt = torch.from_numpy(target)
+    voxels, _, _, _ = voxelize(pt[None], torch.ones((1, len(pt)), dtype=torch.bool), GRID)
+    old = old_counts(torch.cat((torch.zeros((len(pt), 1)), pt), 1), voxels,
+                     gt[None], torch.ones((1, len(gt)), dtype=torch.bool))
+    new = reconstruction_counts(predicted, target)
+    for key in old:
+        assert np.isclose(new[key], old[key]), (key, new[key], old[key])
+    summary = summarize_counts(new)
+    assert np.isclose(summary["voxel_iou"], new["voxel_tp"] / (
+        new["predicted_voxels"] + new["target_voxels"] - new["voxel_tp"]))
