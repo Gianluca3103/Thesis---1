@@ -108,13 +108,15 @@ class GenerativeBlock(nn.Module):
 class RawSparseConfidenceDecoder(nn.Module):
     """Decode to the original grid with learned local mixing at every scale."""
 
-    def __init__(self, config: StudentConfig):
+    def __init__(self, config: StudentConfig, *, output_channels: int = 1):
         super().__init__()
+        if output_channels < 1:
+            raise ValueError("Decoder output channels must be positive")
         widths = (config.feature_dim, *config.decoder_channels)
         self.blocks = nn.ModuleList(
             GenerativeBlock(widths[i], widths[i + 1], (64, 32, 16)[i])
             for i in range(3))
-        self.logits = nn.Linear(widths[-1], 1)
+        self.logits = nn.Linear(widths[-1], output_channels)
 
     def forward(self, bottleneck: SparseSites,
                 radar_pyramid: tuple[SparseSites, ...] | None = None):
@@ -125,7 +127,7 @@ class RawSparseConfidenceDecoder(nn.Module):
         if not len(bottleneck.coords):
             return SparseSites._from_validated(
                 bottleneck.coords.new_empty((0, 4)),
-                bottleneck.features.new_empty((0, 1)), GRID.shape_zyx, 1)
+                bottleneck.features.new_empty((0, self.logits.out_features)), GRID.shape_zyx, 1)
         # ME stores coordinates in the fine-grid convention at their tensor
         # stride. SparseSites stores compact coarse-cell indices instead.
         fine_coordinates = bottleneck.coords.int().clone()
