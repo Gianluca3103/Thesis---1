@@ -36,7 +36,11 @@ setup() {
   git -C "$UPSTREAM" diff > "$OUT/upstream_radar_patch.diff"
 
   if ! "$PY" -c 'import compressai, einops' >/dev/null 2>&1; then
-    "$PY" -m pip install --only-binary=:all: 'compressai==1.2.8' 'einops==0.3.2'
+    # Ubuntu 20.04 has glibc 2.31; the published 1.2.8 Linux wheel requires
+    # glibc 2.34. Build the pinned source distribution against this venv.
+    "$PY" -m pip install --no-cache-dir --no-binary=compressai \
+      --index-url "${DPCC_PYPI_INDEX:-https://pypi.org/simple}" \
+      'compressai==1.2.8' 'einops==0.3.2'
   fi
   if ! command -v nvcc >/dev/null 2>&1; then
     for root in /usr/local/cuda /usr/local/cuda-12.1 /usr/local/cuda-12.2; do

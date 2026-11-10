@@ -58,3 +58,8 @@ PyTorch 1.7.1, and CUDA 11.0; the professor machine uses newer PyTorch and an
 RTX 4090. The build-compatibility edits are explicit and recorded, but a
 successful smoke test on that machine is still required before assuming the
 upstream CUDA operators run correctly.
+
+On Ubuntu 20.04, the current CompressAI wheel cannot be installed because it
+requires glibc 2.34. The setup launcher therefore builds pinned CompressAI
+1.2.8 from its source distribution in the existing Python environment. It
+does not change the D-PCC model or its objective.

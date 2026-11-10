@@ -53,6 +53,13 @@ def test_paper_config_except_radar_width():
     assert c.lr == 1e-3 and c.aux_lr == 1e-3
 
 
+def test_professor_launcher_builds_compressai_from_source():
+    launcher = (Path(__file__).parents[1] / "scripts/run_radar_dpcc_official_professor.sh").read_text()
+    assert "--no-binary=compressai" in launcher
+    assert "--only-binary=:all:" not in launcher
+    assert "compressai==1.2.8" in launcher
+
+
 def test_normalization_inverts_training_values():
     scale = RadarScale([-30, -15, -10, 0], [50, 20, 10, 19])
     points = torch.tensor([[1.2, -4.1, 0.8, 12, -2, 1, 8],
