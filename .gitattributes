@@ -1,3 +1,4 @@
 scripts/run_radar_autoencoder_gate12_local.sh text eol=lf
 scripts/run_radar_autoencoder_gate12_professor_100ep.sh text eol=lf
 scripts/run_radar_autoencoder_prefilter_professor_100ep.sh text eol=lf
+scripts/run_radar_dpcc_professor.sh text eol=lf
