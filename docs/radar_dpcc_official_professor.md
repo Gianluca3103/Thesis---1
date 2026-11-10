@@ -59,6 +59,15 @@ RTX 4090. The build-compatibility edits are explicit and recorded, but a
 successful smoke test on that machine is still required before assuming the
 upstream CUDA operators run correctly.
 
+The professor machine currently has only the CUDA 11.8 toolkit, whereas its
+PyTorch was built for CUDA 12.1. The optional
+`scripts/install_cuda121_for_dpcc.sh` downloads NVIDIA's CUDA 12.1.1 runfile,
+checks the MD5 published by NVIDIA, and installs **toolkit only** into
+`$BASE/cuda-12.1` without changing the system driver or CUDA 11.8. It checks
+for 15 GiB free on the data drive first. Run this once before `setup`; setup
+then selects its `nvcc`. NVIDIA documents `--toolkitpath` and `--tmpdir` for a
+custom installation location and extraction directory.
+
 On Ubuntu 20.04, the current CompressAI wheel cannot be installed because it
 requires glibc 2.34. The setup launcher therefore builds pinned CompressAI
 1.2.8 from its source distribution in the existing Python environment. It

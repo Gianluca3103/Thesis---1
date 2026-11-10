@@ -60,6 +60,17 @@ def test_professor_launcher_builds_compressai_from_source():
     assert "compressai==1.2.8" in launcher
 
 
+def test_professor_launcher_selects_matching_cuda_and_installer_is_toolkit_only():
+    root = Path(__file__).parents[1] / "scripts"
+    launcher = (root / "run_radar_dpcc_official_professor.sh").read_text()
+    installer = (root / "install_cuda121_for_dpcc.sh").read_text()
+    assert '"$BASE/cuda-12.1"' in launcher
+    assert '"$version" == "$torch_cuda"' in launcher
+    assert "--toolkitpath=" in installer and "--tmpdir=" in installer
+    assert "--driver" not in installer and "sudo" not in installer.split("sh \"$INSTALLER\"")[1]
+    assert "2f0a4127bf797bf4eab0be2a547cb8d0" in installer
+
+
 def test_normalization_inverts_training_values():
     scale = RadarScale([-30, -15, -10, 0], [50, 20, 10, 19])
     points = torch.tensor([[1.2, -4.1, 0.8, 12, -2, 1, 8],

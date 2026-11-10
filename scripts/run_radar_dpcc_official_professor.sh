@@ -24,6 +24,43 @@ for required in "$PY" "$REPO/scripts/train_radar_dpcc_official.py" \
   [[ -s "$required" ]] || { echo "Missing: $required" >&2; exit 1; }
 done
 
+select_cuda_compiler() {
+  local torch_cuda root output version chosen="" fallback="" seen=""
+  local -a roots=("$BASE/cuda-12.1" /usr/local/cuda-12.1 /opt/cuda-12.1 \
+    /usr/local/cuda-12.2 /opt/cuda-12.2 \
+    "${CUDA_HOME:-}" /usr/local/cuda-12.* /opt/cuda-12.* /usr/local/cuda)
+  local -a path_nvcc=()
+  readarray -t path_nvcc < <(type -a -p nvcc 2>/dev/null || true)
+  for output in "${path_nvcc[@]}"; do
+    roots+=("$(dirname "$(dirname "$output")")")
+  done
+  torch_cuda=$("$PY" -c 'import torch; print(torch.version.cuda or "")')
+  [[ -n "$torch_cuda" ]] || { echo 'PyTorch has no CUDA build' >&2; exit 1; }
+  for root in "${roots[@]}"; do
+    [[ -n "$root" && -x "$root/bin/nvcc" ]] || continue
+    output=$("$root/bin/nvcc" --version)
+    [[ "$output" =~ release[[:space:]]+([0-9]+\.[0-9]+) ]] || continue
+    version=${BASH_REMATCH[1]}
+    seen+=" $root=$version"
+    if [[ "$version" == "$torch_cuda" ]]; then
+      chosen="$root"
+      break
+    fi
+    if [[ "${version%%.*}" == "${torch_cuda%%.*}" && -z "$fallback" ]]; then
+      fallback="$root"
+    fi
+  done
+  [[ -n "$chosen" ]] || chosen="$fallback"
+  if [[ -z "$chosen" ]]; then
+    echo "PyTorch needs CUDA $torch_cuda nvcc; found:${seen:- none}." >&2
+    echo 'Install CUDA Toolkit 12.1 (or another 12.x toolkit) alongside 11.8, then rerun setup.' >&2
+    exit 1
+  fi
+  export CUDA_HOME="$chosen" PATH="$chosen/bin:$PATH"
+  echo "Selected CUDA_HOME=$CUDA_HOME for PyTorch CUDA $torch_cuda"
+  "$CUDA_HOME/bin/nvcc" --version | tail -n 1
+}
+
 setup() {
   if [[ ! -d "$UPSTREAM/.git" ]]; then
     mkdir -p "$(dirname "$UPSTREAM")"
@@ -42,20 +79,8 @@ setup() {
       --index-url "${DPCC_PYPI_INDEX:-https://pypi.org/simple}" \
       'compressai==1.2.8' 'einops==0.3.2'
   fi
-  if ! command -v nvcc >/dev/null 2>&1; then
-    for root in /usr/local/cuda /usr/local/cuda-12.1 /usr/local/cuda-12.2; do
-      if [[ -x "$root/bin/nvcc" ]]; then
-        export CUDA_HOME="$root" PATH="$root/bin:$PATH"
-        break
-      fi
-    done
-  fi
-  command -v nvcc >/dev/null 2>&1 || {
-    echo 'CUDA toolkit nvcc is required to compile original D-PCC CUDA operators.' >&2
-    exit 1
-  }
+  select_cuda_compiler
   echo "PyTorch: $("$PY" -c 'import torch; print(torch.__version__, torch.version.cuda)')"
-  echo "nvcc: $(nvcc --version | tail -n 1)"
   if ! compgen -G "$UPSTREAM/models/pointops/pointops_cuda*.so" >/dev/null; then
     (cd "$UPSTREAM/models/pointops" && "$PY" setup.py build_ext --inplace)
   fi
