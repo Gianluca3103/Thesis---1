@@ -79,6 +79,7 @@ def _summarize_frames(model, frames: FilteredFrames, scale: RadarScale,
         raw = frames.load(i)
         inp = scale.encode(raw).T.contiguous()[None].to(device)
         with torch.no_grad():
+            reset_encoder_neighbors(model)
             xyz, attrs, loss, terms, _ = model(inp)
         predicted = scale.decode(torch.cat((xyz[0].T, attrs[0].T), 1)).cpu().numpy()
         measured = reconstruction_counts(predicted, raw.numpy())
@@ -91,6 +92,17 @@ def _summarize_frames(model, frames: FilteredFrames, scale: RadarScale,
     result.update({key: value / len(frames) for key, value in losses.items()})
     result["frames"] = len(frames)
     return result
+
+
+def reset_encoder_neighbors(model) -> None:
+    """Undo upstream's persistent k reduction after processing a small frame.
+
+    DownsampleLayer.forward assigns `self.k = min(self.k, N)`. Without this
+    reset, one sparse frame permanently changes all later frames' receptive
+    fields. Each frame still uses the upstream adaptive k=min(16,N).
+    """
+    for layer in model.encoder.encoder_layers:
+        layer.k = model.args.k
 
 
 def _atomic_save(path: Path, payload: dict) -> None:
@@ -206,6 +218,7 @@ def main() -> None:
         for i in tqdm(indices, desc=f"Official D-PCC train {number:03d}",
                       unit="frame", dynamic_ncols=True):
             inp = scale.encode(train.load(i)).T.contiguous()[None].to(device)
+            reset_encoder_neighbors(model)
             _, _, loss, terms, _ = model(inp)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

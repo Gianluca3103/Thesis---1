@@ -20,7 +20,10 @@ from scipy.spatial import cKDTree
 GRID_MIN = np.array((-51.2, -51.2, -2.0), dtype=np.float64)
 GRID_MAX = np.array((51.2, 51.2, 2.0), dtype=np.float64)
 GRID_SIZE = np.array((0.2, 0.2, 0.25), dtype=np.float64)
-MIN_INPUT_POINTS = 432  # 16-neighbor search after three 1/3 downsamplings
+# The original DownsampleLayer reduces N to round(N/3) three times. It also
+# lowers its own k when fewer than 16 neighbors exist. N=14 -> 5 -> 2 -> 1;
+# N=13 -> 4 -> 1 -> 0, which the CUDA model cannot process.
+MIN_INPUT_POINTS = 14
 ATTR_NAMES = ("rcs", "radial", "compensated_radial", "scan_age")
 FILTER_VERSION = "filtered_radar_self_reconstruction_v1"
 
@@ -55,7 +58,7 @@ class FilteredFrames:
                 or points.shape[1] != 7 or not torch.isfinite(points).all()):
             raise ValueError(f"Invalid filtered radar frame {frame_id}")
         if len(points) < MIN_INPUT_POINTS:
-            raise ValueError(f"D-PCC requires >= {MIN_INPUT_POINTS} input points; "
+            raise ValueError(f"Three upstream D-PCC downsamplings require >= {MIN_INPUT_POINTS} input points; "
                              f"{frame_id} has {len(points)}. No points are synthesized or skipped.")
         return points.float()
 

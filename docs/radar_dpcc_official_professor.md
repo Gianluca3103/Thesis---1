@@ -24,6 +24,14 @@ The necessary radar adaptations are recorded in `upstream_radar_patch.diff`:
   the *whole retained frame* as both input and target. No LiDAR is loaded.
   D-PCC's SemanticKITTI code instead operates on 12 m cubes; full frames are
   required here by the experiment and may use substantially more memory.
+- The original encoder reduces point count by one third at each of three
+  stages and lowers the neighbor count for small frames. The adapter accepts
+  the 46-return frame seen in this dataset. It requires at least 14 returns,
+  the smallest count that leaves one point after all three reductions.
+- Upstream `DownsampleLayer` mutates its neighbor count when processing a
+  small frame. The wrapper resets it to 16 before each frame, so a sparse
+  frame does not permanently reduce the receptive field of later frames.
+  Within each frame the original `min(k, N)` behavior is retained.
 - Whole-grid XYZ and training-split attribute min/max are mapped to the
   authors' expected `[-1,1]` range. The inverse is used before metric scoring.
   This is a modality-specific data transform, so the run is not an identical
