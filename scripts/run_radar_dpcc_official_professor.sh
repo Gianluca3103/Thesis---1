@@ -102,7 +102,7 @@ smoke() {
   ready
   "$PY" -u -m scripts.train_radar_dpcc_official \
     --filtered-root "$FILTERED" --output-root "$OUT/smoke" \
-    --epochs 1 --train-limit 1 --val-limit 1 \
+    --epochs 1 --first-usable-smoke \
     2>&1 | tee "$OUT/smoke.log"
 }
 

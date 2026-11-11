@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-import pytest
 import torch
 
 from models.radar_lidar_crossmodal_v1.encoder import GRID
@@ -19,7 +18,8 @@ from scripts.official_dpcc_radar_data import (FILTER_VERSION, GRID_MAX, GRID_MIN
                                               FilteredFrames, RadarScale,
                                               reconstruction_counts, summarize_counts)
 from scripts.patch_official_dpcc_radar import COMPAT_CPP, UPSTREAM_REV, adapt
-from scripts.train_radar_dpcc_official import ModelConfig, reset_encoder_neighbors
+from scripts.train_radar_dpcc_official import (ModelConfig, _summarize_frames,
+                                                reset_encoder_neighbors)
 
 
 def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
@@ -105,8 +105,57 @@ def test_small_nonempty_filtered_frame_is_not_rejected(tmp_path: Path):
     assert frames.load(0).shape == (46, 7)
     torch.save({"version": FILTER_VERSION, "frame_id": "00544",
                 "points": torch.ones((13, 7))}, path)
-    with pytest.raises(ValueError, match="require >= 14"):
-        frames.load(0)
+    assert frames.load(0).shape == (13, 7)
+    torch.save({"version": FILTER_VERSION, "frame_id": "00544",
+                "points": torch.empty((0, 7))}, path)
+    assert frames.load(0).shape == (0, 7)
+
+
+def test_empty_and_tiny_frames_are_counted_but_not_forwarded(tmp_path: Path):
+    root = tmp_path / "val"
+    root.mkdir()
+    ids = ["00000", "00001", "00002"]
+    manifest = {"version": FILTER_VERSION, "split": "val", "frame_ids": ids,
+                "min_distinct_radar_voxels": 12, "radius_m": 1.6,
+                "grid_minimum_xyz": GRID_MIN.tolist(),
+                "grid_maximum_xyz": GRID_MAX.tolist(),
+                "grid_size_xyz": GRID_SIZE.tolist()}
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    for frame_id, count in zip(ids, (0, 13, 46)):
+        points = torch.zeros((count, 7))
+        points[:, 0] = torch.arange(count) * 0.2
+        torch.save({"version": FILTER_VERSION, "frame_id": frame_id,
+                    "points": points}, root / f"{frame_id}.pt")
+    frames = FilteredFrames(tmp_path, "val")
+
+    class Model:
+        args = SimpleNamespace(k=16)
+        encoder = SimpleNamespace(encoder_layers=[])
+
+        def eval(self):
+            return self
+
+        def __call__(self, inp):
+            assert inp.shape[-1] == 46
+            xyz = inp[:, :3]
+            attrs = inp[:, 3:]
+            terms = {key: 0.0 for key in (
+                "chamfer_loss", "density_loss", "pts_num_loss",
+                "latent_xyzs_loss", "normal_loss", "bpp_loss")}
+            return xyz, attrs, torch.tensor(0.0), terms, None
+
+    result = _summarize_frames(Model(), frames,
+                               RadarScale([-1] * 4, [1] * 4),
+                               torch.device("cpu"), "test")
+    assert result["frames"] == 3
+    assert result["model_forward_frames"] == 1
+    assert result["empty_input_frames"] == 1
+    assert result["too_small_input_frames"] == 1
+    assert result["target_points"] == 59
+    assert result["predicted_points"] == 46
+    assert result["total_loss"] == 0.0
+    frames.retain_first_model_usable()
+    assert frames.ids == ["00002"]
 
 
 def test_small_frame_does_not_permanently_shrink_neighbor_count():

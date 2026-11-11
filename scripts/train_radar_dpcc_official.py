@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 
 from scripts.official_dpcc_radar_data import (ATTR_NAMES, FilteredFrames,
-                                              RadarScale, reconstruction_counts,
+                                              MIN_INPUT_POINTS, RadarScale, reconstruction_counts,
                                               summarize_counts)
 
 
@@ -75,12 +75,21 @@ def _summarize_frames(model, frames: FilteredFrames, scale: RadarScale,
     counts.update({f"{name}_abs_sum": 0.0 for name in ATTR_NAMES})
     losses = {key: 0.0 for key in LOSS_KEYS}
     losses["total_loss"] = 0.0
+    forwarded = empty = too_small = 0
     for i in tqdm(range(len(frames)), desc=title, unit="frame", dynamic_ncols=True):
         raw = frames.load(i)
+        if len(raw) < MIN_INPUT_POINTS:
+            empty += len(raw) == 0
+            too_small += len(raw) > 0
+            measured = reconstruction_counts(np.empty((0, 7)), raw.numpy())
+            for key in counts:
+                counts[key] += measured[key]
+            continue
         inp = scale.encode(raw).T.contiguous()[None].to(device)
         with torch.no_grad():
             reset_encoder_neighbors(model)
             xyz, attrs, loss, terms, _ = model(inp)
+        forwarded += 1
         predicted = scale.decode(torch.cat((xyz[0].T, attrs[0].T), 1)).cpu().numpy()
         measured = reconstruction_counts(predicted, raw.numpy())
         for key in counts:
@@ -89,8 +98,12 @@ def _summarize_frames(model, frames: FilteredFrames, scale: RadarScale,
         for key in LOSS_KEYS:
             losses[key] += terms[key]
     result = summarize_counts(counts)
-    result.update({key: value / len(frames) for key, value in losses.items()})
+    result.update({key: value / forwarded if forwarded else None
+                   for key, value in losses.items()})
     result["frames"] = len(frames)
+    result["model_forward_frames"] = forwarded
+    result["empty_input_frames"] = empty
+    result["too_small_input_frames"] = too_small
     return result
 
 
@@ -137,6 +150,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
+    parser.add_argument("--first-usable-smoke", action="store_true")
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--report-json", type=Path)
@@ -177,6 +191,9 @@ def main() -> None:
 
     train = FilteredFrames(args.filtered_root, "train", args.train_limit)
     val = FilteredFrames(args.filtered_root, "val", args.val_limit)
+    if args.first_usable_smoke:
+        train.retain_first_model_usable()
+        val.retain_first_model_usable()
     args.output_root.mkdir(parents=True, exist_ok=True)
     last_path = args.output_root / "last.ckpt"
     if last_path.is_file():
@@ -214,12 +231,19 @@ def main() -> None:
         model.train()
         training = {key: 0.0 for key in LOSS_KEYS}
         training["total_loss"] = training["aux_loss"] = 0.0
+        trained = empty = too_small = 0
         indices = torch.randperm(len(train)).tolist()
         for i in tqdm(indices, desc=f"Official D-PCC train {number:03d}",
                       unit="frame", dynamic_ncols=True):
-            inp = scale.encode(train.load(i)).T.contiguous()[None].to(device)
+            raw = train.load(i)
+            if len(raw) < MIN_INPUT_POINTS:
+                empty += len(raw) == 0
+                too_small += len(raw) > 0
+                continue
+            inp = scale.encode(raw).T.contiguous()[None].to(device)
             reset_encoder_neighbors(model)
             _, _, loss, terms, _ = model(inp)
+            trained += 1
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -231,8 +255,12 @@ def main() -> None:
             training["aux_loss"] += float(aux_loss.detach())
             for key in LOSS_KEYS:
                 training[key] += terms[key]
+        if not trained:
+            raise ValueError(f"No training frames have at least {MIN_INPUT_POINTS} filtered radar returns")
         scheduler.step()
-        training = {key: value / len(train) for key, value in training.items()}
+        training = {key: value / trained for key, value in training.items()}
+        training.update({"frames": len(train), "model_forward_frames": trained,
+                         "empty_input_frames": empty, "too_small_input_frames": too_small})
         validation = _summarize_frames(model, val, scale, device,
                                        f"Official D-PCC val {number:03d}")
         row = {"epoch": number, "train": training, "val": validation}
@@ -255,12 +283,18 @@ def main() -> None:
             _atomic_save(args.output_root / "best_voxel_iou.ckpt", saved)
         if new_best_chamfer:
             _atomic_save(args.output_root / "best_chamfer.ckpt", saved)
+        val_loss = (f"{validation['total_loss']:.6f}" if validation['total_loss'] is not None
+                    else "n/a")
+        val_chamfer = (f"{validation['chamfer_squared_m2']:.6f}m2"
+                       if validation['chamfer_squared_m2'] is not None else "n/a")
         print(f"Epoch {number:03d}: train_loss={training['total_loss']:.6f} "
-              f"val_loss={validation['total_loss']:.6f} "
+              f"val_loss={val_loss} "
               f"val_voxel_IoU={validation['voxel_iou']:.2%} "
               f"val_point_F1@0.2m={validation['point_f1_0p2m']:.2%} "
-              f"val_Chamfer={validation['chamfer_squared_m2']:.6f}m2 "
-              f"best_IoU={best_iou:.2%}", flush=True)
+              f"val_Chamfer={val_chamfer} "
+              f"best_IoU={best_iou:.2%} "
+              f"train_usable={trained}/{len(train)} "
+              f"val_usable={validation['model_forward_frames']}/{len(val)}", flush=True)
 
 
 if __name__ == "__main__":

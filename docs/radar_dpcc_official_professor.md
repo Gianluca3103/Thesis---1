@@ -32,6 +32,13 @@ The necessary radar adaptations are recorded in `upstream_radar_patch.diff`:
   small frame. The wrapper resets it to 16 before each frame, so a sparse
   frame does not permanently reduce the receptive field of later frames.
   Within each frame the original `min(k, N)` behavior is retained.
+- Some frames become empty after the ≥12/1.6 m filter. Frames with fewer than
+  14 returns cannot pass through the original three-stage encoder. They are
+  counted explicitly: training obtains no gradient from them; evaluation
+  produces no points and includes any real target returns as missed returns.
+  Reports state the number of empty and too-small frames and average model
+  loss only over frames that actually ran. The smoke test chooses real,
+  model-usable train and validation frames without creating points.
 - Whole-grid XYZ and training-split attribute min/max are mapped to the
   authors' expected `[-1,1]` range. The inverse is used before metric scoring.
   This is a modality-specific data transform, so the run is not an identical

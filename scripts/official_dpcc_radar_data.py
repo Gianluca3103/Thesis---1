@@ -49,6 +49,15 @@ class FilteredFrames:
     def __len__(self) -> int:
         return len(self.ids)
 
+    def retain_first_model_usable(self) -> None:
+        """Choose one real frame for smoke testing, without altering its points."""
+        for i in range(len(self)):
+            if len(self.load(i)) >= MIN_INPUT_POINTS:
+                self.ids = [self.ids[i]]
+                return
+        raise ValueError(f"No {self.manifest['split']} frame has at least "
+                         f"{MIN_INPUT_POINTS} filtered radar returns")
+
     def load(self, index: int) -> torch.Tensor:
         frame_id = self.ids[index]
         row = torch.load(self.root / f"{frame_id}.pt", map_location="cpu", weights_only=True)
@@ -57,9 +66,6 @@ class FilteredFrames:
                 or not isinstance(points, torch.Tensor) or points.ndim != 2
                 or points.shape[1] != 7 or not torch.isfinite(points).all()):
             raise ValueError(f"Invalid filtered radar frame {frame_id}")
-        if len(points) < MIN_INPUT_POINTS:
-            raise ValueError(f"Three upstream D-PCC downsamplings require >= {MIN_INPUT_POINTS} input points; "
-                             f"{frame_id} has {len(points)}. No points are synthesized or skipped.")
         return points.float()
 
     def sha256(self) -> str:
@@ -83,8 +89,12 @@ class RadarScale:
         maximum = torch.full((4,), float("-inf"))
         for i in range(len(frames)):
             attrs = frames.load(i)[:, 3:]
+            if not len(attrs):
+                continue
             minimum = torch.minimum(minimum, attrs.amin(0))
             maximum = torch.maximum(maximum, attrs.amax(0))
+        if not torch.isfinite(minimum).all():
+            raise ValueError("Cannot fit radar attribute scale: all training frames are empty")
         maximum = torch.maximum(maximum, minimum + 1e-6)
         return cls(minimum.tolist(), maximum.tolist())
 
