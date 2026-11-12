@@ -19,10 +19,14 @@ export MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.9
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 for required in "$PY" "$REPO/scripts/train_radar_dpcc_official.py" \
-  "$REPO/scripts/official_dpcc_radar_data.py" \
-  "$FILTERED/train/manifest.json" "$FILTERED/val/manifest.json"; do
+  "$REPO/scripts/official_dpcc_radar_data.py"; do
   [[ -s "$required" ]] || { echo "Missing: $required" >&2; exit 1; }
 done
+if [[ "$PHASE" != setup ]]; then
+  for required in "$FILTERED/train/manifest.json" "$FILTERED/val/manifest.json"; do
+    [[ -s "$required" ]] || { echo "Missing: $required" >&2; exit 1; }
+  done
+fi
 
 select_cuda_compiler() {
   local torch_cuda root output version chosen="" fallback="" seen=""
