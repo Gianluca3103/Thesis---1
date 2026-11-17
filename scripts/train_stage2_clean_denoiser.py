@@ -71,7 +71,8 @@ class _CleanRows:
     def __init__(self, dataset, cache: RadarSupportCache, limit: int | None,
                  faulty_root: Path | None = None, split: str | None = None,
                  *, include_full_clean: bool = False,
-                 fault_regions: FaultRegionCache | None = None):
+                 fault_regions: FaultRegionCache | None = None,
+                 radar_features=None):
         self.dataset = dataset
         self.cache = cache
         self.limit = len(dataset) if limit is None else min(len(dataset), limit)
@@ -79,6 +80,7 @@ class _CleanRows:
         self.split = split
         self.include_full_clean = include_full_clean
         self.fault_regions = fault_regions
+        self.radar_features = radar_features
 
     def __len__(self) -> int:
         return self.limit
@@ -99,6 +101,10 @@ class _CleanRows:
                            "faulty_xyz": load_faulty(
                                self.faulty_root, self.split, row["frame_id"]),
                            "support_mask": mask})
+        if self.radar_features is not None:
+            xyz, features = self.radar_features.get(row["frame_id"])
+            result.update({"learned_radar_xyz": xyz,
+                           "learned_radar_features": features})
         return result
 
 
@@ -148,6 +154,11 @@ def _conditioned_inputs(model: SparseResidualStage2, rows: list[dict],
             output = geometry_gate_output(
                 radar, faulty[:0], {"kind": "full_scan"},
                 row["support_mask"], MIN_RADAR_VOXELS)
+        if "learned_radar_features" in row:
+            output["conditioning_xyz"] = row["learned_radar_xyz"].to(
+                device, non_blocking=True)
+            output["conditioning_features"] = row["learned_radar_features"].to(
+                device, non_blocking=True)
         with torch.set_grad_enabled(train_radar_adapter):
             condition = model.conditions(output, 0.5)
         frame_coarse = coarse[coarse[:, 0] == frame][:, 1:]

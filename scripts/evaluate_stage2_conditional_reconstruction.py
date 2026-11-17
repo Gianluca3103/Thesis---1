@@ -474,6 +474,7 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--fault-region-root", type=Path)
+    parser.add_argument("--radar-feature-root", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
@@ -501,7 +502,8 @@ def main() -> None:
     val_loader, val_ids, val_manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, "val", identity, args.num_workers, args.val_limit,
-        fault_region_root=args.fault_region_root)
+        fault_region_root=args.fault_region_root,
+        radar_feature_root=args.radar_feature_root)
     sweep_report, role = sweep(
         model, val_loader, val_ids, args.data_cache_root, alpha_bars,
         device=args.device, seed=args.seed, steps=args.steps,
@@ -521,7 +523,8 @@ def main() -> None:
     test_loader, test_ids, test_manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, "test", identity, args.num_workers, args.test_limit,
-        fault_region_root=args.fault_region_root)
+        fault_region_root=args.fault_region_root,
+        radar_feature_root=args.radar_feature_root)
     if set(val_ids) & set(test_ids):
         raise ValueError("Official test and validation frames overlap")
     test = selected_metrics(
@@ -536,6 +539,8 @@ def main() -> None:
               "oracle_clean_latent": False,
               "addition_head": "disabled_pending_training_on_generated_latents",
               "prediction_inputs": ["faulty_LiDAR", "measured_radar",
+                                    *(["frozen_pointnetpp_radar_features"]
+                                      if args.radar_feature_root else []),
                                     "radar_geometry_gate", "Gaussian_noise"],
               "clean_LiDAR_role": "metric_reference_only",
               "oracle_injector_fault_gate": args.fault_region_root is not None,

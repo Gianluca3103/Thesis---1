@@ -11,6 +11,8 @@ RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
 SUPPORT=${SUPPORT:-$DATA/radar_support12vox_1p6m_mild_fog2_20261107}
 MILD=${MILD:-$DATA/stage2_mild_fog2_20frame_20261101}
 FAULT_REGIONS=${FAULT_REGIONS:-}
+RADAR_FEATURES=${RADAR_FEATURES:-}
+RADAR_ENCODER=${RADAR_ENCODER:-}
 if [[ ${BCE:-0} != 0 ]]; then
   printf 'The one-step BCE trial was removed; use GENERATED_BCE=1\n' >&2
   exit 1
@@ -38,6 +40,11 @@ if (( DECODER_LOSS + GENERATED_BCE + FIXED_VAL_ONLY > 1 )); then
 fi
 if [[ ( "$DECODER_LOSS" == 1 || "$GENERATED_BCE" == 1 ) && -z "$FAULT_REGIONS" ]]; then
   printf 'Generated decoder supervision requires FAULT_REGIONS\n' >&2; exit 1
+fi
+if [[ -n "$RADAR_FEATURES" || -n "$RADAR_ENCODER" ]]; then
+  [[ -n "$RADAR_FEATURES" && -n "$RADAR_ENCODER" && "$GENERATED_BCE" == 1 ]] || {
+    printf 'Learned radar conditioning requires RADAR_FEATURES, RADAR_ENCODER and GENERATED_BCE=1\n' >&2; exit 1;
+  }
 fi
 if [[ -n "$INIT" && "$DECODER_LOSS" != 1 ]]; then
   printf 'INIT requires DECODER_LOSS=1\n' >&2; exit 1
@@ -89,6 +96,19 @@ for required in "$PY" "$LPCR" \
   "$MILD/val/manifest.json" "$MILD/test/manifest.json"; do
   [[ -s "$required" ]] || { printf 'Missing required file: %s\n' "$required" >&2; exit 1; }
 done
+radar_feature_arg=()
+radar_eval_arg=()
+if [[ -n "$RADAR_FEATURES" ]]; then
+  for required in "$RADAR_ENCODER" \
+    "$RADAR_FEATURES/train/manifest.json" \
+    "$RADAR_FEATURES/val/manifest.json" \
+    "$RADAR_FEATURES/test/manifest.json"; do
+    [[ -s "$required" ]] || { printf 'Missing learned radar file: %s\n' "$required" >&2; exit 1; }
+  done
+  radar_feature_arg=(--radar-feature-root "$RADAR_FEATURES"
+                     --radar-encoder-checkpoint "$RADAR_ENCODER")
+  radar_eval_arg=(--radar-feature-root "$RADAR_FEATURES")
+fi
 if [[ -n "$INIT" && ! -s "$INIT" ]]; then
   printf 'Missing initialization checkpoint: %s\n' "$INIT" >&2; exit 1
 fi
@@ -139,6 +159,7 @@ fi
 common=(--vod-root "$VOD" --data-cache-root "$RAW"
   --support-cache-root "$SUPPORT" --faulty-root "$MILD"
   "${region_arg[@]}" "${decoder_arg[@]}" "${bce_arg[@]}" "${fixed_val_arg[@]}"
+  "${radar_feature_arg[@]}"
   --lpcr-checkpoint "$LPCR" --batch-size "$BATCH_SIZE"
   --num-workers "$WORKERS" --device cuda)
 
@@ -180,6 +201,7 @@ printf 'Sweeping thresholds once on the best validation-IoU checkpoint, then sco
   --vod-root "$VOD" --data-cache-root "$RAW" \
   --support-cache-root "$SUPPORT" --faulty-root "$MILD" \
   "${region_arg[@]}" \
+  "${radar_eval_arg[@]}" \
   --lpcr-checkpoint "$LPCR" --checkpoint "$OUT/best_iou.ckpt" \
   --steps "$VAL_STEPS" --num-workers "$WORKERS" --device cuda \
   --output-json "$OUT/best_full_noise_${VAL_STEPS}steps_val_test.json" \

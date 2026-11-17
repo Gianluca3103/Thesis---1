@@ -37,6 +37,8 @@ def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
     dest = tmp_path / "models/Chamfer3D/chamfer3D.cu"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes((source / "Chamfer3D/chamfer3D.cu").read_bytes())
+    dest = tmp_path / "models/Chamfer3D/dist_chamfer_3D.py"
+    dest.write_bytes((source / "Chamfer3D/dist_chamfer_3D.py").read_bytes())
     with patch("scripts.patch_official_dpcc_radar.subprocess.check_output",
                return_value=UPSTREAM_REV):
         first = adapt(tmp_path)
@@ -48,6 +50,9 @@ def test_pinned_upstream_changes_only_radar_channels(tmp_path: Path):
     assert "#include <THC/THC.h>" not in (
         tmp_path / "models/pointops/src" / COMPAT_CPP[0]).read_text()
     assert "import open3d" not in (tmp_path / "models/utils.py").read_text()
+    chamfer_loader = (tmp_path / "models/Chamfer3D/dist_chamfer_3D.py").read_text()
+    assert 'importlib.util.find_spec("chamfer_3D")' in chamfer_loader
+    assert "importlib.find_loader" not in chamfer_loader
 
 
 def test_paper_config_except_radar_width():
@@ -184,3 +189,25 @@ def test_same_counts_as_previous_radar_evaluator():
     summary = summarize_counts(new)
     assert np.isclose(summary["voxel_iou"], new["voxel_tp"] / (
         new["predicted_voxels"] + new["target_voxels"] - new["voxel_tp"]))
+
+
+def test_tolerant_voxel_iou_matches_occupied_centers_one_to_one():
+    target = np.array([[0.05, 0.05, 0.05, 0, 0, 0, 0]])
+    adjacent = np.array([[0.25, 0.05, 0.05, 0, 0, 0, 0]])
+    exact = reconstruction_counts(adjacent, target, include_voxel_iou_0p2m=True)
+    assert exact["voxel_tp"] == 0
+    assert exact["voxel_tp_0p2m"] == 1
+    assert summarize_counts(exact)["voxel_iou_0p2m"] == 1.0
+
+    two_predictions = np.vstack((adjacent,
+                                 [-0.15, 0.05, 0.05, 0, 0, 0, 0]))
+    matched = reconstruction_counts(two_predictions, target,
+                                    include_voxel_iou_0p2m=True)
+    assert matched["voxel_tp_0p2m"] == 1
+    assert summarize_counts(matched)["voxel_iou_0p2m"] == 0.5
+
+    empty = np.empty((0, 7))
+    assert summarize_counts(reconstruction_counts(
+        empty, empty, include_voxel_iou_0p2m=True))["voxel_iou_0p2m"] == 1.0
+    assert summarize_counts(reconstruction_counts(
+        empty, target, include_voxel_iou_0p2m=True))["voxel_iou_0p2m"] == 0.0

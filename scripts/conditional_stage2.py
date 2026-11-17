@@ -35,6 +35,8 @@ CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION = (
     "stage2_conditioned_generated_decoder_occupancy_fault_only_v1")
 CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION = (
     "stage2_conditioned_generated_standard_bce_fault_only_v1")
+CONDITIONED_POINTNETPP_BCE_REVISION = (
+    "stage2_conditioned_pointnetpp1024_generated_bce_fault_only_v1")
 CONDITIONED_FAULTY_START_REVISION = "stage2_conditioned_faulty_start_clean_target_v1"
 CONDITIONED_FAULT_ONLY_REVISION = "stage2_conditioned_faulty_start_fault_only_gate_v1"
 
@@ -43,12 +45,14 @@ class DeploymentRows:
     """Supply radar gate, measured radar, and faulty LiDAR; no clean points."""
 
     def __init__(self, dataset, support: RadarSupportCache, faulty_root: Path,
-                 split: str, fault_regions: FaultRegionCache | None = None):
+                 split: str, fault_regions: FaultRegionCache | None = None,
+                 radar_features=None):
         self.dataset = dataset
         self.support = support
         self.faulty_root = faulty_root
         self.split = split
         self.fault_regions = fault_regions
+        self.radar_features = radar_features
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -60,7 +64,7 @@ class DeploymentRows:
         radar_supported_cells = int(mask.sum())
         if self.fault_regions is not None:
             mask = fault_only_support(mask, self.fault_regions.get(frame_id))
-        return {"frame_id": frame_id,
+        result = {"frame_id": frame_id,
                 "fine_zyx": supported_coordinates(mask),
                 "support_mask": mask,
                 "radar_supported_cells": radar_supported_cells,
@@ -68,6 +72,11 @@ class DeploymentRows:
                 "radar": item["radar"],
                 "faulty_xyz": load_faulty(
                     self.faulty_root, self.split, frame_id)}
+        if self.radar_features is not None:
+            xyz, features = self.radar_features.get(frame_id)
+            result.update({"learned_radar_xyz": xyz,
+                           "learned_radar_features": features})
+        return result
 
 
 def load_model(lpcr_path: Path, checkpoint: Path, device: str):
@@ -80,6 +89,7 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
              CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
              CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
              CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION,
+             CONDITIONED_POINTNETPP_BCE_REVISION,
              CONDITIONED_FAULTY_START_REVISION,
              CONDITIONED_FAULT_ONLY_REVISION) or
             identity.get("lpcr_sha256") != sha256(lpcr_path)):
@@ -90,9 +100,15 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
             pretrained.get("phase") != "lpcr" or
             not pretrained.get("lpcr_full_region")):
         raise ValueError("Expected the frozen full-region LPCR checkpoint")
-    model = SparseResidualStage2(diffusion_target="epsilon").to(device)
-    missing, unexpected = model.load_state_dict(pretrained["model"], strict=False)
-    if unexpected or any(not key.startswith("addition_head.") for key in missing):
+    learned = identity.get("revision") == CONDITIONED_POINTNETPP_BCE_REVISION
+    model = SparseResidualStage2(
+        diffusion_target="epsilon",
+        radar_feature_channels=1024 if learned else 64).to(device)
+    pretrained_model = {key: value for key, value in pretrained["model"].items()
+                        if not learned or not key.startswith("radar_adapter.")}
+    missing, unexpected = model.load_state_dict(pretrained_model, strict=False)
+    allowed_missing = ("addition_head.", "radar_adapter.") if learned else ("addition_head.",)
+    if unexpected or any(not key.startswith(allowed_missing) for key in missing):
         raise ValueError("LPCR checkpoint differs from Stage II architecture")
     model.diffusion.load_state_dict(saved["diffusion"])
     model.radar_adapter.load_state_dict(saved["radar_adapter"])
@@ -103,7 +119,8 @@ def load_model(lpcr_path: Path, checkpoint: Path, device: str):
 def deployment_loader(vod_root: Path, raw_root: Path, support_root: Path,
                       faulty_root: Path, split: str, identity: dict,
                       num_workers: int, limit: int | None = None,
-                      fault_region_root: Path | None = None):
+                      fault_region_root: Path | None = None,
+                      radar_feature_root: Path | None = None):
     if identity.get("fault_region_policy") == POLICY and fault_region_root is None:
         raise ValueError("Checkpoint requires the injector fault-region cache")
     if (identity.get("fault_region_policy") not in (None, POLICY) or
@@ -113,6 +130,8 @@ def deployment_loader(vod_root: Path, raw_root: Path, support_root: Path,
               CONDITIONED_FRESH_FAULT_ONLY_BCE_REVISION,
               CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
               CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION) and
+             identity.get("fault_region_policy") != POLICY) or
+            (identity.get("revision") == CONDITIONED_POINTNETPP_BCE_REVISION and
              identity.get("fault_region_policy") != POLICY)):
         raise ValueError("Unknown or incomplete fault-region gate policy")
     if split in ("train", "val"):
@@ -152,7 +171,21 @@ def deployment_loader(vod_root: Path, raw_root: Path, support_root: Path,
                     "assignment_policy", "partial_loss_policy"):
             if manifest.get(key) != training.get(key):
                 raise ValueError(f"Test mild-fault policy differs: {key}")
-    rows = DeploymentRows(dataset, support, faulty_root, split, regions)
+    radar_features = None
+    if identity.get("revision") == CONDITIONED_POINTNETPP_BCE_REVISION:
+        if radar_feature_root is None:
+            raise ValueError("PointNet++ checkpoint requires --radar-feature-root")
+        from scripts.cache_pointnetpp_stage2_features import RadarFeatureCache
+        radar_features = RadarFeatureCache(
+            radar_feature_root, split, identity["radar_encoder_sha256"])
+        if radar_features.manifest["frame_ids"] != ids:
+            raise ValueError(f"{split} PointNet++ radar feature frames differ")
+        if (split in ("train", "val") and
+                identity["radar_feature_manifest_sha256"][split] !=
+                sha256(radar_features.manifest_path)):
+            raise ValueError(f"{split} PointNet++ features differ from checkpoint")
+    rows = DeploymentRows(dataset, support, faulty_root, split, regions,
+                          radar_features)
     if limit is not None:
         if limit < 1:
             raise ValueError("Frame limit must be positive")

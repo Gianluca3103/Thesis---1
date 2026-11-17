@@ -384,7 +384,8 @@ class AdditionHead(nn.Module):
 
 class SparseResidualStage2(nn.Module):
     def __init__(self, grid: Stage2Grid = GRID,
-                 *, diffusion_target: str = "residual"):
+                 *, diffusion_target: str = "residual",
+                 radar_feature_channels: int = 64):
         super().__init__()
         if diffusion_target not in ("residual", "epsilon"):
             raise ValueError("Diffusion target must be residual or epsilon")
@@ -394,7 +395,10 @@ class SparseResidualStage2(nn.Module):
         self.lpcr = AllowedSiteLPCR(grid)
         self.addition_head = AdditionHead()
         self.use_addition_head = True
-        self.radar_adapter = nn.Linear(64, LATENT_CHANNELS)
+        if radar_feature_channels not in (64, 1024):
+            raise ValueError("Radar features must be fixed statistics or width-1024 PointNet++")
+        self.radar_feature_channels = radar_feature_channels
+        self.radar_adapter = nn.Linear(radar_feature_channels, LATENT_CHANNELS)
         self.diffusion = SparseResidualUNet(grid.shape_at(4))
 
     def conditions(self, stage1_output: dict, threshold: float) -> Stage2Conditions:
@@ -414,11 +418,17 @@ class SparseResidualStage2(nn.Module):
         center = scores.new_tensor(self.grid.minimum_xyz) + (xyz_index + 0.5) * latent_size
         source_coords = stage1_output["conditioning_coords"]
         source = stage1_output["conditioning_features"]
-        if source.ndim != 2 or source.shape[1] != 64 or len(source) != len(source_coords):
-            raise ValueError("Stage-I radar conditioning features must be [N,64]")
-        raw = source.new_zeros((len(coarse), 64))
+        learned_xyz = stage1_output.get("conditioning_xyz")
+        if (source.ndim != 2 or source.shape[1] != self.radar_feature_channels or
+                (learned_xyz is None and len(source) != len(source_coords)) or
+                (learned_xyz is not None and
+                 (learned_xyz.shape != (len(source), 3) or
+                  self.radar_feature_channels != 1024))):
+            raise ValueError("Radar conditioning coordinates and features differ")
+        raw = source.new_zeros((len(coarse), self.radar_feature_channels))
         if len(coarse) and len(source):
-            radar_centers = STAGE1_GRID.centers_xyz(source_coords, stride=8)
+            radar_centers = (learned_xyz if learned_xyz is not None else
+                             STAGE1_GRID.centers_xyz(source_coords, stride=8))
             distance = torch.cdist(center.float(), radar_centers.float())
             nearby_distance, indices = distance.topk(min(4, len(source)),
                                                       largest=False, dim=1)

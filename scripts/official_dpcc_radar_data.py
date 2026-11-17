@@ -130,8 +130,33 @@ def _voxel_keys(xyz: np.ndarray) -> np.ndarray:
     return np.unique(indices[:, 2] * 512 * 512 + indices[:, 1] * 512 + indices[:, 0])
 
 
-def reconstruction_counts(predicted: np.ndarray, target: np.ndarray) -> dict:
-    """Same exact voxel IoU, one-to-one 0.2m F1, Chamfer and attribute MAE."""
+def _voxel_centers(keys: np.ndarray) -> np.ndarray:
+    indices = np.column_stack((keys % 512, (keys // 512) % 512,
+                               keys // (512 * 512)))
+    return GRID_MIN + (indices + 0.5) * GRID_SIZE
+
+
+def _matched_voxels_within(pred_keys: np.ndarray, true_keys: np.ndarray,
+                           radius_m: float) -> int:
+    """One-to-one occupied-voxel matches by physical voxel-center distance."""
+    if not len(pred_keys) or not len(true_keys):
+        return 0
+    left = cKDTree(_voxel_centers(pred_keys))
+    right = cKDTree(_voxel_centers(true_keys))
+    edges = left.sparse_distance_matrix(right, max_distance=radius_m + 1e-6,
+                                        output_type="coo_matrix")
+    if not edges.nnz:
+        return 0
+    graph = csr_matrix((np.ones(edges.nnz, dtype=np.int8),
+                        (edges.row, edges.col)),
+                       shape=(len(pred_keys), len(true_keys)))
+    return int(np.count_nonzero(maximum_bipartite_matching(
+        graph, perm_type="column") >= 0))
+
+
+def reconstruction_counts(predicted: np.ndarray, target: np.ndarray, *,
+                          include_voxel_iou_0p2m: bool = False) -> dict:
+    """Exact voxel IoU, one-to-one 0.2m point F1, and optional tolerant IoU."""
     predicted = np.asarray(predicted, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     if predicted.ndim != 2 or predicted.shape[1] != 7 or target.ndim != 2 or target.shape[1] != 7:
@@ -142,6 +167,8 @@ def reconstruction_counts(predicted: np.ndarray, target: np.ndarray) -> dict:
               "voxel_tp": int(np.intersect1d(pred_keys, true_keys, assume_unique=True).size),
               "point_tp_0p2m": 0, "chamfer_squared_sum": 0.0,
               "chamfer_frames": 0, "attribute_matches": 0}
+    if include_voxel_iou_0p2m:
+        counts["voxel_tp_0p2m"] = _matched_voxels_within(pred_keys, true_keys, 0.2)
     counts.update({f"{name}_abs_sum": 0.0 for name in ATTR_NAMES})
     if not len(predicted) or not len(target):
         return counts
@@ -178,6 +205,11 @@ def summarize_counts(counts: dict) -> dict:
         "chamfer_squared_m2": counts["chamfer_squared_sum"] / counts["chamfer_frames"]
         if counts["chamfer_frames"] else None,
     })
+    if "voxel_tp_0p2m" in counts:
+        tolerant_voxel_union = (counts["predicted_voxels"] + counts["target_voxels"]
+                                - counts["voxel_tp_0p2m"])
+        result["voxel_iou_0p2m"] = (counts["voxel_tp_0p2m"] / tolerant_voxel_union
+                                     if tolerant_voxel_union else 1.0)
     for name in ATTR_NAMES:
         result[f"matched_{name}_mae"] = (counts[f"{name}_abs_sum"] / counts["attribute_matches"]
                                          if counts["attribute_matches"] else None)

@@ -24,6 +24,7 @@ from scripts.conditional_stage2 import (
     CONDITIONED_FRESH_REVISION, CONDITIONED_FRESH_FAULT_ONLY_REVISION,
     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION,
     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION,
+    CONDITIONED_POINTNETPP_BCE_REVISION,
     deployment_loader)
 from scripts.evaluate_stage2_conditional_reconstruction import (
     fixed_threshold_validation, sweep)
@@ -120,20 +121,28 @@ def resume_batch_size_change(saved_identity: dict, identity: dict,
     return previous
 
 
-def fresh_model(lpcr_path: Path, device: str) -> SparseResidualStage2:
+def fresh_model(lpcr_path: Path, device: str,
+                *, radar_feature_channels: int = 64) -> SparseResidualStage2:
     pretrained = torch.load(lpcr_path, map_location="cpu", weights_only=False)
     if (pretrained.get("version") != VERSION or
             pretrained.get("model_revision") != LPCR_REVISION or
             pretrained.get("phase") != "lpcr" or
             not pretrained.get("lpcr_full_region")):
         raise ValueError("Expected the frozen full-region LPCR checkpoint")
-    model = SparseResidualStage2(diffusion_target="epsilon").to(device)
+    model = SparseResidualStage2(
+        diffusion_target="epsilon",
+        radar_feature_channels=radar_feature_channels).to(device)
     fresh_diffusion = {key: value.clone() for key, value in
                        model.diffusion.state_dict().items()}
     fresh_radar = {key: value.clone() for key, value in
                    model.radar_adapter.state_dict().items()}
-    missing, unexpected = model.load_state_dict(pretrained["model"], strict=False)
-    if unexpected or any(not key.startswith("addition_head.") for key in missing):
+    pretrained_model = {key: value for key, value in pretrained["model"].items()
+                        if radar_feature_channels == 64 or
+                        not key.startswith("radar_adapter.")}
+    missing, unexpected = model.load_state_dict(pretrained_model, strict=False)
+    allowed_missing = (("addition_head.", "radar_adapter.")
+                       if radar_feature_channels != 64 else ("addition_head.",))
+    if unexpected or any(not key.startswith(allowed_missing) for key in missing):
         raise ValueError("LPCR checkpoint differs from Stage II architecture")
     model.diffusion.load_state_dict(fresh_diffusion)
     model.radar_adapter.load_state_dict(fresh_radar)
@@ -150,6 +159,10 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--fault-region-root", type=Path)
+    parser.add_argument("--radar-feature-root", type=Path,
+                        help="Frozen width-1024 PointNet++ anchor features")
+    parser.add_argument("--radar-encoder-checkpoint", type=Path,
+                        help="Required with --radar-feature-root for identity checking")
     parser.add_argument("--generated-occupancy-loss", action="store_true",
                         help="Supervise frozen LPCR after a Gaussian-start rollout")
     parser.add_argument("--generated-bce-loss", action="store_true",
@@ -184,6 +197,11 @@ def main() -> None:
         parser.error("Generated BCE trial requires --fault-region-root")
     if args.generated_bce_loss and args.generated_occupancy_loss:
         parser.error("Choose standard BCE or the old asymmetric margin")
+    if ((args.radar_feature_root is None) !=
+            (args.radar_encoder_checkpoint is None)):
+        parser.error("PointNet++ feature root and encoder checkpoint must be given together")
+    if args.radar_feature_root is not None and not args.generated_bce_loss:
+        parser.error("The PointNet++ integration uses generated BCE training")
     if args.initialize_from is not None and not args.generated_occupancy_loss:
         parser.error("--initialize-from is for the generated occupancy trial")
     if args.fixed_validation_only and (
@@ -205,7 +223,9 @@ def main() -> None:
         parser.error("Invalid settings or CUDA unavailable")
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    model = fresh_model(args.lpcr_checkpoint, args.device)
+    model = fresh_model(
+        args.lpcr_checkpoint, args.device,
+        radar_feature_channels=1024 if args.radar_feature_root else 64)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
@@ -221,6 +241,16 @@ def main() -> None:
         min_radar_voxels=MIN_RADAR_VOXELS)
     support = RadarSupportCache(args.support_cache_root / "train", expected)
     support.check_complete()
+    train_radar_features = val_radar_features = None
+    if args.radar_feature_root is not None:
+        from scripts.cache_pointnetpp_stage2_features import RadarFeatureCache
+        radar_hash = sha256(args.radar_encoder_checkpoint)
+        train_radar_features = RadarFeatureCache(
+            args.radar_feature_root, "train", radar_hash)
+        val_radar_features = RadarFeatureCache(
+            args.radar_feature_root, "val", radar_hash)
+        if train_radar_features.manifest["frame_ids"] != train_ids:
+            raise ValueError("Train radar features differ from Stage-II frames")
     train_regions = None
     if args.fault_region_root is not None:
         train_regions = FaultRegionCache(
@@ -232,12 +262,15 @@ def main() -> None:
             raise FileNotFoundError("Train injector footprints are not built")
     train_loader = DataLoader(
         _CleanRows(train_dataset, support, args.train_limit,
-                   args.faulty_root, "train", fault_regions=train_regions),
+                   args.faulty_root, "train", fault_regions=train_regions,
+                   radar_features=train_radar_features),
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     identity = {
-        "revision": (CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION
+        "revision": (CONDITIONED_POINTNETPP_BCE_REVISION
+                     if args.radar_feature_root else
+                     CONDITIONED_FRESH_FAULT_ONLY_GENERATED_BCE_REVISION
                      if args.generated_bce_loss else
                      CONDITIONED_FRESH_FAULT_ONLY_GENERATED_REVISION
                      if args.generated_occupancy_loss else
@@ -261,6 +294,13 @@ def main() -> None:
         "validation_steps": args.validation_steps,
         "validation_model_inputs": "faulty_LiDAR_radar_Gaussian_noise",
         "fresh_diffusion_and_radar_adapter": args.initialize_from is None}
+    if args.radar_feature_root is not None:
+        identity.update({
+            "radar_encoder_sha256": radar_hash,
+            "radar_feature_channels": 1024,
+            "radar_feature_manifest_sha256": {
+                "train": sha256(train_radar_features.manifest_path),
+                "val": sha256(val_radar_features.manifest_path)}})
     decoder_config = None
     if args.generated_bce_loss:
         decoder_config = GeneratedBCEConfig(
@@ -302,6 +342,9 @@ def main() -> None:
         args.vod_root, "val", identity["radar_variant"],
         include_clean=True, data_cache_root=args.data_cache_root)
     val_clean_ids = [frame.frame_id for frame in val_clean_dataset.frames]
+    if (val_radar_features is not None and
+            val_radar_features.manifest["frame_ids"] != val_clean_ids):
+        raise ValueError("Validation radar features differ from Stage-II frames")
     val_regions = None
     if train_regions is not None:
         val_regions = FaultRegionCache(
@@ -324,14 +367,16 @@ def main() -> None:
     val_support.check_complete()
     val_loss_loader = DataLoader(
         _CleanRows(val_clean_dataset, val_support, args.val_limit,
-                   args.faulty_root, "val", fault_regions=val_regions),
+                   args.faulty_root, "val", fault_regions=val_regions,
+                   radar_features=val_radar_features),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=_rows, pin_memory=True,
         persistent_workers=args.num_workers > 0)
     val_loader, val_ids, _ = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, "val", identity, args.num_workers, args.val_limit,
-        fault_region_root=args.fault_region_root)
+        fault_region_root=args.fault_region_root,
+        radar_feature_root=args.radar_feature_root)
     if val_clean_ids[:args.val_limit] != val_ids:
         raise ValueError("Validation loss and deployment frames differ")
     if args.initialize_from is not None:
