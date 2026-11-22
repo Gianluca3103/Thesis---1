@@ -39,7 +39,7 @@ require_pointops() {
   [[ -s "$UPSTREAM/models/pointops/functions/pointops.py" ]] || {
     echo "Missing compiled D-PCC pointops tree: $UPSTREAM" >&2; exit 1;
   }
-  "$PY" -c 'import pointops_cuda; from pointops.functions import pointops; print("PointNet++ FPS ready")'
+  "$PY" -c 'import torch; import pointops_cuda; from pointops.functions import pointops; print("PointNet++ FPS ready")'
 }
 
 prepare() {
