@@ -113,10 +113,11 @@ if [[ -n "$INIT" && ! -s "$INIT" ]]; then
   printf 'Missing initialization checkpoint: %s\n' "$INIT" >&2; exit 1
 fi
 
-mkdir -p "$OUT" "$DATA/stage2_clean_tmp"
+STAGE2_TMPDIR=${STAGE2_TMPDIR:-/tmp/stage2_${UID}}
+mkdir -p "$OUT" "$STAGE2_TMPDIR"
 cd "$REPO"
 export PYTHONPATH="$REPO" OMP_NUM_THREADS=8 CROSSMODAL_GPU_NEIGHBORS=0
-export TMPDIR="$DATA/stage2_clean_tmp"
+export TMPDIR="$STAGE2_TMPDIR"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 region_arg=()
