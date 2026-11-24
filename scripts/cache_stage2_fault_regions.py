@@ -15,7 +15,8 @@ from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.fault_region import (
     FaultRegionCache, cache_identity, partial_azimuth_region)
 from models.radar_lidar_stage2.mild_fault_data import (
-    MILD_FOG2_VERSION, frame_seed, partial_azimuth_loss)
+    MILD_FOG2_VERSION, PARTIAL_ONLY_VERSION, fault_types_for_version,
+    frame_seed, partial_azimuth_loss)
 
 
 def main() -> None:
@@ -37,9 +38,13 @@ def main() -> None:
         ids = [frame.frame_id for frame in dataset.frames]
         mild_path = args.faulty_root / split / "manifest.json"
         mild = json.loads(mild_path.read_text(encoding="utf-8"))
-        if (mild.get("version") != MILD_FOG2_VERSION
+        version = mild.get("version")
+        if (version not in (MILD_FOG2_VERSION, PARTIAL_ONLY_VERSION)
                 or mild.get("radar_variant") != args.radar_variant
-                or mild.get("frame_ids") != ids):
+                or mild.get("frame_ids") != ids
+                or mild.get("fault_types") != list(fault_types_for_version(version))
+                or set(mild.get("frame_faults", {})) != set(ids)
+                or set(mild["frame_faults"].values()) - set(mild["fault_types"])):
             raise ValueError(f"Mild-fault manifest differs from {split} fixed frames")
         expected = cache_identity(
             split, ids, mild_path,

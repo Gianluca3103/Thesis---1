@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fresh PointNet++ radar AE and LiDAR LPCR, followed by fault-gated Stage II.
+# Fresh PointNet++ radar AE and LiDAR LPCR, followed by partial-loss Stage II.
 set -euo pipefail
 
 PHASE=${1:-all}
@@ -8,11 +8,10 @@ DATA=${DATA:-$BASE/sensor_fusion_outputs/sensor_fusion_outputs}
 REPO=${REPO:-$BASE/sensor_fusion_outputs/Thesis-1-radar-autoencoder-prefilter-20261109}
 PY=${PY:-$BASE/Sensor-Fusion/.venv_model_v2/bin/python}
 VOD=${VOD:-/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC}
-FOG=${FOG:-$BASE/Sensor-Fusion/Weather_Injector/LiDAR_fog_sim}
 UPSTREAM=${UPSTREAM:-$DATA/radar_dpcc_official_12vox_1p6m_20261111/upstream/D-PCC}
-OUT=${OUT:-$DATA/e2e_pointnetpp1024_lpcr_stage2_bce1_20261117}
-RAW=${RAW:-$DATA/crossmodal_fov70_refined_noaug_30ep_20261015/fixed_frames}
-MILD=${MILD:-$OUT/mild_faults_xyz_presence}
+OUT=${OUT:-$DATA/e2e_pointnetpp1024_lpcr_stage2_partial_only_20261124}
+RAW=${RAW:-$OUT/fixed_frames}
+MILD=${MILD:-$OUT/partial_loss_faults}
 SUPPORT=${SUPPORT:-$OUT/radar_support12vox_1p6m}
 REGIONS=${REGIONS:-$OUT/fault_regions}
 RADAR_CACHE=$OUT/radar_filtered_cache
@@ -43,9 +42,23 @@ require_pointops() {
 }
 
 prepare() {
-  [[ -s "$FOG/integral_lookup_tables/original/integral_0m_to_200m_stepsize_0.1m_tau_h_20ns_alpha_0.01.pickle" ]] || {
-    echo "Missing mild-fog lookup table under $FOG" >&2; exit 1;
-  }
+  # The shared VoD radar variant is generated if missing and verified if present.
+  for split in train val test; do
+    "$PY" -u -m scripts.generate_vod_accumulated_radar \
+      --vod-root "$VOD" --stack-sizes 20 --split "$split" \
+      --alignment-source official-5 --output-suffix verified \
+      --isolate-split-history --no-basic-validity-filter \
+      --num-workers "$WORKERS" 2>&1 | tee -a "$OUT/radar_stacks.log"
+    "$PY" -u -m scripts.generate_vod_doppler_radar \
+      --vod-root "$VOD" --split "$split" \
+      --output-variant radar_20frames_verified_doppler_radial \
+      --frame-period-s 0.10022 --doppler-sign 1 \
+      --num-workers "$WORKERS" 2>&1 | tee -a "$OUT/radar_stacks.log"
+  done
+  "$PY" -u -m scripts.check_crossmodal_inputs \
+    --vod-root "$VOD" \
+    --radar-variant radar_20frames_verified_doppler_radial \
+    2>&1 | tee -a "$OUT/radar_stacks.log"
   for split in train val test; do
     "$PY" -u -m scripts.cache_crossmodal_fixed_frames \
       --vod-root "$VOD" --cache-root "$RAW" --split "$split" \
@@ -59,13 +72,10 @@ prepare() {
       --min-distinct-radar-voxels 12 --num-workers "$WORKERS" \
       2>&1 | tee -a "$OUT/support_cache.log"
   done
-  for split in both test; do
-    "$PY" -u -m scripts.cache_stage2_mild_fog2 \
-      --vod-root "$VOD" --data-cache-root "$RAW" \
-      --fog-simulator-root "$FOG" --output-root "$MILD" \
-      --split "$split" --num-workers "$WORKERS" \
-      2>&1 | tee -a "$OUT/mild_fault_cache.log"
-  done
+  "$PY" -u -m scripts.cache_stage2_partial_loss \
+    --vod-root "$VOD" --data-cache-root "$RAW" \
+    --output-root "$MILD" --split all --num-workers "$WORKERS" \
+    2>&1 | tee -a "$OUT/partial_loss_cache.log"
   for split in train val test; do
     "$PY" -u -m scripts.pointnetpp_stage2_radar_data \
       --vod-root "$VOD" --cache-root "$RADAR_CACHE" --split "$split" \
