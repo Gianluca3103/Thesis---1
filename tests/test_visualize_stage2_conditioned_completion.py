@@ -1,5 +1,8 @@
 """Conditioned samples show actual additions and their full-ROI errors."""
 
+import json
+import re
+
 import numpy as np
 import pytest
 import torch
@@ -63,3 +66,32 @@ def test_conditioned_sample_writes_completed_scan_and_light_viewer(tmp_path):
     deployable = (tmp_path / "deployable.html").read_text(encoding="utf-8")
     assert "Prediction begins from Gaussian noise" in deployable
     assert "oracle-assisted diagnostic outputs" not in deployable.lower()
+
+
+def test_viewer_includes_every_point_without_display_caps(tmp_path):
+    record = {
+        "split": "test", "frame_id": "00001", "fault": "partial_loss_30",
+        "epoch": 1, "threshold": 0.5,
+        "overall": {"faulty": {"iou": 0.1, "iou_0p2m": 0.2},
+                    "completed": {"iou": 0.3, "iou_0p2m": 0.4},
+                    "added_cells": 1},
+        "clean_xyz": np.zeros((6001, 3), dtype=np.float32),
+        "faulty_xyz": np.zeros((6001, 3), dtype=np.float32),
+        "true_added_xyz": np.zeros((5001, 3), dtype=np.float32),
+        "false_added_xyz": np.empty((0, 3), dtype=np.float32),
+        "missing_xyz": np.empty((0, 3), dtype=np.float32),
+        "radar_xyz": np.zeros((2001, 3), dtype=np.float32),
+        "gate_xyz": np.zeros((3001, 3), dtype=np.float32),
+        "oracle_clean_latent": False,
+    }
+    path = tmp_path / "all_points.html"
+    _viewer(path, record, 3103)
+    page = path.read_text(encoding="utf-8")
+    payload = json.loads(re.search(
+        r'<script id="data" type="application/json">(.*?)</script>',
+        page).group(1))
+    assert [(layer["full"], len(layer["points"]))
+            for layer in payload["layers"]] == [
+                (6001, 6001), (6001, 6001), (5001, 5001), (0, 0),
+                (0, 0), (2001, 2001), (3001, 3001)]
+    assert "All occupancy voxel centers are displayed" in page

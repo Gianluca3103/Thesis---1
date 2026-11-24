@@ -56,11 +56,7 @@ def balanced_frame_ids(frame_ids: list[str], faults: dict[str, str],
     return [frame_id for frame_id in frame_ids if frame_id in selected]
 
 
-def _display(xyz: np.ndarray, limit: int, seed: int) -> list[list[float]]:
-    if len(xyz) > limit:
-        indices = np.sort(np.random.default_rng(seed).choice(
-            len(xyz), limit, replace=False))
-        xyz = xyz[indices]
+def _display(xyz: np.ndarray) -> list[list[float]]:
     return np.round(xyz.astype(np.float64), 3).tolist()
 
 
@@ -118,18 +114,18 @@ def _plot(path: Path, record: dict) -> None:
     plt.close(fig)
 
 
-def _viewer(path: Path, record: dict, seed: int) -> None:
+def _viewer(path: Path, record: dict, _seed: int) -> None:
     layers = []
-    for index, (name, color, xyz, limit) in enumerate((
-            ("Clean target", "#dbe7ef", record["clean_xyz"], 6000),
-            ("Faulty input", "#68b8ff", record["faulty_xyz"], 6000),
-            ("New true additions", "#48e1ad", record["true_added_xyz"], 5000),
-            ("New false additions", "#ff9c57", record["false_added_xyz"], 5000),
-            ("Still missing", "#ff5964", record["missing_xyz"], 4000),
-            ("Radar returns", "#7bbdff", record["radar_xyz"], 2000),
-            ("Eligible gate (subset)", "#ae89df", record["gate_xyz"], 3000))):
+    for name, color, xyz in (
+            ("Clean target", "#dbe7ef", record["clean_xyz"]),
+            ("Faulty input", "#68b8ff", record["faulty_xyz"]),
+            ("New true additions", "#48e1ad", record["true_added_xyz"]),
+            ("New false additions", "#ff9c57", record["false_added_xyz"]),
+            ("Still missing", "#ff5964", record["missing_xyz"]),
+            ("Radar returns", "#7bbdff", record["radar_xyz"]),
+            ("Eligible gate", "#ae89df", record["gate_xyz"])):
         layers.append({"name": name, "color": color, "full": len(xyz),
-                       "points": _display(xyz, limit, seed + index)})
+                       "points": _display(xyz)})
     metrics = record["overall"]
     payload = json.dumps({
         "split": record["split"], "frame": record["frame_id"],
@@ -154,7 +150,7 @@ label{white-space:nowrap}canvas{width:100%;height:72vh;min-height:440px;backgrou
 <button id="gate">Radar gate</button><button id="zin">Zoom in</button>
 <button id="zout">Zoom out</button><button id="reset">Reset</button></div>
 <div id="layers" class="layers"></div><canvas id="view"></canvas>
-<p>Drag to rotate · Shift-drag to pan · wheel to zoom. Points are occupancy voxel centers. Display is sampled; PLY and NPZ contain every voxel.</p>
+<p>Drag to rotate · Shift-drag to pan · wheel to zoom. All occupancy voxel centers are displayed; PLY and NPZ contain every voxel.</p>
 <p><b>Interpretation:</b> __INTERPRETATION__</p>
 <p id="downloads"></p><script id="data" type="application/json">__DATA__</script>
 <script>(()=>{const d=JSON.parse(document.getElementById('data').textContent);

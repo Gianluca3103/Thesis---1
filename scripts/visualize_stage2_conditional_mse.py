@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--support-cache-root", type=Path, required=True)
     parser.add_argument("--faulty-root", type=Path, required=True)
     parser.add_argument("--fault-region-root", type=Path, required=True)
+    parser.add_argument("--radar-feature-root", type=Path)
     parser.add_argument("--lpcr-checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -67,7 +68,8 @@ def main() -> None:
     full_loader, frame_ids, manifest = deployment_loader(
         args.vod_root, args.data_cache_root, args.support_cache_root,
         args.faulty_root, args.split, identity, args.num_workers,
-        fault_region_root=args.fault_region_root)
+        fault_region_root=args.fault_region_root,
+        radar_feature_root=args.radar_feature_root)
     chosen = set(balanced_frame_ids(
         frame_ids, manifest["frame_faults"], args.per_fault, args.seed))
     indices = [index for index, frame_id in enumerate(frame_ids)
@@ -147,7 +149,9 @@ def main() -> None:
         "training_loss": training_loss,
         "decoder_bce_weight": identity.get("decoder_bce_weight"),
         "sampling_steps": args.steps, "oracle_clean_latent": False,
-        "prediction_inputs": ["Gaussian_noise", "faulty_LiDAR", "radar"],
+        "prediction_inputs": ["Gaussian_noise", "faulty_LiDAR", "radar",
+                              *(["frozen_pointnetpp_radar_features"]
+                                if args.radar_feature_root else [])],
         "samples": summaries}, indent=2) + "\n", encoding="utf-8")
     links = "\n".join(
         f'<li><a target="viewer" href="{html.escape(item["html"], quote=True)}">'

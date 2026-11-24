@@ -19,8 +19,10 @@ from scripts import visualize_stage2_conditional_mse as viewer
      "MSE + generated BCE (weight 1)"),
 ])
 @pytest.mark.parametrize("split", ("train", "val", "test"))
+@pytest.mark.parametrize("learned_radar", (False, True))
 def test_balanced_samples_use_only_faulty_inputs_for_prediction(
-        monkeypatch, tmp_path, training_loss, bce_weight, label, split):
+        monkeypatch, tmp_path, training_loss, bce_weight, label, split,
+        learned_radar):
     faults = ("fog_sim_2", "partial_loss_30", "partial_loss_40",
               "partial_loss_50")
     rows = [{"frame_id": f"{index:05d}",
@@ -39,8 +41,12 @@ def test_balanced_samples_use_only_faulty_inputs_for_prediction(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(viewer, "load_model", lambda *_: (object(), identity,
                                                           {"epoch": 30}))
-    monkeypatch.setattr(viewer, "deployment_loader", lambda *_, **__: (
-        SimpleNamespace(dataset=rows), ids, manifest))
+    def deployment_loader(*_, **kwargs):
+        expected = tmp_path / "radar_features" if learned_radar else None
+        assert kwargs["radar_feature_root"] == expected
+        return SimpleNamespace(dataset=rows), ids, manifest
+
+    monkeypatch.setattr(viewer, "deployment_loader", deployment_loader)
     monkeypatch.setattr(viewer, "cosine_alpha_bars", lambda **_: torch.ones(1000))
     monkeypatch.setattr(viewer, "_roi_radar", lambda *_: np.empty((0, 3)))
 
@@ -74,22 +80,26 @@ def test_balanced_samples_use_only_faulty_inputs_for_prediction(
     monkeypatch.setattr(viewer, "reference_clean", clean)
     monkeypatch.setattr(viewer, "_frame_candidates", candidates)
     monkeypatch.setattr(viewer, "_save_record", save)
-    monkeypatch.setattr(sys, "argv", ["viewer", "--vod-root", str(tmp_path),
-                                      "--data-cache-root", str(tmp_path),
-                                      "--support-cache-root", str(tmp_path),
-                                      "--faulty-root", str(tmp_path),
-                                      "--fault-region-root", str(tmp_path),
-                                      "--lpcr-checkpoint", str(tmp_path),
-                                      "--checkpoint", str(tmp_path),
-                                      "--output-root", str(tmp_path / "views"),
-                                      "--split", split,
-                                      "--per-fault", "1", "--num-workers", "0"])
+    argv = ["viewer", "--vod-root", str(tmp_path),
+            "--data-cache-root", str(tmp_path),
+            "--support-cache-root", str(tmp_path),
+            "--faulty-root", str(tmp_path),
+            "--fault-region-root", str(tmp_path),
+            "--lpcr-checkpoint", str(tmp_path),
+            "--checkpoint", str(tmp_path),
+            "--output-root", str(tmp_path / "views"),
+            "--split", split,
+            "--per-fault", "1", "--num-workers", "0"]
+    if learned_radar:
+        argv.extend(["--radar-feature-root", str(tmp_path / "radar_features")])
+    monkeypatch.setattr(sys, "argv", argv)
     viewer.main()
     report = json.loads((tmp_path / "views" / "summary.json").read_text())
     assert report["oracle_clean_latent"] is False
     assert report["training_loss"] == training_loss
     assert report["decoder_bce_weight"] == bce_weight
     assert report["split"] == split
+    assert ("frozen_pointnetpp_radar_features" in report["prediction_inputs"]) == learned_radar
     assert label in (tmp_path / "views" / "index.html").read_text()
     assert len(report["samples"]) == 4
     assert {record["fault"] for record in state["records"]} == set(faults)
