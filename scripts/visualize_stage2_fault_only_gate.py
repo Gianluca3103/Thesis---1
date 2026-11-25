@@ -24,12 +24,29 @@ from models.radar_lidar_crossmodal_v1.radar_pruner_cache import (
 from models.radar_lidar_stage2.fault_data import load_faulty
 from models.radar_lidar_stage2.fault_only_gate import fault_only_support
 from models.radar_lidar_stage2.fault_region import FaultRegionCache, cache_identity
-from models.radar_lidar_stage2.mild_fault_data import MILD_FOG2_TYPES, MILD_FOG2_VERSION
+from models.radar_lidar_stage2.mild_fault_data import (
+    MILD_FOG2_VERSION, PARTIAL_ONLY_VERSION, fault_types_for_version)
 from models.radar_lidar_stage2.sparse_geometry import GRID
 from scripts.compare_radar_support_rules import _sample, _viewer_html, _xyz, flat_indices
 
 
 OBSERVED_BIT = 1 << 2
+
+
+def checked_fault_types(manifest: dict, split: str, radar_variant: str,
+                        frame_ids: list[str]) -> tuple[str, ...]:
+    version = manifest.get("version")
+    if version not in (MILD_FOG2_VERSION, PARTIAL_ONLY_VERSION):
+        raise ValueError("Unsupported Stage II fault cache version")
+    fault_types = fault_types_for_version(version)
+    if (manifest.get("split") != split or
+            manifest.get("radar_variant") != radar_variant or
+            manifest.get("frame_ids") != frame_ids or
+            manifest.get("fault_types") != list(fault_types) or
+            set(manifest.get("frame_faults", {})) != set(frame_ids) or
+            set(manifest["frame_faults"].values()) - set(fault_types)):
+        raise ValueError("Fault cache differs from fixed frames")
+    return fault_types
 
 
 def candidate_payload(raw: np.ndarray, active: np.ndarray,
@@ -88,6 +105,7 @@ def render_frame(path: Path, *, frame_id: str, fault: str, region: dict,
     page = page.replace("No model prediction or injector footprint is used.",
                         "The fault-only rule uses the known synthetic injector footprint. No model predictions are shown.")
     page = page.replace("box.checked=i===0", "box.checked=i===1")
+    page = page.replace('id="exclude">', 'id="exclude" checked>')
     page = page.replace("17 radar support rules", "2 active-region rules")
     path.write_text(page, encoding="utf-8")
     return {"frame_id": frame_id, "fault": fault, "file": path.name,
@@ -118,11 +136,8 @@ def main() -> None:
     ids = [frame.frame_id for frame in dataset.frames]
     manifest_path = args.faulty_root / args.split / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if (manifest.get("version") != MILD_FOG2_VERSION or
-            manifest.get("split") != args.split or
-            manifest.get("radar_variant") != args.radar_variant or
-            manifest.get("frame_ids") != ids):
-        raise ValueError("Mild-fault cache differs from fixed frames")
+    fault_types = checked_fault_types(
+        manifest, args.split, args.radar_variant, ids)
     support = RadarSupportCache(
         args.support_cache_root / args.split,
         support_identity(args.split, ids, args.radar_variant,
@@ -143,7 +158,7 @@ def main() -> None:
     else:
         rng = random.Random(args.seed)
         selected = []
-        for fault in MILD_FOG2_TYPES:
+        for fault in fault_types:
             candidates = [frame_id for frame_id in ids
                           if manifest["frame_faults"][frame_id] == fault]
             selected.extend(rng.sample(candidates,

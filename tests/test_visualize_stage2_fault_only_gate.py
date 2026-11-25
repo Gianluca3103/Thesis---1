@@ -7,8 +7,23 @@ import pytest
 import torch
 
 from models.radar_lidar_stage2.sparse_geometry import GRID
+from models.radar_lidar_stage2.mild_fault_data import (
+    PARTIAL_ONLY_TYPES, PARTIAL_ONLY_VERSION)
 from scripts.visualize_stage2_fault_only_gate import (
-    OBSERVED_BIT, candidate_payload, render_frame)
+    OBSERVED_BIT, candidate_payload, checked_fault_types, render_frame)
+
+
+def test_viewer_accepts_current_partial_only_cache():
+    manifest = {"version": PARTIAL_ONLY_VERSION, "split": "val",
+                "radar_variant": "radar_20frames_verified_doppler_radial",
+                "frame_ids": ["00001"], "fault_types": list(PARTIAL_ONLY_TYPES),
+                "frame_faults": {"00001": "partial_loss_40"}}
+    assert checked_fault_types(manifest, "val", manifest["radar_variant"],
+                               ["00001"]) == PARTIAL_ONLY_TYPES
+    manifest["frame_faults"]["00001"] = "fog_sim_2"
+    with pytest.raises(ValueError, match="differs"):
+        checked_fault_types(manifest, "val", manifest["radar_variant"],
+                            ["00001"])
 
 
 def test_viewer_packs_every_radar_voxel_and_fault_only_subset():
@@ -54,5 +69,6 @@ def test_viewer_defaults_to_fault_only_and_labels_oracle(tmp_path):
         display_points=10, seed=1)
     html = page.read_text(encoding="utf-8")
     assert "box.checked=i===1" in html
+    assert 'id="exclude" checked>' in html
     assert "known synthetic injector footprint" in html
     assert record["radar_cells"] == record["fault_only_cells"] == 1
