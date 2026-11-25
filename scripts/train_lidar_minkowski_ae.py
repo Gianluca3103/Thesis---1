@@ -13,10 +13,11 @@ import random
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.lidar_minkowski_ae import SparseVoxelAutoencoder, _inside, _keys
+from models.lidar_minkowski_ae import SparseVoxelAutoencoder, _inside, _keys, _targets_at
 from models.lidar_minkowski_ae_data import CleanVoxelFrames, summarize_counts
 from models.radar_lidar_stage2.sparse_geometry import GRID
 
@@ -49,7 +50,16 @@ def _run(model, loader, device, *, optimizer, threshold, label):
             fine = row["coordinates"].to(device, non_blocking=True)
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            output = model(fine, threshold=threshold)
+            if training:
+                output = model(fine, threshold=threshold)
+            else:
+                # Keep clean targets outside the sparse decoder at evaluation.
+                # They are used only after candidate coordinates/logits exist.
+                output = model.decode(model.encode(fine), threshold=threshold)
+                labels = _targets_at(output.coordinates, fine, 1)
+                output.loss = F.binary_cross_entropy_with_logits(
+                    output.logits, labels.float())
+                output.reachable_targets = int(labels.sum().item())
             if output.loss is None or not torch.isfinite(output.loss):
                 raise RuntimeError(f"Non-finite voxel reconstruction loss: {row['frame_ids']}")
             if training:

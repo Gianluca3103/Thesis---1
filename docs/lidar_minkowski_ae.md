@@ -38,3 +38,19 @@ output root is needed to change model width, levels, or the data split.
 This trial measures clean-to-clean bottleneck fidelity. A high IoU here does
 not establish that the latent can recover cells absent from faulty LiDAR, or
 that diffusion can predict the corresponding latent features from radar.
+
+The default one-level model has 64-channel latent features on LiDAR-derived
+stride-2 sparse sites. This is **not** Stage II's 32-channel latent on
+`(z,y,x)` stride `(16,4,4)` sites supplied by its reconstruction hierarchy;
+the weights and latent tensors cannot be substituted into Stage II. With a
+single 2x downsampling and kernel-2 generative upsampling, every fine input
+voxel has a candidate child by construction. A 100% candidate-recall ceiling
+is therefore not evidence of completion.
+
+If clean-to-clean IoU reaches 100%, run `scripts.audit_lidar_minkowski_ae` on
+the saved checkpoint. It compares target-free decoding with the training
+forward path, zeros the latent features while preserving sparse coordinates,
+and removes whole occupied stride-2 blocks from the input. It reports the
+exact saved BCE and voxel counts, candidate-site count, and missing-block
+recovery. These checks distinguish a genuine local copy from a metric or
+coordinate leak.
