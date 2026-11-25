@@ -9,6 +9,7 @@ from models.lidar_minkowski_ae_data import (
 )
 from scripts.train_lidar_minkowski_ae import _counts, _run
 from scripts.audit_lidar_minkowski_ae import remove_coarse_blocks
+from scripts.visualize_lidar_minkowski_ae import _html, voxel_centers
 
 
 def test_voxelization_matches_stage2_grid_and_fixed_forward_crop():
@@ -74,3 +75,24 @@ def test_validation_decodes_before_targets_are_consulted():
                   label="target-free-check")
     assert result["exact_iou"] == 1.0
     assert result["candidate_recall_ceiling"] == 1.0
+
+
+def test_reconstruction_viewer_keeps_all_voxels(tmp_path):
+    cells = np.asarray([[5, 80, 8], [6, 80, 8]], dtype=np.int32)
+    centers = voxel_centers(cells)
+    np.testing.assert_allclose(centers[:, 0], [1.1, 1.3])
+    layers = {name: centers for name in (
+        "Clean target", "Clean-input reconstruction", "Masked input",
+        "Masked-input reconstruction", "Removed clean voxels")}
+    path = tmp_path / "sample.html"
+    _html(path, frame_id="00000", split="val", epoch=1, threshold=0.5,
+          layers=layers, clean_iou=1.0, masked_iou=0.7,
+          missing_recall=0.0)
+    import json
+    import re
+    match = re.search(r'<script id="data" type="application/json">(.*?)</script>',
+                      path.read_text(encoding="utf-8"), re.S)
+    assert match is not None
+    payload = json.loads(match.group(1))
+    assert all(layer["count"] == 2 and len(layer["points"]) == 2
+               for layer in payload["layers"])

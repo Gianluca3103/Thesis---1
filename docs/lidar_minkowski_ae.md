@@ -54,3 +54,9 @@ and removes whole occupied stride-2 blocks from the input. It reports the
 exact saved BCE and voxel counts, candidate-site count, and missing-block
 recovery. These checks distinguish a genuine local copy from a metric or
 coordinate leak.
+
+`scripts.visualize_lidar_minkowski_ae` exports selected official-split frames
+as standalone interactive HTML, full-resolution NPZ, and PLY files. It shows
+the clean input/target, clean-input reconstruction, and a separate diagnostic
+in which 30% of occupied stride-2 blocks are removed before decoding. No
+points or voxels are capped in the viewer or exports.
