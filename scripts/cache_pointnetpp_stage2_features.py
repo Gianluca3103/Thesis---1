@@ -34,8 +34,9 @@ class RadarFeatureCache:
         self.manifest_path = self.root / "manifest.json"
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.frame_ids = set(self.manifest.get("frame_ids", []))
+        self.feature_channels = self.manifest.get("feature_channels")
         if (self.manifest.get("version") != VERSION or
-                self.manifest.get("feature_channels") != 1024 or
+                self.feature_channels not in (768, 1024) or
                 self.manifest.get("anchors") != 512 or
                 (checkpoint_hash is not None and
                  self.manifest.get("radar_checkpoint_sha256") != checkpoint_hash)):
@@ -49,7 +50,8 @@ class RadarFeatureCache:
         xyz, features = saved.get("xyz"), saved.get("features")
         if (saved.get("version") != VERSION or saved.get("frame_id") != frame_id or
                 not isinstance(xyz, torch.Tensor) or xyz.ndim != 2 or xyz.shape[1] != 3 or
-                not isinstance(features, torch.Tensor) or features.shape != (len(xyz), 1024) or
+                not isinstance(features, torch.Tensor) or
+                features.shape != (len(xyz), self.feature_channels) or
                 len(xyz) > 512 or not torch.isfinite(xyz).all() or
                 not torch.isfinite(features).all()):
             raise ValueError(f"Invalid radar feature frame: {path}")
@@ -62,10 +64,10 @@ def cache_split(radar_root: Path, checkpoint: Path, output_root: Path,
     identity = saved["identity"]
     if (identity["version"] != AE_VERSION or
             identity.get("variant", "pointnetpp") != "pointnetpp" or
-            identity["width"] != 1024 or identity["anchors"] != 512 or
+            identity["width"] not in (768, 1024) or identity["anchors"] != 512 or
             identity["input_points"] != 2048 or identity["children"] != 4 or
             identity.get("dropout_p", 0.0) != 0.0):
-        raise ValueError("Expected trained width-1024, no-dropout PointNet++ radar AE")
+        raise ValueError("Expected trained width-768/1024, no-dropout PointNet++ radar AE")
     frames = Stage2RadarFrames(radar_root, split, limit)
     if split == "train" and frames.sha256() != identity["train_manifest"]:
         raise ValueError("Training radar frames differ from checkpoint")
@@ -73,7 +75,7 @@ def cache_split(radar_root: Path, checkpoint: Path, output_root: Path,
         raise ValueError("Validation radar frames differ from checkpoint")
     scale = Stage2RadarScale.from_json(identity["scale"])
     model = RadarAutoencoder(
-        "pointnetpp", scale.minimum, scale.maximum, width=1024,
+        "pointnetpp", scale.minimum, scale.maximum, width=identity["width"],
         anchors=512, children=4, columns=7).to(device)
     model.load_state_dict(saved["model"])
     model.eval().requires_grad_(False)
@@ -83,7 +85,7 @@ def cache_split(radar_root: Path, checkpoint: Path, output_root: Path,
                 "radar_checkpoint_sha256": checkpoint_hash,
                 "radar_checkpoint_epoch": saved["epoch"],
                 "input_points": 2048, "anchors": 512,
-                "feature_channels": 1024,
+                "feature_channels": identity["width"],
                 "feature_dtype": "float16",
                 "empty_frame_policy": "empty anchors and features"}
     target = Path(output_root) / split
@@ -98,7 +100,7 @@ def cache_split(radar_root: Path, checkpoint: Path, output_root: Path,
         temporary.replace(manifest_path)
     missing = sum(not (target / f"{frame_id}.pt").is_file()
                   for frame_id in frames.ids)
-    estimated_bytes = missing * (512 * 1024 * 2 + 512 * 3 * 4 + 65536)
+    estimated_bytes = missing * (512 * identity["width"] * 2 + 512 * 3 * 4 + 65536)
     free_bytes = shutil.disk_usage(target).free
     if estimated_bytes + 2 * 1024**3 > free_bytes:
         raise OSError(f"Radar feature cache needs about {estimated_bytes / 1024**3:.1f} "
@@ -127,7 +129,7 @@ def cache_split(radar_root: Path, checkpoint: Path, output_root: Path,
         else:
             payload = {"version": VERSION, "frame_id": frame_id,
                        "xyz": torch.empty((0, 3)),
-                       "features": torch.empty((0, 1024), dtype=torch.float16)}
+                       "features": torch.empty((0, identity["width"]), dtype=torch.float16)}
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             torch.save(payload, temporary)
